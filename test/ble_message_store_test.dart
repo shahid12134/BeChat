@@ -1,4 +1,5 @@
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
@@ -50,6 +51,40 @@ void main() {
       expect(message['status'], MessageStatus.delivered.name);
       expect(message['transport'], MessageTransport.ble.name);
       expect(message['is_encrypted'], 0);
+      expect(message['timestamp'], endsWith('Z'));
+      expect(DateTime.parse(message['timestamp'] as String).isUtc, isTrue);
+    },
+  );
+
+  test(
+    'an older incoming message does not replace newer chat metadata',
+    () async {
+      final newer = DateTime.utc(2026, 4, 5, 6, 20);
+      final older = DateTime.utc(2026, 4, 5, 6, 7);
+
+      await store.storeIncoming(
+        payload: _payload(
+          messageId: 'msg-newer',
+          content: 'Newer',
+          timestamp: newer,
+        ),
+        peer: remote,
+      );
+      final receipt = await store.storeIncoming(
+        payload: _payload(
+          messageId: 'msg-older',
+          content: 'Older',
+          timestamp: older,
+        ),
+        peer: remote,
+      );
+
+      expect(receipt.result, BleIncomingResult.stored);
+      final chat = (await db.query('chats')).single;
+      expect(chat['last_message'], 'Newer');
+      expect(chat['last_message_time'], TimestampUtils.toUtcIso8601(newer));
+      expect(chat['unread_count'], 2);
+      expect(await db.query('messages'), hasLength(2));
     },
   );
 
@@ -138,6 +173,7 @@ BleMessagePayload _payload({
   String senderId = 'device-remote',
   String receiverId = 'device-local',
   String content = 'Hello',
+  DateTime? timestamp,
 }) {
   return BleMessagePayload(
     metadata: BleMessageMetadata(
@@ -145,7 +181,7 @@ BleMessagePayload _payload({
       senderId: senderId,
       receiverId: receiverId,
       messageType: MessageType.text.name,
-      timestamp: DateTime.utc(2026, 4, 5, 6, 7),
+      timestamp: timestamp ?? DateTime.utc(2026, 4, 5, 6, 7),
       ttl: 3600,
       contentLength: content.length,
       isEncrypted: false,

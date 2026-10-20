@@ -1,6 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/core/utils/timestamp_utils.dart';
 
 class DatabaseHelper {
   static Database? _database;
@@ -43,8 +44,62 @@ class DatabaseHelper {
     int oldVersion,
     int newVersion,
   ) async {
-    // Future migrations go here
-    // if (oldVersion < 2) { await _migrateToV2(db); }
+    if (oldVersion < 2) {
+      await migrateToUtcTimestamps(db);
+    }
+  }
+
+  /// Rewrites legacy timestamp columns to the canonical UTC representation.
+  ///
+  /// Older builds stored outgoing timestamps as naive local ISO strings while
+  /// incoming BLE timestamps were stored as UTC. SQLite compares those TEXT
+  /// values lexicographically, so a mixed database produced wrong ordering.
+  /// This migration preserves the represented instant and only changes the
+  /// serialization; no rows are deleted.
+  static Future<void> migrateToUtcTimestamps(Database db) async {
+    const columns = <(String, String)>[
+      ('messages', 'timestamp'),
+      ('messages', 'created_at'),
+      ('messages', 'updated_at'),
+      ('chats', 'last_message_time'),
+      ('chats', 'created_at'),
+      ('chats', 'updated_at'),
+    ];
+    for (final (table, column) in columns) {
+      await _normalizeTimestampColumn(db, table, column);
+    }
+  }
+
+  static Future<void> _normalizeTimestampColumn(
+    Database db,
+    String table,
+    String column,
+  ) async {
+    final rows = await db.query(
+      table,
+      columns: ['id', column],
+      where: '$column IS NOT NULL',
+    );
+    final batch = db.batch();
+    var changed = false;
+    for (final row in rows) {
+      final raw = row[column] as String?;
+      if (raw == null) continue;
+      final parsed = DateTime.tryParse(raw);
+      if (parsed == null) continue;
+      final canonical = TimestampUtils.toUtcIso8601(parsed);
+      if (canonical == raw) continue;
+      batch.update(
+        table,
+        {column: canonical},
+        where: 'id = ?',
+        whereArgs: [row['id']],
+      );
+      changed = true;
+    }
+    if (changed) {
+      await batch.commit(noResult: true);
+    }
   }
 
   static Future<void> _createTables(Database db) async {

@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/database/database_helper.dart';
 
@@ -37,21 +38,41 @@ class MessageRepository {
       );
       if (inserted == 0) return false;
 
-      final updated = await txn.update(
+      final chatRows = await txn.query(
         'chats',
-        {
-          'last_message': message.content,
-          'last_message_time': message.timestamp.toIso8601String(),
-          'updated_at': DateTime.now().toIso8601String(),
-        },
+        columns: ['last_message_time'],
         where: 'chat_id = ?',
         whereArgs: [message.chatId],
+        limit: 1,
       );
-      if (updated != 1) {
+      if (chatRows.isEmpty) {
         throw StateError('Chat not found for message ${message.messageId}');
+      }
+
+      final messageTime = TimestampUtils.toUtcIso8601(message.timestamp);
+      final storedTime = chatRows.first['last_message_time'] as String?;
+      if (_isNewerThanStored(messageTime, storedTime)) {
+        await txn.update(
+          'chats',
+          {
+            'last_message': message.content,
+            'last_message_time': messageTime,
+            'updated_at': TimestampUtils.nowUtcIso8601(),
+          },
+          where: 'chat_id = ?',
+          whereArgs: [message.chatId],
+        );
       }
       return true;
     });
+  }
+
+  static bool _isNewerThanStored(String candidate, String? stored) {
+    if (stored == null) return true;
+    final candidateTime = DateTime.tryParse(candidate);
+    final storedTime = DateTime.tryParse(stored);
+    if (candidateTime == null || storedTime == null) return true;
+    return candidateTime.isAfter(storedTime);
   }
 
   Future<List<Message>> getMessagesByChatId(
@@ -90,7 +111,7 @@ class MessageRepository {
     final db = await _db;
     await db.update(
       'messages',
-      {'status': status.name, 'updated_at': DateTime.now().toIso8601String()},
+      {'status': status.name, 'updated_at': TimestampUtils.nowUtcIso8601()},
       where: 'message_id = ?',
       whereArgs: [messageId],
     );
@@ -105,7 +126,7 @@ class MessageRepository {
       'messages',
       {
         'transport': transport.name,
-        'updated_at': DateTime.now().toIso8601String(),
+        'updated_at': TimestampUtils.nowUtcIso8601(),
       },
       where: 'message_id = ?',
       whereArgs: [messageId],
@@ -163,7 +184,7 @@ class MessageRepository {
       {
         'status': status.name,
         'transport': transport.name,
-        'updated_at': DateTime.now().toIso8601String(),
+        'updated_at': TimestampUtils.nowUtcIso8601(),
       },
       where: 'message_id = ?',
       whereArgs: [messageId],
@@ -177,7 +198,7 @@ class MessageRepository {
       {
         'status': MessageStatus.queued.name,
         'transport': MessageTransport.pending.name,
-        'updated_at': DateTime.now().toIso8601String(),
+        'updated_at': TimestampUtils.nowUtcIso8601(),
       },
       where: 'sender_id = ? AND status IN (?, ?)',
       whereArgs: [

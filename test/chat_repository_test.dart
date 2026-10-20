@@ -1,3 +1,4 @@
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/chat.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/repositories/chat_repository.dart';
@@ -67,7 +68,7 @@ void main() {
 
       final row = (await db.query('chats')).single;
       expect(row['id'], 'chat-row-id');
-      expect(row['created_at'], createdAt.toIso8601String());
+      expect(row['created_at'], TimestampUtils.toUtcIso8601(createdAt));
       expect(row['title'], 'Alice Updated');
       expect(row['unread_count'], 4);
     },

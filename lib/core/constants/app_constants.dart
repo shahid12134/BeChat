@@ -2,7 +2,7 @@ class AppConstants {
   static const String appName = 'BeChat';
   static const String appVersion = '1.0.0';
   static const String databaseName = 'bechat.db';
-  static const int databaseVersion = 1;
+  static const int databaseVersion = 2;
 
   static const Duration scanTimeout = Duration(seconds: 15);
   static const Duration mockResponseDelay = Duration(milliseconds: 800);

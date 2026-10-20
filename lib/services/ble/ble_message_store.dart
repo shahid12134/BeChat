@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/database/database_helper.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
@@ -68,8 +69,8 @@ class BleMessageStore {
             'display_name': peer.displayName,
             'device_name': peer.deviceName,
             'status': PeerStatus.online.name,
-            'last_seen': now.toIso8601String(),
-            'updated_at': now.toIso8601String(),
+            'last_seen': TimestampUtils.toUtcIso8601(now),
+            'updated_at': TimestampUtils.toUtcIso8601(now),
           },
           where: 'peer_id = ?',
           whereArgs: [peer.peerId],
@@ -104,8 +105,8 @@ class BleMessageStore {
           'peer_id': peer.peerId,
           'title': peer.displayName,
           'unread_count': 0,
-          'created_at': now.toIso8601String(),
-          'updated_at': now.toIso8601String(),
+          'created_at': TimestampUtils.toUtcIso8601(now),
+          'updated_at': TimestampUtils.toUtcIso8601(now),
         };
         await txn.insert('chats', chat);
         chatRows = await txn.query(
@@ -146,14 +147,21 @@ class BleMessageStore {
         );
       }
 
+      final messageTime = TimestampUtils.toUtcIso8601(
+        payload.metadata.timestamp,
+      );
+      final storedTime = chatRows.first['last_message_time'] as String?;
+      final chatUpdate = <String, Object?>{
+        'unread_count': (chatRows.first['unread_count'] as int? ?? 0) + 1,
+      };
+      if (storedTime == null || _isNewerThanStored(messageTime, storedTime)) {
+        chatUpdate['last_message'] = payload.content;
+        chatUpdate['last_message_time'] = messageTime;
+        chatUpdate['updated_at'] = TimestampUtils.toUtcIso8601(now);
+      }
       await txn.update(
         'chats',
-        {
-          'last_message': payload.content,
-          'last_message_time': payload.metadata.timestamp.toIso8601String(),
-          'unread_count': (chatRows.first['unread_count'] as int? ?? 0) + 1,
-          'updated_at': now.toIso8601String(),
-        },
+        chatUpdate,
         where: 'chat_id = ?',
         whereArgs: [chatId],
       );
@@ -164,6 +172,13 @@ class BleMessageStore {
         peerId: peer.peerId,
       );
     });
+  }
+
+  static bool _isNewerThanStored(String candidate, String stored) {
+    final candidateTime = DateTime.tryParse(candidate);
+    final storedTime = DateTime.tryParse(stored);
+    if (candidateTime == null || storedTime == null) return true;
+    return candidateTime.isAfter(storedTime);
   }
 }
 

@@ -1,3 +1,5 @@
+import 'package:bechat/core/utils/timestamp_utils.dart';
+
 class Chat {
   final String? id;
   final String chatId;
@@ -52,10 +54,16 @@ class Chat {
       'peer_id': peerId,
       'title': title,
       'last_message': lastMessage,
-      'last_message_time': lastMessageTime?.toIso8601String(),
+      'last_message_time': lastMessageTime == null
+          ? null
+          : TimestampUtils.toUtcIso8601(lastMessageTime!),
       'unread_count': unreadCount,
-      'created_at': createdAt?.toIso8601String(),
-      'updated_at': updatedAt?.toIso8601String(),
+      'created_at': createdAt == null
+          ? null
+          : TimestampUtils.toUtcIso8601(createdAt!),
+      'updated_at': updatedAt == null
+          ? null
+          : TimestampUtils.toUtcIso8601(updatedAt!),
     };
   }
 

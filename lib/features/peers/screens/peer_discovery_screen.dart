@@ -182,7 +182,15 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
                 ),
               ),
             ),
-          if (!demoEnabled) _buildBleBanner(context, bleState),
+          if (!demoEnabled)
+            ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * 0.45,
+              ),
+              child: SingleChildScrollView(
+                child: _buildBleBanner(context, bleState),
+              ),
+            ),
           if (demoEnabled)
             Container(
               padding: const EdgeInsets.all(16),

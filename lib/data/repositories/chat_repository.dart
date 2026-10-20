@@ -1,5 +1,6 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/chat.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/database/database_helper.dart';
@@ -95,7 +96,7 @@ class ChatRepository {
     final map = chat.toMap()
       ..remove('id')
       ..remove('created_at')
-      ..['updated_at'] = DateTime.now().toIso8601String();
+      ..['updated_at'] = TimestampUtils.nowUtcIso8601();
     await db.update(
       'chats',
       map,
@@ -114,8 +115,8 @@ class ChatRepository {
       'chats',
       {
         'last_message': message,
-        'last_message_time': time.toIso8601String(),
-        'updated_at': DateTime.now().toIso8601String(),
+        'last_message_time': TimestampUtils.toUtcIso8601(time),
+        'updated_at': TimestampUtils.nowUtcIso8601(),
       },
       where: 'chat_id = ?',
       whereArgs: [chatId],
@@ -126,7 +127,7 @@ class ChatRepository {
     final db = await _db;
     await db.rawUpdate(
       'UPDATE chats SET unread_count = unread_count + 1, updated_at = ? WHERE chat_id = ?',
-      [DateTime.now().toIso8601String(), chatId],
+      [TimestampUtils.nowUtcIso8601(), chatId],
     );
   }
 
@@ -134,7 +135,7 @@ class ChatRepository {
     final db = await _db;
     await db.update(
       'chats',
-      {'unread_count': 0, 'updated_at': DateTime.now().toIso8601String()},
+      {'unread_count': 0, 'updated_at': TimestampUtils.nowUtcIso8601()},
       where: 'chat_id = ?',
       whereArgs: [chatId],
     );

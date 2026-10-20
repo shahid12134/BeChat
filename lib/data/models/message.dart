@@ -1,3 +1,5 @@
+import 'package:bechat/core/utils/timestamp_utils.dart';
+
 enum MessageType { text, image, file, system }
 
 enum MessageStatus { queued, sending, sent, delivered, read, failed }
@@ -82,13 +84,17 @@ class Message {
       'receiver_id': receiverId,
       'content': content,
       'message_type': messageType.name,
-      'timestamp': timestamp.toIso8601String(),
+      'timestamp': TimestampUtils.toUtcIso8601(timestamp),
       'status': status.name,
       'transport': transport.name,
       'ttl': ttl,
       'is_encrypted': isEncrypted ? 1 : 0,
-      'created_at': createdAt?.toIso8601String(),
-      'updated_at': updatedAt?.toIso8601String(),
+      'created_at': createdAt == null
+          ? null
+          : TimestampUtils.toUtcIso8601(createdAt!),
+      'updated_at': updatedAt == null
+          ? null
+          : TimestampUtils.toUtcIso8601(updatedAt!),
     };
   }
 

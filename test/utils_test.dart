@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:intl/intl.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:bechat/core/utils/date_utils.dart';
 
@@ -42,6 +43,14 @@ void main() {
       final threeHoursAgo = DateTime.now().subtract(const Duration(hours: 3));
       final result = AppDateUtils.formatRelativeTime(threeHoursAgo);
       expect(result, '3h ago');
+    });
+
+    test('renders UTC timestamps in the device timezone', () {
+      final utc = DateTime.utc(2026, 8, 9, 10, 30);
+      expect(
+        AppDateUtils.formatMessageTimestamp(utc),
+        DateFormat('h:mm a').format(utc.toLocal()),
+      );
     });
 
     test('returns empty string for null datetime', () {

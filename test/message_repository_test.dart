@@ -1,3 +1,4 @@
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/repositories/chat_repository.dart';
@@ -161,9 +162,97 @@ void main() {
 
       final chat = (await db.query('chats')).single;
       expect(chat['last_message'], 'Queued message');
-      expect(chat['last_message_time'], now.toIso8601String());
+      expect(chat['last_message_time'], TimestampUtils.toUtcIso8601(now));
     },
   );
+
+  test(
+    'persists timestamps as canonical UTC regardless of source zone',
+    () async {
+      final localTime = DateTime(2026, 2, 3, 4, 5, 6, 789, 123);
+      final utcTime = DateTime.utc(2026, 2, 3, 4, 5, 6, 789, 456);
+      await repository.insertMessage(
+        Message(
+          messageId: 'msg-local-time',
+          chatId: chatId,
+          senderId: 'device-local',
+          receiverId: peer.peerId,
+          content: 'Local time',
+          timestamp: localTime,
+          createdAt: localTime,
+          updatedAt: localTime,
+        ),
+      );
+      await repository.insertMessage(
+        Message(
+          messageId: 'msg-utc-time',
+          chatId: chatId,
+          senderId: peer.peerId,
+          receiverId: 'device-local',
+          content: 'UTC time',
+          timestamp: utcTime,
+          createdAt: utcTime,
+          updatedAt: utcTime,
+        ),
+      );
+
+      final rows = await db.query('messages', orderBy: 'message_id ASC');
+      expect(rows, hasLength(2));
+      for (final row in rows) {
+        final timestamp = row['timestamp'] as String;
+        expect(timestamp, endsWith('Z'));
+        expect(DateTime.parse(timestamp).isUtc, isTrue);
+        expect(timestamp, hasLength(27));
+      }
+      final localRow = rows.singleWhere(
+        (row) => row['message_id'] == 'msg-local-time',
+      );
+      expect(
+        DateTime.parse(
+          localRow['timestamp'] as String,
+        ).isAtSameMomentAs(localTime),
+        isTrue,
+      );
+    },
+  );
+
+  test('an older message does not overwrite newer chat metadata', () async {
+    final newer = DateTime.utc(2026, 5, 1, 12);
+    final older = DateTime.utc(2026, 5, 1, 10);
+
+    await repository.insertMessageAndUpdateChat(
+      Message(
+        messageId: 'msg-newer',
+        chatId: chatId,
+        senderId: peer.peerId,
+        receiverId: 'device-local',
+        content: 'Newest',
+        timestamp: newer,
+        createdAt: newer,
+        updatedAt: newer,
+      ),
+    );
+    expect(
+      await repository.insertMessageAndUpdateChat(
+        Message(
+          messageId: 'msg-older',
+          chatId: chatId,
+          senderId: peer.peerId,
+          receiverId: 'device-local',
+          content: 'Stale',
+          timestamp: older,
+          createdAt: older,
+          updatedAt: older,
+        ),
+      ),
+      isTrue,
+    );
+
+    final chat = (await db.query('chats')).single;
+    expect(chat['last_message'], 'Newest');
+    expect(chat['last_message_time'], TimestampUtils.toUtcIso8601(newer));
+    expect(await db.query('messages'), hasLength(2));
+  });
 
   test('inserted rows receive non-null primary keys', () async {
     final now = DateTime.now();

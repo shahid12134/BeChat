@@ -35,6 +35,32 @@ enum BleRuntimeStatus {
 
 enum BleLinkRole { central, peripheral }
 
+/// Runs [operation] again after a transient failure, up to [maxAttempts].
+///
+/// Re-throws the last error with its original stack trace when every attempt
+/// fails, so callers can still surface the underlying platform message.
+Future<T> retryBleOperation<T>(
+  Future<T> Function() operation, {
+  int maxAttempts = 3,
+  Duration Function(int attempt)? delay,
+}) async {
+  Object? lastError;
+  StackTrace? lastStackTrace;
+  for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error, stackTrace) {
+      lastError = error;
+      lastStackTrace = stackTrace;
+      if (attempt == maxAttempts) break;
+      if (delay != null) {
+        await Future<void>.delayed(delay(attempt));
+      }
+    }
+  }
+  Error.throwWithStackTrace(lastError!, lastStackTrace!);
+}
+
 class BleRuntimeState {
   const BleRuntimeState({
     this.status = BleRuntimeStatus.idle,
@@ -146,6 +172,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   bool _advertising = false;
   bool _linkEstablishing = false;
   bool _cleaningLink = false;
+  Completer<void>? _linkCleanupCompleter;
   bool _disposed = false;
 
   BleLinkSession? _activeSession;
@@ -631,6 +658,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
     final waiter = Completer<void>();
     _connectionWaiters[peripheral.uuid.toString()] = waiter;
+    unawaited(waiter.future.catchError((Object _) {}));
     try {
       await _central.connect(peripheral).timeout(const Duration(seconds: 15));
       await waiter.future.timeout(const Duration(seconds: 15));
@@ -649,7 +677,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         maximumWriteLength: maxWriteLength,
       );
       _centralTransport = transport;
-      await _central.setCharacteristicNotifyState(peripheral, tx, state: true);
+      await _enableNotifications(peripheral, tx);
       final session = _createSession(transport, BleLinkRole.central);
       _activeSession = session;
       final hello = await session.start();
@@ -675,6 +703,26 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
       return null;
     }
+  }
+
+  /// Writes the TX client configuration descriptor.
+  ///
+  /// Android can report a generic status 129 for this write when it races the
+  /// tail of service discovery or a just-closed link. The descriptor write is
+  /// idempotent, so retrying on the same connection recovers the common case
+  /// instead of forcing the user to reconnect manually.
+  Future<void> _enableNotifications(
+    Peripheral peripheral,
+    GATTCharacteristic characteristic,
+  ) {
+    return retryBleOperation(
+      () => _central.setCharacteristicNotifyState(
+        peripheral,
+        characteristic,
+        state: true,
+      ),
+      delay: (attempt) => Duration(milliseconds: 250 * attempt),
+    );
   }
 
   _BeChatCharacteristics _findBeChatCharacteristics(
@@ -838,6 +886,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       if (waiter != null && !waiter.isCompleted) waiter.complete();
       return;
     }
+    final waiter = _connectionWaiters.remove(key);
+    if (waiter != null && !waiter.isCompleted) {
+      waiter.completeError(
+        const BleLinkException(
+          'The peer disconnected during connection setup.',
+        ),
+      );
+    }
     _pendingCentralWrites.remove(key);
     final activePeripheral = _activePeripheral;
     if (activePeripheral != null &&
@@ -903,6 +959,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
       return;
     }
+    final cleanup = _linkCleanupCompleter;
+    if (cleanup != null) {
+      await cleanup.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
+      if (_disposed) return;
+    }
     if (_activeRole == BleLinkRole.peripheral &&
         _activeCentral?.uuid == event.central.uuid &&
         (_activeSession != null || _linkEstablishing)) {
@@ -964,6 +1028,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Future<void> _onSessionClosed(BleLinkRole role, Object? error) async {
     if (_cleaningLink) return;
     _cleaningLink = true;
+    final cleanup = Completer<void>();
+    _linkCleanupCompleter = cleanup;
     try {
       _activeSession = null;
       _activePeer = null;
@@ -1012,6 +1078,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
     } finally {
       _cleaningLink = false;
+      if (!cleanup.isCompleted) cleanup.complete();
+      if (identical(_linkCleanupCompleter, cleanup)) {
+        _linkCleanupCompleter = null;
+      }
     }
   }
 
