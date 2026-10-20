@@ -30,11 +30,19 @@ class DatabaseHelper {
   }
 
   static Future<void> _onCreate(Database db, int version) async {
+    await createSchema(db);
+  }
+
+  static Future<void> createSchema(Database db) async {
     await _createTables(db);
     await _createIndexes(db);
   }
 
-  static Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+  static Future<void> _onUpgrade(
+    Database db,
+    int oldVersion,
+    int newVersion,
+  ) async {
     // Future migrations go here
     // if (oldVersion < 2) { await _migrateToV2(db); }
   }
@@ -138,16 +146,28 @@ class DatabaseHelper {
 
   static Future<void> _createIndexes(Database db) async {
     await db.execute('CREATE INDEX idx_messages_chat_id ON messages(chat_id)');
-    await db.execute('CREATE INDEX idx_messages_timestamp ON messages(timestamp)');
+    await db.execute(
+      'CREATE INDEX idx_messages_timestamp ON messages(timestamp)',
+    );
     await db.execute('CREATE INDEX idx_messages_sender ON messages(sender_id)');
-    await db.execute('CREATE INDEX idx_messages_receiver ON messages(receiver_id)');
+    await db.execute(
+      'CREATE INDEX idx_messages_receiver ON messages(receiver_id)',
+    );
     await db.execute('CREATE INDEX idx_chats_peer_id ON chats(peer_id)');
-    await db.execute('CREATE INDEX idx_chats_last_message_time ON chats(last_message_time)');
+    await db.execute(
+      'CREATE INDEX idx_chats_last_message_time ON chats(last_message_time)',
+    );
     await db.execute('CREATE INDEX idx_peers_peer_id ON peers(peer_id)');
     await db.execute('CREATE INDEX idx_peers_status ON peers(status)');
-    await db.execute('CREATE INDEX idx_message_routes_target ON message_routes(target_peer)');
-    await db.execute('CREATE INDEX idx_message_routes_status ON message_routes(status)');
-    await db.execute('CREATE INDEX idx_attachments_message ON attachments(message_id)');
+    await db.execute(
+      'CREATE INDEX idx_message_routes_target ON message_routes(target_peer)',
+    );
+    await db.execute(
+      'CREATE INDEX idx_message_routes_status ON message_routes(status)',
+    );
+    await db.execute(
+      'CREATE INDEX idx_attachments_message ON attachments(message_id)',
+    );
   }
 
   static Future<void> closeDatabase() async {

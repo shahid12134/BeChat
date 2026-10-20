@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
 import 'package:bechat/core/utils/date_utils.dart';
+import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 
 class PeerDetailsScreen extends ConsumerStatefulWidget {
@@ -16,18 +17,65 @@ class PeerDetailsScreen extends ConsumerStatefulWidget {
 }
 
 class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
+  Future<void> _openChat(Peer peer) async {
+    try {
+      await ref.read(peerListProvider.notifier).savePeer(peer);
+      final chat = await ref
+          .read(chatRepositoryProvider)
+          .getOrCreateChatForPeer(peer);
+      await ref.read(chatListProvider.notifier).refreshChats();
+      if (mounted) {
+        context.push('/chat/${chat.chatId}');
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Unable to open conversation: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final peersAsync = ref.watch(peerListProvider);
-    final peer = peersAsync.valueOrNull?.where((p) => p.peerId == widget.peerId).firstOrNull;
 
-    if (peer == null) {
-      return Scaffold(
+    return peersAsync.when(
+      loading: () => Scaffold(
         appBar: AppBar(title: const Text('Peer Details')),
-        body: const Center(child: Text('Peer not found')),
-      );
-    }
+        body: const Center(child: CircularProgressIndicator()),
+      ),
+      error: (e, _) => Scaffold(
+        appBar: AppBar(title: const Text('Peer Details')),
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Error loading peer: $e'),
+              const SizedBox(height: 12),
+              ElevatedButton(
+                onPressed: () =>
+                    ref.read(peerListProvider.notifier).refreshPeers(),
+                child: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      ),
+      data: (peers) {
+        final peer = peers.where((p) => p.peerId == widget.peerId).firstOrNull;
+        if (peer == null) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('Peer Details')),
+            body: const Center(child: Text('Peer not found')),
+          );
+        }
+        return _buildDetails(context, peer);
+      },
+    );
+  }
 
+  Widget _buildDetails(BuildContext context, Peer peer) {
     return Scaffold(
       appBar: AppBar(
         title: Text(peer.displayName),
@@ -35,10 +83,14 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
           PopupMenuButton<String>(
             onSelected: (value) async {
               if (value == 'block') {
-                await ref.read(peerListProvider.notifier).blockPeer(peer.peerId);
+                await ref
+                    .read(peerListProvider.notifier)
+                    .blockPeer(peer.peerId);
                 if (context.mounted) context.pop();
               } else if (value == 'unblock') {
-                await ref.read(peerListProvider.notifier).unblockPeer(peer.peerId);
+                await ref
+                    .read(peerListProvider.notifier)
+                    .unblockPeer(peer.peerId);
               }
             },
             itemBuilder: (context) => [
@@ -70,14 +122,16 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             const SizedBox(height: 16),
             Text(
               peer.displayName,
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
             ),
             const SizedBox(height: 4),
             Text(
               peer.deviceName,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             Container(
@@ -117,16 +171,30 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             Text(
               'DEVICE INFORMATION',
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 1.2,
-                  ),
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 1.2,
+              ),
             ),
             const SizedBox(height: 12),
             _infoRow(context, 'Device ID', peer.peerId),
-            _infoRow(context, 'Signal Strength', peer.signalStrength != null ? '${peer.signalStrength} dBm' : 'Unknown'),
-            _infoRow(context, 'First Seen', AppDateUtils.formatFullTimestamp(peer.firstSeen)),
-            _infoRow(context, 'Last Seen', AppDateUtils.formatFullTimestamp(peer.lastSeen)),
+            _infoRow(
+              context,
+              'Signal Strength',
+              peer.signalStrength != null
+                  ? '${peer.signalStrength} dBm'
+                  : 'Unknown',
+            ),
+            _infoRow(
+              context,
+              'First Seen',
+              AppDateUtils.formatFullTimestamp(peer.firstSeen),
+            ),
+            _infoRow(
+              context,
+              'Last Seen',
+              AppDateUtils.formatFullTimestamp(peer.lastSeen),
+            ),
           ],
         ),
       ),
@@ -143,10 +211,10 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             Text(
               'SECURITY',
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 1.2,
-                  ),
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 1.2,
+              ),
             ),
             const SizedBox(height: 12),
             _infoRow(
@@ -163,8 +231,8 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             ),
             _infoRow(
               context,
-              'Pairing Status',
-              peer.isBlocked ? 'Blocked' : 'Available',
+              'Blocked',
+              peer.isBlocked ? 'Yes' : 'No',
               valueColor: peer.isBlocked ? Colors.red : Colors.green,
             ),
           ],
@@ -181,14 +249,18 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
           SizedBox(
             width: double.infinity,
             child: ElevatedButton.icon(
-              onPressed: peer.isBlocked ? null : () {
-                // TODO Phase 3: Implement actual pairing
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Pairing will be available in Phase 3')),
-                );
-              },
+              onPressed: peer.isBlocked ? null : () => _openChat(peer),
+              icon: const Icon(Icons.chat_bubble_outline),
+              label: const Text('Message'),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: null,
               icon: const Icon(Icons.link),
-              label: const Text('Pair / Connect'),
+              label: const Text('Pairing available in Phase 3'),
             ),
           ),
           const SizedBox(height: 8),
@@ -196,11 +268,16 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             width: double.infinity,
             child: OutlinedButton.icon(
               onPressed: () async {
-                await ref.read(peerListProvider.notifier).blockPeer(peer.peerId);
+                await ref
+                    .read(peerListProvider.notifier)
+                    .blockPeer(peer.peerId);
                 if (context.mounted) context.pop();
               },
               icon: const Icon(Icons.block, color: Colors.red),
-              label: const Text('Block Peer', style: TextStyle(color: Colors.red)),
+              label: const Text(
+                'Block Peer',
+                style: TextStyle(color: Colors.red),
+              ),
             ),
           ),
         ],
@@ -208,7 +285,12 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
     );
   }
 
-  Widget _infoRow(BuildContext context, String label, String value, {Color? valueColor}) {
+  Widget _infoRow(
+    BuildContext context,
+    String label,
+    String value, {
+    Color? valueColor,
+  }) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(

@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:bechat/data/models/identity.dart';
+import 'package:bechat/data/repositories/app_data_repository.dart';
 import 'package:bechat/data/repositories/identity_repository.dart';
 import 'package:bechat/data/database/database_helper.dart';
 
@@ -7,8 +8,17 @@ final identityRepositoryProvider = Provider<IdentityRepository>((ref) {
   return IdentityRepository();
 });
 
-final identityProvider = StateNotifierProvider<IdentityNotifier, AsyncValue<Identity?>>((ref) {
-  return IdentityNotifier(ref.read(identityRepositoryProvider));
+final appDataRepositoryProvider = Provider<AppDataRepository>((ref) {
+  return AppDataRepository();
+});
+
+final identityProvider =
+    StateNotifierProvider<IdentityNotifier, AsyncValue<Identity?>>((ref) {
+      return IdentityNotifier(ref.read(identityRepositoryProvider));
+    });
+
+final localDeviceIdProvider = Provider<String?>((ref) {
+  return ref.watch(identityProvider).valueOrNull?.deviceId;
 });
 
 class IdentityNotifier extends StateNotifier<AsyncValue<Identity?>> {
@@ -21,7 +31,7 @@ class IdentityNotifier extends StateNotifier<AsyncValue<Identity?>> {
   Future<void> loadIdentity() async {
     state = const AsyncValue.loading();
     try {
-      final identity = await _repository.getIdentity();
+      final identity = await _repository.ensureIdentity();
       state = AsyncValue.data(identity);
     } catch (e, st) {
       state = AsyncValue.error(e, st);
@@ -42,7 +52,14 @@ class IdentityNotifier extends StateNotifier<AsyncValue<Identity?>> {
 
 final databaseInfoProvider = FutureProvider<Map<String, int>>((ref) async {
   final db = await DatabaseHelper.database;
-  final tables = ['peers', 'chats', 'messages', 'attachments', 'identity', 'message_routes'];
+  final tables = [
+    'peers',
+    'chats',
+    'messages',
+    'attachments',
+    'identity',
+    'message_routes',
+  ];
   final counts = <String, int>{};
   for (final table in tables) {
     final result = await db.rawQuery('SELECT COUNT(*) as count FROM $table');

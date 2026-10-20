@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/repositories/message_repository.dart';
 
@@ -7,15 +8,20 @@ final messageRepositoryProvider = Provider<MessageRepository>((ref) {
 });
 
 final messageListProvider =
-    StateNotifierProvider.family<MessageListNotifier, AsyncValue<List<Message>>, String>((ref, chatId) {
-  return MessageListNotifier(ref.read(messageRepositoryProvider), chatId);
-});
+    StateNotifierProvider.family<
+      MessageListNotifier,
+      AsyncValue<List<Message>>,
+      String
+    >((ref, chatId) {
+      return MessageListNotifier(ref.read(messageRepositoryProvider), chatId);
+    });
 
 class MessageListNotifier extends StateNotifier<AsyncValue<List<Message>>> {
   final MessageRepository _repository;
   final String chatId;
 
-  MessageListNotifier(this._repository, this.chatId) : super(const AsyncValue.loading()) {
+  MessageListNotifier(this._repository, this.chatId)
+    : super(const AsyncValue.loading()) {
     loadMessages();
   }
 
@@ -39,7 +45,21 @@ class MessageListNotifier extends StateNotifier<AsyncValue<List<Message>>> {
   }
 
   Future<void> sendMessage(Message message) async {
-    await _repository.insertMessage(message);
-    await refreshMessages();
+    final inserted = await _repository.insertMessageAndUpdateChat(message);
+    if (!inserted) {
+      throw StateError('Message ${message.messageId} already exists');
+    }
+
+    final messages = [...?state.valueOrNull, message]
+      ..sort((a, b) {
+        final byTimestamp = a.timestamp.compareTo(b.timestamp);
+        return byTimestamp != 0
+            ? byTimestamp
+            : a.messageId.compareTo(b.messageId);
+      });
+    if (messages.length > AppConstants.defaultPageSize) {
+      messages.removeRange(0, messages.length - AppConstants.defaultPageSize);
+    }
+    state = AsyncValue.data(messages);
   }
 }

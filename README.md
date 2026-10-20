@@ -4,9 +4,9 @@
 
 ## Current Status
 
-**Phase 1 + Phase 2 only.** This is the development foundation with working chat UI, peer discovery UI, local SQLite persistence, and mock peer discovery.
+**Phase 1: Local Foundation.** This release provides a unique local identity, safe local SQLite persistence, local chat creation, honest queued message states, and an opt-in simulated discovery mode.
 
-Phase 3+ features (BLE, cryptography, Wi-Fi Direct, cloud messaging) are NOT implemented.
+Real BLE discovery, cryptography, pairing, Wi-Fi Direct, cloud messaging, and mesh routing are NOT implemented.
 
 ---
 
@@ -28,6 +28,7 @@ lib/
   main.dart                          # App entry point
   app/
     app.dart                         # MaterialApp widget
+    bootstrap_host.dart              # Database/identity bootstrap and retry UI
     theme/
       app_theme.dart                 # Light/dark themes, colors
     routes/
@@ -52,12 +53,14 @@ lib/
       identity.dart                  # Device identity model
       message_route.dart             # Future routing model
     repositories/
+      app_data_repository.dart       # Transactional user-data clearing
       peer_repository.dart           # Peer CRUD operations
       chat_repository.dart           # Chat CRUD operations
       message_repository.dart        # Message CRUD operations
-      identity_repository.dart       # Identity CRUD operations
+      identity_repository.dart       # Identity bootstrap and legacy repair
       peer_discovery_repository.dart # Abstract discovery interface
-      mock_peer_discovery_repository.dart # Mock discovery implementation
+      mock_peer_discovery_repository.dart # Demo-only simulated discovery
+      unavailable_peer_discovery_repository.dart # Non-demo discovery state
     mock/
       mock_data.dart                 # Demo data seeder
   providers/
@@ -113,7 +116,6 @@ lib/
 | `sqflite` | Local SQLite database |
 | `uuid` | Unique ID generation |
 | `intl` | Date formatting |
-| `google_fonts` | Typography |
 
 ---
 
@@ -175,9 +177,18 @@ adb install build/app/outputs/flutter-apk/app-debug.apk
 
 ---
 
-## How Mock Peers Work
+## Demo Mode and Simulated Peers
 
-The application includes a `MockPeerDiscoveryRepository` that simulates BLE peer discovery:
+Demo mode is disabled by default. Ordinary startup creates only the local identity and does not seed peers, chats, or messages.
+
+Enable simulated discovery and sample data explicitly:
+
+```bash
+flutter run --dart-define=BECHAT_DEMO_DATA=true
+flutter build apk --debug --dart-define=BECHAT_DEMO_DATA=true
+```
+
+With demo mode enabled, the Nearby screen is labeled as simulated and can discover:
 
 - **Alice** - "Alice's Phone" (Online, -45 dBm)
 - **Rahul** - "Rahul's Phone" (Online, -62 dBm)
@@ -185,19 +196,11 @@ The application includes a `MockPeerDiscoveryRepository` that simulates BLE peer
 - **Cyber Lab** - (Online, -55 dBm)
 - **Maria** - "Maria's Phone" (Offline, -88 dBm)
 
-Tap **Scan** to discover mock peers. In Phase 3, `BlePeerDiscoveryRepository` will replace this.
+These are not real Bluetooth devices. In Phase 2, a real `PeerDiscoveryRepository` implementation will replace the mock.
 
----
+Demo seeding does not create or replace the real local identity. It runs only when demo mode is enabled and the peers table is empty, so repeated startup does not duplicate records.
 
-## How Sample Data Works
-
-On first launch, if the database is empty, `MockData.seedIfEmpty()` populates:
-
-- Local device identity
-- 5 mock peers
-- 3 conversations with messages
-
-Sample data is seeded once and persists in SQLite.
+To remove demo data, open **Settings > Debug Information > Clear Database**. This deletes peers, chats, messages, attachments, and routing records while keeping the local identity. If demo mode remains enabled, sample data may be seeded again on a later startup when the peers table is empty.
 
 ---
 
@@ -260,9 +263,12 @@ flutter analyze       # Check for issues
 ```
 
 Tests cover:
-- Model serialization/deserialization
-- Date utility functions
-- Basic widget rendering
+- Identity creation, persistence, legacy placeholder repair, and rollback
+- Peer/chat/message repository safety, ordering, transactions, and foreign keys
+- User-data clearing while retaining identity
+- Queued message behavior and sender detection
+- Demo-mode gating and simulated peer persistence
+- Bootstrap failure recovery and key widget interactions
 
 ---
 

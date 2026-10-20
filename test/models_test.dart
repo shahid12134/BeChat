@@ -99,30 +99,45 @@ void main() {
       expect(restored.transport, MessageTransport.local);
     });
 
-    test('isSent returns true for local device', () {
+    test('isSentBy returns true for the current local device', () {
       final message = Message(
         messageId: 'msg-001',
         chatId: 'chat-001',
-        senderId: 'local-device-001',
+        senderId: 'device-abc',
         receiverId: 'peer-001',
         content: 'Test',
         timestamp: DateTime.now(),
       );
 
-      expect(message.isSent, true);
+      expect(message.isSentBy('device-abc'), true);
     });
 
-    test('isSent returns false for remote peer', () {
+    test('isSentBy returns false for another device and a legacy constant', () {
       final message = Message(
         messageId: 'msg-001',
         chatId: 'chat-001',
         senderId: 'peer-001',
-        receiverId: 'local-device-001',
+        receiverId: 'device-abc',
         content: 'Test',
         timestamp: DateTime.now(),
       );
 
-      expect(message.isSent, false);
+      expect(message.isSentBy('device-abc'), false);
+      expect(message.isSentBy('local-device-001'), false);
+    });
+
+    test('new messages default to queued and pending transport', () {
+      final message = Message(
+        messageId: 'msg-001',
+        chatId: 'chat-001',
+        senderId: 'device-abc',
+        receiverId: 'peer-001',
+        content: 'Test',
+        timestamp: DateTime.now(),
+      );
+
+      expect(message.status, MessageStatus.queued);
+      expect(message.transport, MessageTransport.pending);
     });
   });
 

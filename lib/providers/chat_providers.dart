@@ -6,9 +6,10 @@ final chatRepositoryProvider = Provider<ChatRepository>((ref) {
   return ChatRepository();
 });
 
-final chatListProvider = StateNotifierProvider<ChatListNotifier, AsyncValue<List<Chat>>>((ref) {
-  return ChatListNotifier(ref.read(chatRepositoryProvider));
-});
+final chatListProvider =
+    StateNotifierProvider<ChatListNotifier, AsyncValue<List<Chat>>>((ref) {
+      return ChatListNotifier(ref.read(chatRepositoryProvider));
+    });
 
 class ChatListNotifier extends StateNotifier<AsyncValue<List<Chat>>> {
   final ChatRepository _repository;
@@ -36,7 +37,11 @@ class ChatListNotifier extends StateNotifier<AsyncValue<List<Chat>>> {
     }
   }
 
-  Future<void> updateLastMessage(String chatId, String message, DateTime time) async {
+  Future<void> updateLastMessage(
+    String chatId,
+    String message,
+    DateTime time,
+  ) async {
     await _repository.updateLastMessage(chatId, message, time);
     await refreshChats();
   }

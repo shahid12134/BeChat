@@ -14,6 +14,11 @@ class AppConstants {
   static const String defaultDeviceName = 'My BeChat Device';
   static const String defaultAvatarPath = '';
 
-  // Future Phase 3: will hold actual device identity
-  static const String placeholderDeviceId = 'local-device-001';
+  static const bool demoDataEnabled = bool.fromEnvironment(
+    'BECHAT_DEMO_DATA',
+    defaultValue: false,
+  );
+
+  // Legacy installations used this shared ID before unique identities existed.
+  static const String legacyPlaceholderDeviceId = 'local-device-001';
 }

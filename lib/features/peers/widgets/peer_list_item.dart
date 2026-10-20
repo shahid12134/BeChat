@@ -3,12 +3,32 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
+import 'package:bechat/providers/chat_providers.dart';
+import 'package:bechat/providers/peer_providers.dart';
 
 class PeerListItem extends ConsumerWidget {
   final Peer peer;
-  final bool showSaved;
 
-  const PeerListItem({super.key, required this.peer, this.showSaved = false});
+  const PeerListItem({super.key, required this.peer});
+
+  Future<void> _startChat(BuildContext context, WidgetRef ref) async {
+    try {
+      await ref.read(peerListProvider.notifier).savePeer(peer);
+      final chat = await ref
+          .read(chatRepositoryProvider)
+          .getOrCreateChatForPeer(peer);
+      await ref.read(chatListProvider.notifier).refreshChats();
+      if (context.mounted) {
+        context.push('/chat/${chat.chatId}');
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Unable to open conversation: $e')),
+        );
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -53,16 +73,11 @@ class PeerListItem extends ConsumerWidget {
           ),
         ],
       ),
-      trailing: showSaved
-          ? null
-          : ElevatedButton(
-              onPressed: () {},
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                minimumSize: Size.zero,
-              ),
-              child: const Text('Pair', style: TextStyle(fontSize: 12)),
-            ),
+      trailing: IconButton(
+        icon: const Icon(Icons.chat_bubble_outline),
+        tooltip: 'Message',
+        onPressed: () => _startChat(context, ref),
+      ),
       onTap: () => context.push('/peer/${peer.peerId}'),
     );
   }

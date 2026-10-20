@@ -1,6 +1,13 @@
 import 'package:flutter/material.dart';
 
-enum EmptyStateType { noChats, noPeers, noMessages, scanFailed }
+enum EmptyStateType {
+  noChats,
+  noPeers,
+  noMessages,
+  scanFailed,
+  noSearchResults,
+  discoveryUnavailable,
+}
 
 class EmptyState extends StatelessWidget {
   final EmptyStateType type;
@@ -18,9 +25,20 @@ class EmptyState extends StatelessWidget {
           children: [
             Icon(_icon, size: 80, color: Theme.of(context).colorScheme.outline),
             const SizedBox(height: 24),
-            Text(_title, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600)),
+            Text(
+              _title,
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w600),
+            ),
             const SizedBox(height: 8),
-            Text(_subtitle, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant)),
+            Text(
+              _subtitle,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
             if (onAction != null && _buttonLabel != null) ...[
               const SizedBox(height: 24),
               ElevatedButton.icon(
@@ -40,6 +58,8 @@ class EmptyState extends StatelessWidget {
     EmptyStateType.noPeers => Icons.bluetooth_searching,
     EmptyStateType.noMessages => Icons.message_outlined,
     EmptyStateType.scanFailed => Icons.error_outline,
+    EmptyStateType.noSearchResults => Icons.search_off,
+    EmptyStateType.discoveryUnavailable => Icons.bluetooth_disabled,
   };
 
   String get _title => switch (type) {
@@ -47,13 +67,22 @@ class EmptyState extends StatelessWidget {
     EmptyStateType.noPeers => 'No peers found',
     EmptyStateType.noMessages => 'No messages yet',
     EmptyStateType.scanFailed => 'Scan failed',
+    EmptyStateType.noSearchResults => 'No results',
+    EmptyStateType.discoveryUnavailable =>
+      'Bluetooth discovery coming in Phase 2',
   };
 
   String get _subtitle => switch (type) {
-    EmptyStateType.noChats => 'Start a conversation with a nearby peer to get started.',
-    EmptyStateType.noPeers => 'Make sure Bluetooth is enabled and tap scan to discover nearby BeChat devices.',
+    EmptyStateType.noChats =>
+      'Start a conversation with a nearby peer to get started.',
+    EmptyStateType.noPeers =>
+      'Make sure Bluetooth is enabled and tap scan to discover nearby BeChat devices.',
     EmptyStateType.noMessages => 'Send a message to start the conversation.',
-    EmptyStateType.scanFailed => 'Unable to scan for peers. Check your Bluetooth settings and try again.',
+    EmptyStateType.scanFailed =>
+      'Discovery could not be completed. Please try again.',
+    EmptyStateType.noSearchResults => 'No conversations match your search.',
+    EmptyStateType.discoveryUnavailable =>
+      'Real nearby-device discovery is not implemented yet. Simulated discovery is available only when demo mode is enabled.',
   };
 
   String? get _buttonLabel => switch (type) {
@@ -61,6 +90,8 @@ class EmptyState extends StatelessWidget {
     EmptyStateType.noPeers => 'Scan Again',
     EmptyStateType.noMessages => null,
     EmptyStateType.scanFailed => 'Retry Scan',
+    EmptyStateType.noSearchResults => null,
+    EmptyStateType.discoveryUnavailable => null,
   };
 
   IconData? get _buttonIcon => switch (type) {
@@ -68,5 +99,7 @@ class EmptyState extends StatelessWidget {
     EmptyStateType.noPeers => Icons.refresh,
     EmptyStateType.noMessages => null,
     EmptyStateType.scanFailed => Icons.refresh,
+    EmptyStateType.noSearchResults => null,
+    EmptyStateType.discoveryUnavailable => null,
   };
 }

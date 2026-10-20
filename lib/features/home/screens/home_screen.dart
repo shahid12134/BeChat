@@ -15,19 +15,16 @@ class HomeScreen extends ConsumerStatefulWidget {
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   int _currentIndex = 0;
 
-  final _screens = const [
-    ChatListScreen(),
-    PeerDiscoveryScreen(),
-    SettingsScreen(),
-  ];
-
   @override
   Widget build(BuildContext context) {
+    final screens = [
+      ChatListScreen(onDiscoverPeers: () => setState(() => _currentIndex = 1)),
+      const PeerDiscoveryScreen(),
+      const SettingsScreen(),
+    ];
+
     return Scaffold(
-      body: IndexedStack(
-        index: _currentIndex,
-        children: _screens,
-      ),
+      body: IndexedStack(index: _currentIndex, children: screens),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
         onDestinationSelected: (index) {

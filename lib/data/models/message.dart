@@ -1,5 +1,7 @@
 enum MessageType { text, image, file, system }
-enum MessageStatus { sending, sent, delivered, read, failed }
+
+enum MessageStatus { queued, sending, sent, delivered, read, failed }
+
 enum MessageTransport { local, mesh, cloud, pending }
 
 class Message {
@@ -27,7 +29,7 @@ class Message {
     required this.content,
     this.messageType = MessageType.text,
     required this.timestamp,
-    this.status = MessageStatus.sending,
+    this.status = MessageStatus.queued,
     this.transport = MessageTransport.pending,
     this.ttl = 86400,
     this.isEncrypted = false,
@@ -35,7 +37,7 @@ class Message {
     this.updatedAt,
   });
 
-  bool get isSent => senderId == 'local-device-001';
+  bool isSentBy(String localDeviceId) => senderId == localDeviceId;
 
   Message copyWith({
     String? id,

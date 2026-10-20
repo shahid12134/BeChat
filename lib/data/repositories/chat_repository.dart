@@ -1,17 +1,62 @@
 import 'package:sqflite/sqflite.dart';
+import 'package:uuid/uuid.dart';
 import 'package:bechat/data/models/chat.dart';
+import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/database/database_helper.dart';
 
 class ChatRepository {
-  Future<Database> get _db => DatabaseHelper.database;
+  ChatRepository({Future<Database> Function()? database})
+    : _openDatabase = database ?? (() => DatabaseHelper.database);
+
+  final Future<Database> Function() _openDatabase;
+
+  Future<Database> get _db => _openDatabase();
 
   Future<void> insertChat(Chat chat) async {
     final db = await _db;
+    final now = DateTime.now();
     await db.insert(
       'chats',
-      chat.toMap()..remove('id'),
-      conflictAlgorithm: ConflictAlgorithm.replace,
+      chat
+          .copyWith(
+            id: chat.id ?? const Uuid().v4(),
+            createdAt: chat.createdAt ?? now,
+            updatedAt: chat.updatedAt ?? now,
+          )
+          .toMap(),
+      conflictAlgorithm: ConflictAlgorithm.ignore,
     );
+  }
+
+  Future<Chat> getOrCreateChatForPeer(Peer peer) async {
+    final db = await _db;
+    return db.transaction<Chat>((txn) async {
+      final existing = await txn.query(
+        'chats',
+        where: 'peer_id = ?',
+        whereArgs: [peer.peerId],
+        orderBy: 'created_at ASC',
+        limit: 1,
+      );
+      if (existing.isNotEmpty) return Chat.fromMap(existing.first);
+
+      final now = DateTime.now();
+      final chat = Chat(
+        id: const Uuid().v4(),
+        chatId: 'chat-${const Uuid().v4()}',
+        peerId: peer.peerId,
+        title: peer.displayName,
+        unreadCount: 0,
+        createdAt: now,
+        updatedAt: now,
+      );
+      await txn.insert(
+        'chats',
+        chat.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.abort,
+      );
+      return chat;
+    });
   }
 
   Future<List<Chat>> getAllChats() async {
@@ -38,6 +83,7 @@ class ChatRepository {
       'chats',
       where: 'peer_id = ?',
       whereArgs: [peerId],
+      orderBy: 'created_at ASC',
       limit: 1,
     );
     if (maps.isEmpty) return null;
@@ -46,15 +92,23 @@ class ChatRepository {
 
   Future<void> updateChat(Chat chat) async {
     final db = await _db;
+    final map = chat.toMap()
+      ..remove('id')
+      ..remove('created_at')
+      ..['updated_at'] = DateTime.now().toIso8601String();
     await db.update(
       'chats',
-      chat.toMap(),
+      map,
       where: 'chat_id = ?',
       whereArgs: [chat.chatId],
     );
   }
 
-  Future<void> updateLastMessage(String chatId, String message, DateTime time) async {
+  Future<void> updateLastMessage(
+    String chatId,
+    String message,
+    DateTime time,
+  ) async {
     final db = await _db;
     await db.update(
       'chats',
@@ -80,10 +134,7 @@ class ChatRepository {
     final db = await _db;
     await db.update(
       'chats',
-      {
-        'unread_count': 0,
-        'updated_at': DateTime.now().toIso8601String(),
-      },
+      {'unread_count': 0, 'updated_at': DateTime.now().toIso8601String()},
       where: 'chat_id = ?',
       whereArgs: [chatId],
     );
@@ -96,7 +147,9 @@ class ChatRepository {
 
   Future<int> getTotalUnreadCount() async {
     final db = await _db;
-    final result = await db.rawQuery('SELECT SUM(unread_count) as total FROM chats');
+    final result = await db.rawQuery(
+      'SELECT SUM(unread_count) as total FROM chats',
+    );
     return (result.first['total'] as int?) ?? 0;
   }
 }

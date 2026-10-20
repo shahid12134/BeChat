@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:google_fonts/google_fonts.dart';
 
 class AppColors {
   static const Color primary = Color(0xFF1A73E8);
@@ -34,7 +33,10 @@ class AppColors {
 
 class AppTheme {
   static ThemeData lightTheme() {
-    final textTheme = GoogleFonts.interTextTheme();
+    final textTheme = ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.light,
+    ).textTheme;
 
     return ThemeData(
       useMaterial3: true,
@@ -86,7 +88,10 @@ class AppTheme {
           borderRadius: BorderRadius.circular(24),
           borderSide: const BorderSide(color: AppColors.primary, width: 2),
         ),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
       ),
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
@@ -94,19 +99,18 @@ class AppTheme {
           foregroundColor: Colors.white,
           elevation: 0,
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
-          ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
       ),
-      iconTheme: const IconThemeData(
-        color: AppColors.textSecondary,
-      ),
+      iconTheme: const IconThemeData(color: AppColors.textSecondary),
     );
   }
 
   static ThemeData darkTheme() {
-    final textTheme = GoogleFonts.interTextTheme(ThemeData.dark().textTheme);
+    final textTheme = ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.dark,
+    ).textTheme;
 
     return ThemeData(
       useMaterial3: true,
@@ -158,11 +162,12 @@ class AppTheme {
           borderRadius: BorderRadius.circular(24),
           borderSide: const BorderSide(color: AppColors.primary, width: 2),
         ),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
       ),
-      iconTheme: const IconThemeData(
-        color: AppColors.textLight,
-      ),
+      iconTheme: const IconThemeData(color: AppColors.textLight),
     );
   }
 }

@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:bechat/providers/chat_providers.dart';
+import 'package:bechat/providers/message_providers.dart';
+import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/core/constants/app_constants.dart';
 
@@ -48,7 +51,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  Widget _buildProfileSection(BuildContext context, AsyncValue<dynamic> identityAsync) {
+  Widget _buildProfileSection(
+    BuildContext context,
+    AsyncValue<dynamic> identityAsync,
+  ) {
     return identityAsync.when(
       data: (identity) => ListTile(
         leading: const CircleAvatar(child: Icon(Icons.person)),
@@ -62,7 +68,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 ),
                 onSubmitted: (value) async {
                   if (value.trim().isNotEmpty) {
-                    await ref.read(identityProvider.notifier).updateDisplayName(value.trim());
+                    await ref
+                        .read(identityProvider.notifier)
+                        .updateDisplayName(value.trim());
                   }
                   setState(() => _isEditingName = false);
                 },
@@ -97,7 +105,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  Widget _buildDatabaseSection(BuildContext context, AsyncValue<Map<String, int>> dbInfoAsync) {
+  Widget _buildDatabaseSection(
+    BuildContext context,
+    AsyncValue<Map<String, int>> dbInfoAsync,
+  ) {
     return ExpansionTile(
       leading: const Icon(Icons.storage),
       title: const Text('Database'),
@@ -145,7 +156,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ListTile(
           leading: const Icon(Icons.code),
           title: const Text('Project'),
-          trailing: const Text('BeChat Phase 2'),
+          trailing: const Text('BeChat Phase 1'),
         ),
       ],
     );
@@ -171,11 +182,19 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           title: const Text('Clear Database'),
           trailing: const Icon(Icons.delete_forever, color: Colors.red),
           onTap: () async {
+            final demoNote = AppConstants.demoDataEnabled
+                ? '\n\nDemo mode is enabled, so sample data may be seeded again '
+                      'on a later startup.'
+                : '';
             final confirmed = await showDialog<bool>(
               context: context,
               builder: (context) => AlertDialog(
                 title: const Text('Clear Database'),
-                content: const Text('This will delete all data. Are you sure?'),
+                content: Text(
+                  'This will delete all peers, chats, messages, attachments, '
+                  'and routing records. Your local identity will be kept.'
+                  '$demoNote',
+                ),
                 actions: [
                   TextButton(
                     onPressed: () => Navigator.pop(context, false),
@@ -183,17 +202,36 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   ),
                   TextButton(
                     onPressed: () => Navigator.pop(context, true),
-                    child: const Text('Clear', style: TextStyle(color: Colors.red)),
+                    child: const Text(
+                      'Clear',
+                      style: TextStyle(color: Colors.red),
+                    ),
                   ),
                 ],
               ),
             );
             if (confirmed == true) {
-              // TODO: implement database clear
-              if (context.mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Database cleared')),
-                );
+              try {
+                await ref.read(appDataRepositoryProvider).clearUserData();
+                ref.read(discoveredPeersProvider.notifier).state = [];
+                ref.invalidate(messageListProvider);
+                ref.invalidate(databaseInfoProvider);
+                await ref.read(chatListProvider.notifier).refreshChats();
+                await ref.read(peerListProvider.notifier).refreshPeers();
+
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('User data cleared. Identity retained.'),
+                    ),
+                  );
+                }
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Failed to clear data: $e')),
+                  );
+                }
               }
             }
           },

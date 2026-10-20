@@ -1,17 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:bechat/app/app.dart';
-import 'package:bechat/data/database/database_helper.dart';
-import 'package:bechat/data/mock/mock_data.dart';
+import 'package:bechat/app/bootstrap_host.dart';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  await DatabaseHelper.database;
-  await MockData.seedIfEmpty();
 
-  runApp(
-    const ProviderScope(
-      child: BeChatApp(),
-    ),
-  );
+  runApp(const ProviderScope(child: BootstrapHost()));
 }

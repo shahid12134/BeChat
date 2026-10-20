@@ -10,6 +10,7 @@ import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
+import 'package:bechat/providers/settings_providers.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String chatId;
@@ -53,6 +54,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
+    if (text.length > AppConstants.maxMessageLength) {
+      _showError('Message is too long');
+      return;
+    }
+
+    final identity = ref.read(identityProvider).valueOrNull;
+    if (identity == null) {
+      _showError('Local identity is unavailable. Messages cannot be saved.');
+      return;
+    }
 
     final chatAsync = ref.read(chatListProvider).valueOrNull;
     final chat = chatAsync?.where((c) => c.chatId == widget.chatId).firstOrNull;
@@ -62,28 +73,39 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final message = Message(
       messageId: 'msg-${_uuid.v4()}',
       chatId: widget.chatId,
-      senderId: AppConstants.placeholderDeviceId,
+      senderId: identity.deviceId,
       receiverId: chat.peerId,
       content: text,
       timestamp: now,
-      status: MessageStatus.sending,
-      transport: MessageTransport.local,
+      status: MessageStatus.queued,
+      transport: MessageTransport.pending,
       createdAt: now,
       updatedAt: now,
     );
 
-    _messageController.clear();
-
-    await ref.read(messageListProvider(widget.chatId).notifier).sendMessage(message);
-    await ref.read(chatListProvider.notifier).updateLastMessage(widget.chatId, text, now);
-
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-
-    // Simulate delivery status update
-    await Future.delayed(const Duration(seconds: 1));
-    if (mounted) {
-      await ref.read(messageListProvider(widget.chatId).notifier).refreshMessages();
+    try {
+      await ref
+          .read(messageListProvider(widget.chatId).notifier)
+          .sendMessage(message);
+      _messageController.clear();
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    } catch (e) {
+      _showError('Failed to save message: $e');
+      return;
     }
+
+    try {
+      await ref.read(chatListProvider.notifier).refreshChats();
+    } catch (e) {
+      _showError('Message saved, but the chat list could not be refreshed.');
+    }
+  }
+
+  void _showError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -91,9 +113,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final messagesAsync = ref.watch(messageListProvider(widget.chatId));
     final chatAsync = ref.watch(chatListProvider);
     final peersAsync = ref.watch(peerListProvider);
+    final identityAsync = ref.watch(identityProvider);
+    final localDeviceId = ref.watch(localDeviceIdProvider);
 
-    final chat = chatAsync.valueOrNull?.where((c) => c.chatId == widget.chatId).firstOrNull;
-    final peer = peersAsync.valueOrNull?.where((p) => p.peerId == chat?.peerId).firstOrNull;
+    final chat = chatAsync.valueOrNull
+        ?.where((c) => c.chatId == widget.chatId)
+        .firstOrNull;
+    final peer = peersAsync.valueOrNull
+        ?.where((p) => p.peerId == chat?.peerId)
+        .firstOrNull;
     final peerName = peer?.displayName ?? chat?.title ?? 'Unknown';
     final isOnline = peer?.status.name == 'online';
 
@@ -111,12 +139,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(peerName, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
                   Text(
-                    isOnline ? 'Online' : 'Last seen ${AppDateUtils.formatRelativeTime(peer?.lastSeen)}',
+                    peerName,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    isOnline
+                        ? 'Online'
+                        : 'Last seen ${AppDateUtils.formatRelativeTime(peer?.lastSeen)}',
                     style: TextStyle(
                       fontSize: 12,
-                      color: isOnline ? Colors.green : Theme.of(context).colorScheme.onSurfaceVariant,
+                      color: isOnline
+                          ? Colors.green
+                          : Theme.of(context).colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ],
@@ -125,12 +163,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ],
         ),
         actions: [
-          const StatusIndicator(status: TransportStatus.local),
+          const StatusIndicator(status: TransportStatus.pending),
           const SizedBox(width: 12),
         ],
       ),
       body: Column(
         children: [
+          if (identityAsync.hasError)
+            Container(
+              width: double.infinity,
+              color: Theme.of(context).colorScheme.errorContainer,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Text(
+                'Local identity is unavailable. Messages cannot be saved.',
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onErrorContainer,
+                ),
+              ),
+            ),
           Expanded(
             child: messagesAsync.when(
               data: (messages) {
@@ -139,20 +189,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Icon(Icons.message_outlined,
-                            size: 64, color: Theme.of(context).colorScheme.outline),
+                        Icon(
+                          Icons.message_outlined,
+                          size: 64,
+                          color: Theme.of(context).colorScheme.outline,
+                        ),
                         const SizedBox(height: 16),
                         Text(
                           'No messages yet',
-                          style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          style: Theme.of(context).textTheme.titleMedium
+                              ?.copyWith(
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
                               ),
                         ),
                         const SizedBox(height: 4),
                         Text(
                           'Send a message to start the conversation',
                           style: TextStyle(
-                              color: Theme.of(context).colorScheme.onSurfaceVariant),
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
                         ),
                       ],
                     ),
@@ -160,13 +219,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 }
                 return ListView.builder(
                   controller: _scrollController,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
                   itemCount: messages.length,
                   itemBuilder: (context, index) {
                     final msg = messages[index];
-                    final isMe = msg.isSent;
-                    final showTimestamp = index == 0 ||
-                        messages[index].timestamp.difference(messages[index - 1].timestamp).inMinutes > 5;
+                    final isMe =
+                        localDeviceId != null && msg.isSentBy(localDeviceId);
+                    final showTimestamp =
+                        index == 0 ||
+                        messages[index].timestamp
+                                .difference(messages[index - 1].timestamp)
+                                .inMinutes >
+                            5;
 
                     return Column(
                       children: [
@@ -177,7 +244,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                               AppDateUtils.formatFullTimestamp(msg.timestamp),
                               style: TextStyle(
                                 fontSize: 12,
-                                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                                color: Theme.of(
+                                  context,
+                                ).colorScheme.onSurfaceVariant,
                               ),
                             ),
                           ),
@@ -198,11 +267,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   Widget _buildInputBar(BuildContext context) {
+    final localDeviceId = ref.watch(localDeviceIdProvider);
+
     return Container(
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         color: Theme.of(context).scaffoldBackgroundColor,
-        border: Border(top: BorderSide(color: Theme.of(context).dividerColor, width: 0.5)),
+        border: Border(
+          top: BorderSide(color: Theme.of(context).dividerColor, width: 0.5),
+        ),
       ),
       child: SafeArea(
         top: false,
@@ -245,19 +318,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 textCapitalization: TextCapitalization.sentences,
                 maxLines: 4,
                 minLines: 1,
+                maxLength: AppConstants.maxMessageLength,
                 decoration: InputDecoration(
                   hintText: 'Type a message...',
+                  counterText: '',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide(color: Theme.of(context).dividerColor),
+                    borderSide: BorderSide(
+                      color: Theme.of(context).dividerColor,
+                    ),
                   ),
                   enabledBorder: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide(color: Theme.of(context).dividerColor),
+                    borderSide: BorderSide(
+                      color: Theme.of(context).dividerColor,
+                    ),
                   ),
                   filled: true,
                   fillColor: Theme.of(context).colorScheme.surface,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 10,
+                  ),
                 ),
                 onSubmitted: (_) => _sendMessage(),
               ),
@@ -265,12 +347,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             const SizedBox(width: 4),
             Container(
               decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.primary,
+                color: localDeviceId == null
+                    ? Theme.of(context).colorScheme.outline
+                    : Theme.of(context).colorScheme.primary,
                 shape: BoxShape.circle,
               ),
               child: IconButton(
                 icon: const Icon(Icons.send, color: Colors.white, size: 20),
-                onPressed: _sendMessage,
+                onPressed: localDeviceId == null ? null : _sendMessage,
               ),
             ),
           ],
@@ -313,7 +397,9 @@ class MessageBubble extends StatelessWidget {
             Text(
               message.content,
               style: TextStyle(
-                color: isMe ? Colors.white : Theme.of(context).colorScheme.onSurface,
+                color: isMe
+                    ? Colors.white
+                    : Theme.of(context).colorScheme.onSurface,
                 fontSize: 15,
               ),
             ),
@@ -349,6 +435,7 @@ class MessageBubble extends StatelessWidget {
   }
 
   IconData get _statusIcon => switch (message.status) {
+    MessageStatus.queued => Icons.schedule,
     MessageStatus.sending => Icons.access_time,
     MessageStatus.sent => Icons.done,
     MessageStatus.delivered => Icons.done_all,

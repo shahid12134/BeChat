@@ -5,7 +5,9 @@ import 'package:bechat/core/widgets/empty_state.dart';
 import 'package:bechat/providers/chat_providers.dart';
 
 class ChatListScreen extends ConsumerStatefulWidget {
-  const ChatListScreen({super.key});
+  final VoidCallback? onDiscoverPeers;
+
+  const ChatListScreen({super.key, this.onDiscoverPeers});
 
   @override
   ConsumerState<ChatListScreen> createState() => _ChatListScreenState();
@@ -61,16 +63,24 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
           final filtered = _searchQuery.isEmpty
               ? chats
               : chats
-                  .where((c) =>
-                      (c.title ?? '').toLowerCase().contains(_searchQuery.toLowerCase()) ||
-                      (c.lastMessage ?? '').toLowerCase().contains(_searchQuery.toLowerCase()))
-                  .toList();
+                    .where(
+                      (c) =>
+                          (c.title ?? '').toLowerCase().contains(
+                            _searchQuery.toLowerCase(),
+                          ) ||
+                          (c.lastMessage ?? '').toLowerCase().contains(
+                            _searchQuery.toLowerCase(),
+                          ),
+                    )
+                    .toList();
 
           if (filtered.isEmpty) {
+            if (_searchQuery.isNotEmpty) {
+              return const EmptyState(type: EmptyStateType.noSearchResults);
+            }
             return EmptyState(
-              type: _searchQuery.isNotEmpty
-                  ? EmptyStateType.noChats
-                  : EmptyStateType.noChats,
+              type: EmptyStateType.noChats,
+              onAction: widget.onDiscoverPeers,
             );
           }
 
