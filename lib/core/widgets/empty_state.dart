@@ -68,8 +68,7 @@ class EmptyState extends StatelessWidget {
     EmptyStateType.noMessages => 'No messages yet',
     EmptyStateType.scanFailed => 'Scan failed',
     EmptyStateType.noSearchResults => 'No results',
-    EmptyStateType.discoveryUnavailable =>
-      'Bluetooth discovery coming in Phase 2',
+    EmptyStateType.discoveryUnavailable => 'Bluetooth discovery is off',
   };
 
   String get _subtitle => switch (type) {
@@ -82,7 +81,7 @@ class EmptyState extends StatelessWidget {
       'Discovery could not be completed. Please try again.',
     EmptyStateType.noSearchResults => 'No conversations match your search.',
     EmptyStateType.discoveryUnavailable =>
-      'Real nearby-device discovery is not implemented yet. Simulated discovery is available only when demo mode is enabled.',
+      'Enable Bluetooth and grant Nearby devices permission, then try scanning again.',
   };
 
   String? get _buttonLabel => switch (type) {

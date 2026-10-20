@@ -47,16 +47,16 @@ void main() {
     final messageRepository = _FakeMessageRepository();
     await _pumpChat(tester, messageRepository);
 
-    await tester.enterText(find.byType(TextField), 'Hello Phase 1');
+    await tester.enterText(find.byType(TextField), 'Hello over BLE');
     await tester.tap(find.byIcon(Icons.send));
     await tester.pumpAndSettle();
 
-    expect(find.text('Hello Phase 1'), findsOneWidget);
+    expect(find.text('Hello over BLE'), findsOneWidget);
     expect(messageRepository.messages, hasLength(1));
 
     final message = messageRepository.messages.single;
     expect(message.senderId, identity.deviceId);
-    expect(message.content, 'Hello Phase 1');
+    expect(message.content, 'Hello over BLE');
     expect(message.status, MessageStatus.queued);
     expect(message.transport, MessageTransport.pending);
 
@@ -65,6 +65,23 @@ void main() {
 
     await tester.pump(const Duration(seconds: 2));
     expect(messageRepository.messages.single.status, MessageStatus.queued);
+  });
+
+  testWidgets('rejects text over 4096 UTF-8 bytes before persistence', (
+    tester,
+  ) async {
+    final messageRepository = _FakeMessageRepository();
+    await _pumpChat(tester, messageRepository);
+
+    await tester.enterText(
+      find.byType(TextField),
+      List.filled(1025, '😀').join(),
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pump();
+
+    expect(find.textContaining('too long for a BLE transfer'), findsOneWidget);
+    expect(messageRepository.messages, isEmpty);
   });
 
   testWidgets('failed persistence keeps the input and shows an error', (

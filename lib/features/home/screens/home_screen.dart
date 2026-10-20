@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:bechat/features/chats/screens/chat_list_screen.dart';
 import 'package:bechat/features/peers/screens/peer_discovery_screen.dart';
 import 'package:bechat/features/settings/screens/settings_screen.dart';
+import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
@@ -12,8 +13,31 @@ class HomeScreen extends ConsumerStatefulWidget {
   ConsumerState<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends ConsumerState<HomeScreen> {
+class _HomeScreenState extends ConsumerState<HomeScreen>
+    with WidgetsBindingObserver {
   int _currentIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final ble = ref.read(bleRuntimeProvider.notifier);
+    if (state == AppLifecycleState.paused) {
+      ble.pauseForBackground();
+    } else if (state == AppLifecycleState.resumed) {
+      ble.resumeFromBackground();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

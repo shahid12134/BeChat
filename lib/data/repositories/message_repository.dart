@@ -112,6 +112,93 @@ class MessageRepository {
     );
   }
 
+  Future<void> markMessageSending(String messageId) async {
+    await _updateDeliveryStatus(
+      messageId,
+      MessageStatus.sending,
+      MessageTransport.ble,
+    );
+  }
+
+  Future<void> markMessageSent(String messageId) async {
+    await _updateDeliveryStatus(
+      messageId,
+      MessageStatus.sent,
+      MessageTransport.ble,
+    );
+  }
+
+  Future<void> markMessageDelivered(String messageId) async {
+    await _updateDeliveryStatus(
+      messageId,
+      MessageStatus.delivered,
+      MessageTransport.ble,
+    );
+  }
+
+  Future<void> markMessageFailed(String messageId) async {
+    await _updateDeliveryStatus(
+      messageId,
+      MessageStatus.failed,
+      MessageTransport.ble,
+    );
+  }
+
+  Future<void> requeueMessage(String messageId) async {
+    await _updateDeliveryStatus(
+      messageId,
+      MessageStatus.queued,
+      MessageTransport.pending,
+    );
+  }
+
+  Future<void> _updateDeliveryStatus(
+    String messageId,
+    MessageStatus status,
+    MessageTransport transport,
+  ) async {
+    final db = await _db;
+    await db.update(
+      'messages',
+      {
+        'status': status.name,
+        'transport': transport.name,
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      where: 'message_id = ?',
+      whereArgs: [messageId],
+    );
+  }
+
+  Future<void> resetOutboxForSender(String senderId) async {
+    final db = await _db;
+    await db.update(
+      'messages',
+      {
+        'status': MessageStatus.queued.name,
+        'transport': MessageTransport.pending.name,
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      where: 'sender_id = ? AND status IN (?, ?)',
+      whereArgs: [
+        senderId,
+        MessageStatus.sending.name,
+        MessageStatus.sent.name,
+      ],
+    );
+  }
+
+  Future<List<Message>> getQueuedOutgoingMessages(String senderId) async {
+    final db = await _db;
+    final maps = await db.query(
+      'messages',
+      where: 'sender_id = ? AND status = ? AND receiver_id <> ?',
+      whereArgs: [senderId, MessageStatus.queued.name, senderId],
+      orderBy: 'timestamp ASC, message_id ASC',
+    );
+    return maps.map((message) => Message.fromMap(message)).toList();
+  }
+
   Future<void> deleteMessage(String messageId) async {
     final db = await _db;
     await db.delete(

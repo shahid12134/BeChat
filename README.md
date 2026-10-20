@@ -1,23 +1,33 @@
 # BeChat
 
-**An Encrypted Offline Peer-to-Peer Messaging Framework using BLE and Wi-Fi Direct with Adaptive Cloud Switching.**
+**An offline peer-to-peer messaging framework using direct BLE, with future
+Wi-Fi Direct and adaptive cloud switching.**
 
 ## Current Status
 
-**Phase 1: Local Foundation.** This release provides a unique local identity, safe local SQLite persistence, local chat creation, honest queued message states, and an opt-in simulated discovery mode.
+**Phase 2: Direct Offline BLE Text Messaging.** BeChat can advertise, scan,
+connect, exchange application identities over a GATT link, and send text
+messages of up to 4096 UTF-8 bytes between two foreground Android phones.
+Delivery is acknowledged end-to-end with an application ACK; messages remain
+queued until the intended peer is connected and acknowledges them.
 
-Real BLE discovery, cryptography, pairing, Wi-Fi Direct, cloud messaging, and mesh routing are NOT implemented.
+This phase does **not** provide message encryption, cryptographic peer
+authentication, background delivery, multi-hop mesh routing, store-and-forward
+relay, or cloud fallback.
 
 ---
 
 ## Project Overview
 
-BeChat is a Flutter Android application designed for secure, offline-first peer-to-peer messaging. The architecture supports future phases where:
+BeChat is a Flutter Android application designed for offline-first
+peer-to-peer messaging. The architecture supports future phases where:
 
-- **Phase 3:** BLE peer discovery and encrypted messaging
+- **Phase 2:** Direct BLE discovery, GATT connection, and acknowledged text
+  messaging (current)
+- **Phase 3:** Peer authentication and encrypted messaging
 - **Phase 4:** Wi-Fi Direct transfer
-- **Phase 5:** Store-and-forward relay, multi-hop routing
-- **Phase 6:** Firebase cloud fallback, hybrid routing
+- **Phase 5:** Store-and-forward relay and multi-hop routing
+- **Phase 6:** Firebase cloud fallback and hybrid routing
 
 ---
 
@@ -34,6 +44,10 @@ lib/
     routes/
       app_router.dart                # GoRouter navigation
   core/
+    ble/
+      ble_protocol.dart              # Frame/transfer codecs, HELLO, payloads
+      ble_transport.dart             # Bidirectional byte transport interface
+      ble_link_session.dart          # Handshake, framing, ACK, send/receive
     constants/
       app_constants.dart             # App-wide constants
     utils/
@@ -52,18 +66,25 @@ lib/
       attachment.dart                # Attachment data model
       identity.dart                  # Device identity model
       message_route.dart             # Future routing model
+      ble_candidate.dart             # Nearby BLE discovery hint
     repositories/
       app_data_repository.dart       # Transactional user-data clearing
       peer_repository.dart           # Peer CRUD operations
       chat_repository.dart           # Chat CRUD operations
-      message_repository.dart        # Message CRUD operations
+      message_repository.dart        # Message CRUD + BLE delivery states
       identity_repository.dart       # Identity bootstrap and legacy repair
-      peer_discovery_repository.dart # Abstract discovery interface
+      peer_discovery_repository.dart # Phase 1 demo discovery interface
       mock_peer_discovery_repository.dart # Demo-only simulated discovery
-      unavailable_peer_discovery_repository.dart # Non-demo discovery state
+      unavailable_peer_discovery_repository.dart # Non-demo demo state
     mock/
       mock_data.dart                 # Demo data seeder
+  services/
+    ble/
+      ble_runtime.dart               # Android permissions, GATT, links, UI state
+      ble_message_store.dart         # Atomic incoming message persistence
+      ble_outbox.dart                # Queued delivery and bounded retries
   providers/
+    ble_providers.dart               # BLE runtime state provider
     chat_providers.dart              # Chat state management
     peer_providers.dart              # Peer state management
     message_providers.dart           # Message state management
@@ -116,6 +137,7 @@ lib/
 | `sqflite` | Local SQLite database |
 | `uuid` | Unique ID generation |
 | `intl` | Date formatting |
+| `bluetooth_low_energy` `6.2.1` | Android BLE central and peripheral roles |
 
 ---
 
@@ -125,13 +147,16 @@ lib/
 
 1. **Flutter SDK** installed (3.35.4+)
 2. **Android SDK** installed with:
-   - Android SDK Platform 35
+   - Android SDK Platform 36
    - Android SDK Build-Tools
    - Android NDK 27.1.12297006
    - Android SDK Platform-Tools
-3. **Physical Android phone** with:
-   - Android 8.0+ (API 26+)
+3. **Two physical Android phones** with:
+   - Android 7.0+ (API 24+)
+   - BLE hardware
    - USB Debugging enabled
+   - Bluetooth turned on
+   - BeChat open in the foreground on both phones
 
 ### Setup Steps
 
@@ -157,7 +182,7 @@ You should see your device listed.
 #### 3. Build and Run
 
 ```bash
-cd Bechat
+cd C:\Projects\BeChat
 flutter pub get
 flutter run
 ```
@@ -174,6 +199,51 @@ Install manually:
 ```bash
 adb install build/app/outputs/flutter-apk/app-debug.apk
 ```
+
+---
+
+## Direct BLE Text Messaging
+
+Both phones advertise the BeChat GATT service and scan for it. The app uses
+the standard BLE central and peripheral roles at the same time, so either phone
+can initiate a connection.
+
+1. Install the same build on both phones and open BeChat on both.
+2. Open **Nearby** and tap **Scan for Peers** on both phones.
+3. Grant the Android **Nearby devices** permission when prompted. Android 11
+   and earlier also require location permission for BLE scanning.
+4. Tap a discovered BeChat device on one phone.
+5. Wait for the GATT connection and application HELLO handshake. The peer is
+   saved only after a valid HELLO and is shown in **Saved Peers**.
+6. Open the peer's chat and send text.
+
+Delivery behavior:
+
+- Outgoing messages are saved locally as `queued` before transmission.
+- `sent` means every BLE frame was written; it is not proof of receipt.
+- `delivered` requires an application ACK from the peer.
+- If the link drops or an ACK times out, the message is returned to the outbox.
+  Retries are bounded.
+- Messages for another peer remain queued while a different peer is connected.
+- Incoming messages are stored atomically. Duplicate message IDs are
+  acknowledged as duplicates without creating a second message or unread count.
+- Blocked peers are rejected during HELLO and incoming-message validation.
+
+BLE IDs from advertisements are discovery hints. The stable BeChat application
+device ID is exchanged in HELLO. Neither the BLE address nor the application ID
+is cryptographically authenticated in this phase.
+
+### Fixed GATT Profile
+
+| Item | UUID |
+|------|------|
+| BeChat service | `6f1b8e30-6c4a-4f4f-9f4c-424543484100` |
+| RX (central writes) | `6f1b8e30-6c4a-4f4f-9f4c-424543484101` |
+| TX (peripheral notifies) | `6f1b8e30-6c4a-4f4f-9f4c-424543484102` |
+
+The protocol uses a 10-byte big-endian frame header, start/data/end framing,
+and an FNV-1a checksum. The checksum detects accidental corruption only; it is
+not a cryptographic integrity mechanism.
 
 ---
 
@@ -196,7 +266,10 @@ With demo mode enabled, the Nearby screen is labeled as simulated and can discov
 - **Cyber Lab** - (Online, -55 dBm)
 - **Maria** - "Maria's Phone" (Offline, -88 dBm)
 
-These are not real Bluetooth devices. In Phase 2, a real `PeerDiscoveryRepository` implementation will replace the mock.
+These are not real Bluetooth devices. Demo mode remains separate from the
+real BLE runtime: it never starts scanning or advertising and does not produce
+fake entries in the real BLE nearby list. With demo mode disabled, the Nearby
+screen uses real BLE discovery only.
 
 Demo seeding does not create or replace the real local identity. It runs only when demo mode is enabled and the peers table is empty, so repeated startup does not duplicate records.
 
@@ -208,50 +281,48 @@ To remove demo data, open **Settings > Debug Information > Clear Database**. Thi
 
 The following belong to future phases:
 
-- BLE scanning/advertising/messaging
-- Public-key cryptography (RSA/ECC)
-- AES message encryption
-- Cryptographic key generation/exchange
+- Message encryption or cryptographic peer authentication
+- Key generation, verification, or out-of-band identity comparison
+- Background BLE operation or notifications
+- More than one simultaneous BLE link
 - Wi-Fi Direct
-- Socket communication
 - Store-and-forward relay
-- Multi-hop routing
-- TTL routing logic
-- Firebase authentication
-- Firebase Cloud Messaging
-- Cloud synchronization
-- Automatic P2P/cloud switching
-- Real media/file transfer
-- Production security implementation
+- Multi-hop or TTL routing
+- Firebase authentication or Cloud Messaging
+- Cloud synchronization or automatic P2P/cloud switching
+- Media/file transfer
+- Production security hardening
 
----
+### Phase 2 Limitations
 
-## Future Phase 3 Integration
-
-To replace mock discovery with real BLE:
-
-1. Create `BlePeerDiscoveryRepository` implementing `PeerDiscoveryRepository`
-2. Register it as a Riverpod provider
-3. Update `peerDiscoveryRepositoryProvider` in `peer_providers.dart`
-
-```dart
-// peer_providers.dart
-final peerDiscoveryRepositoryProvider = Provider<PeerDiscoveryRepository>((ref) {
-  // Replace with: return BlePeerDiscoveryRepository();
-  return MockPeerDiscoveryRepository();
-});
-```
+- Text only, with a maximum of 4096 UTF-8 bytes per message.
+- Both phones must have BeChat in the foreground.
+- BLE range, discovery time, and connection reliability depend on the phones
+  and radio environment.
+- The link is not encrypted and the exchanged identity is not authenticated.
+  Anyone nearby with a compatible implementation could attempt to connect.
+- Discovery advertises only the display name `BeChat`; the stable application
+  ID is revealed after connecting.
+- Only one active link is supported. Concurrent connection attempts are
+  rejected rather than arbitrated by a cryptographic identity comparison.
+- The BLE runtime is enabled for Android only. iOS is not configured in this
+  phase.
+- The app has not been validated through an automated physical-phone BLE test;
+  manual two-device testing is required.
 
 ---
 
 ## Android Permissions
 
-Currently configured:
+Declared in `AndroidManifest.xml`:
 
-- `INTERNET` (future use)
-- `ACCESS_NETWORK_STATE` (connectivity checks)
-
-Future BLE permissions are documented in `AndroidManifest.xml` but commented out.
+- `INTERNET` and `ACCESS_NETWORK_STATE` (foundation only)
+- Android 11 and below: `BLUETOOTH`, `BLUETOOTH_ADMIN`,
+  `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`
+- Android 12 and above: `BLUETOOTH_SCAN` (with `neverForLocation`),
+  `BLUETOOTH_CONNECT`, `BLUETOOTH_ADVERTISE`
+- `android.hardware.bluetooth_le` is optional so the app can install on devices
+  without BLE; runtime BLE use then reports that it is unsupported.
 
 ---
 
@@ -268,7 +339,16 @@ Tests cover:
 - User-data clearing while retaining identity
 - Queued message behavior and sender detection
 - Demo-mode gating and simulated peer persistence
+- BLE frame codec, transfer framing, reassembly, checksums, and size limits
+- HELLO validation, message payload UTF-8 boundaries, and ACKs
+- Session handshake, ACK timeout, disconnect handling, and transfer limits
+- Outbox transitions, ACK outcomes, requeue behavior, and bounded retries
+- Atomic incoming-message persistence, duplicate handling, and blocked peers
 - Bootstrap failure recovery and key widget interactions
+
+Manual BLE validation still requires two physical Android phones; emulator and
+unit tests cannot verify radio behavior, GATT interoperability, or real
+throughput.
 
 ---
 

@@ -156,7 +156,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ListTile(
           leading: const Icon(Icons.code),
           title: const Text('Project'),
-          trailing: const Text('BeChat Phase 1'),
+          trailing: const Text('BeChat Phase 2 BLE'),
         ),
       ],
     );

@@ -4,8 +4,10 @@ import 'package:go_router/go_router.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
 import 'package:bechat/core/utils/date_utils.dart';
+import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
+import 'package:bechat/services/ble/ble_runtime.dart';
 
 class PeerDetailsScreen extends ConsumerStatefulWidget {
   final String peerId;
@@ -39,6 +41,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
   @override
   Widget build(BuildContext context) {
     final peersAsync = ref.watch(peerListProvider);
+    final bleState = ref.watch(bleRuntimeProvider);
 
     return peersAsync.when(
       loading: () => Scaffold(
@@ -70,12 +73,18 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             body: const Center(child: Text('Peer not found')),
           );
         }
-        return _buildDetails(context, peer);
+        return _buildDetails(context, peer, bleState);
       },
     );
   }
 
-  Widget _buildDetails(BuildContext context, Peer peer) {
+  Widget _buildDetails(
+    BuildContext context,
+    Peer peer,
+    BleRuntimeState bleState,
+  ) {
+    final isBleConnected =
+        bleState.isConnected && bleState.activePeerId == peer.peerId;
     return Scaffold(
       appBar: AppBar(
         title: Text(peer.displayName),
@@ -117,7 +126,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
               name: peer.displayName,
               avatarPath: peer.avatarPath,
               radius: 48,
-              isOnline: peer.status == PeerStatus.online,
+              isOnline: isBleConnected,
             ),
             const SizedBox(height: 16),
             Text(
@@ -137,13 +146,19 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(
-                color: _statusColor(peer.status).withValues(alpha: 0.1),
+                color:
+                    (isBleConnected ? Colors.green : _statusColor(peer.status))
+                        .withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Text(
-                peer.status.name.toUpperCase(),
+                isBleConnected
+                    ? 'BLE CONNECTED'
+                    : peer.status.name.toUpperCase(),
                 style: TextStyle(
-                  color: _statusColor(peer.status),
+                  color: isBleConnected
+                      ? Colors.green
+                      : _statusColor(peer.status),
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
                 ),
@@ -154,7 +169,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             const SizedBox(height: 24),
             _buildSecuritySection(context, peer),
             const SizedBox(height: 24),
-            _buildActions(context, peer),
+            _buildActions(context, peer, isBleConnected),
           ],
         ),
       ),
@@ -225,9 +240,15 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             ),
             _infoRow(
               context,
-              'Encryption',
-              'Pending Phase 3',
+              'BLE Identity',
+              'Application ID exchanged; not verified out-of-band',
               valueColor: Colors.orange,
+            ),
+            _infoRow(
+              context,
+              'Encryption',
+              'Not enabled in direct BLE mode',
+              valueColor: Colors.red,
             ),
             _infoRow(
               context,
@@ -241,7 +262,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
     );
   }
 
-  Widget _buildActions(BuildContext context, Peer peer) {
+  Widget _buildActions(BuildContext context, Peer peer, bool isBleConnected) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Column(
@@ -259,8 +280,14 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             width: double.infinity,
             child: OutlinedButton.icon(
               onPressed: null,
-              icon: const Icon(Icons.link),
-              label: const Text('Pairing available in Phase 3'),
+              icon: Icon(
+                isBleConnected ? Icons.bluetooth_connected : Icons.bluetooth,
+              ),
+              label: Text(
+                isBleConnected
+                    ? 'Direct BLE link active'
+                    : 'Connect from Nearby Peers',
+              ),
             ),
           ),
           const SizedBox(height: 8),

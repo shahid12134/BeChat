@@ -1,16 +1,20 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:uuid/uuid.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
-import 'package:bechat/core/widgets/status_indicator.dart';
 import 'package:bechat/core/utils/date_utils.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
+import 'package:bechat/services/ble/ble_runtime.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String chatId;
@@ -54,8 +58,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
-    if (text.length > AppConstants.maxMessageLength) {
-      _showError('Message is too long');
+    if (utf8.encode(text).length > AppConstants.maxMessageLength) {
+      _showError('Message is too long for a BLE transfer (4096 UTF-8 bytes).');
       return;
     }
 
@@ -99,6 +103,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     } catch (e) {
       _showError('Message saved, but the chat list could not be refreshed.');
     }
+
+    unawaited(
+      ref
+          .read(bleRuntimeProvider.notifier)
+          .requestDelivery(chat.peerId)
+          .catchError((Object _) {
+            if (mounted) {
+              _showError('Message is queued; BLE delivery could not start.');
+            }
+          }),
+    );
   }
 
   void _showError(String message) {
@@ -108,6 +123,49 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     ).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  Widget _buildBleBanner(
+    BuildContext context,
+    BleRuntimeState bleState,
+    String? peerId,
+  ) {
+    final theme = Theme.of(context);
+    late final String message;
+    late final Color background;
+    late final Color foreground;
+
+    if (AppConstants.demoDataEnabled) {
+      message =
+          'Demo mode: messages are saved locally and are not sent over BLE.';
+      background = theme.colorScheme.secondaryContainer;
+      foreground = theme.colorScheme.onSecondaryContainer;
+    } else if (bleState.isConnected && bleState.activePeerId == peerId) {
+      message =
+          'BLE link active. App identity was exchanged, but this link is not '
+          'cryptographically authenticated.';
+      background = theme.colorScheme.primaryContainer;
+      foreground = theme.colorScheme.onPrimaryContainer;
+    } else if (bleState.isConnected) {
+      message =
+          'BLE is connected to another device. Messages here stay queued until '
+          'you connect to this peer.';
+      background = theme.colorScheme.tertiaryContainer;
+      foreground = theme.colorScheme.onTertiaryContainer;
+    } else {
+      message =
+          'No BLE link. Messages are saved locally and queued for later '
+          'delivery.';
+      background = theme.colorScheme.surfaceContainerHighest;
+      foreground = theme.colorScheme.onSurfaceVariant;
+    }
+
+    return Container(
+      width: double.infinity,
+      color: background,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Text(message, style: TextStyle(color: foreground, fontSize: 12)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final messagesAsync = ref.watch(messageListProvider(widget.chatId));
@@ -115,6 +173,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     final peersAsync = ref.watch(peerListProvider);
     final identityAsync = ref.watch(identityProvider);
     final localDeviceId = ref.watch(localDeviceIdProvider);
+    final bleState = ref.watch(bleRuntimeProvider);
 
     final chat = chatAsync.valueOrNull
         ?.where((c) => c.chatId == widget.chatId)
@@ -123,7 +182,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         ?.where((p) => p.peerId == chat?.peerId)
         .firstOrNull;
     final peerName = peer?.displayName ?? chat?.title ?? 'Unknown';
-    final isOnline = peer?.status.name == 'online';
+    final isOnline =
+        bleState.isConnected && bleState.activePeerId == chat?.peerId;
 
     return Scaffold(
       appBar: AppBar(
@@ -163,8 +223,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ],
         ),
         actions: [
-          const StatusIndicator(status: TransportStatus.pending),
-          const SizedBox(width: 12),
+          Tooltip(
+            message: isOnline
+                ? 'Direct BLE link active'
+                : 'No direct BLE link for this peer',
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Icon(
+                isOnline ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
+                color: isOnline
+                    ? Colors.green
+                    : Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
         ],
       ),
       body: Column(
@@ -181,6 +253,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 ),
               ),
             ),
+          _buildBleBanner(context, bleState, chat?.peerId),
           Expanded(
             child: messagesAsync.when(
               data: (messages) {

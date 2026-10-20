@@ -183,4 +183,66 @@ void main() {
     final row = (await db.query('messages')).single;
     expect(row['id'], isNotNull);
   });
+
+  test(
+    'BLE outbox selects queued outgoing messages and tracks ACK states',
+    () async {
+      final now = DateTime.now();
+      for (final entry in {
+        'msg-queued': MessageStatus.queued,
+        'msg-sending': MessageStatus.sending,
+        'msg-sent': MessageStatus.sent,
+        'msg-delivered': MessageStatus.delivered,
+        'msg-failed': MessageStatus.failed,
+      }.entries) {
+        await repository.insertMessage(
+          Message(
+            messageId: entry.key,
+            chatId: chatId,
+            senderId: 'device-local',
+            receiverId: peer.peerId,
+            content: entry.key,
+            timestamp: now,
+            status: entry.value,
+            createdAt: now,
+            updatedAt: now,
+          ),
+        );
+      }
+
+      final queued = await repository.getQueuedOutgoingMessages('device-local');
+      expect(queued.map((message) => message.messageId), ['msg-queued']);
+
+      await repository.markMessageSending('msg-queued');
+      var stored = await repository.getMessageByMessageId('msg-queued');
+      expect(stored?.status, MessageStatus.sending);
+      expect(stored?.transport, MessageTransport.ble);
+
+      await repository.markMessageSent('msg-queued');
+      stored = await repository.getMessageByMessageId('msg-queued');
+      expect(stored?.status, MessageStatus.sent);
+
+      await repository.markMessageDelivered('msg-queued');
+      stored = await repository.getMessageByMessageId('msg-queued');
+      expect(stored?.status, MessageStatus.delivered);
+
+      await repository.resetOutboxForSender('device-local');
+      expect(
+        (await repository.getMessageByMessageId('msg-queued'))?.status,
+        MessageStatus.delivered,
+      );
+      expect(
+        (await repository.getMessageByMessageId('msg-sending'))?.status,
+        MessageStatus.queued,
+      );
+      expect(
+        (await repository.getMessageByMessageId('msg-sent'))?.status,
+        MessageStatus.queued,
+      );
+      expect(
+        (await repository.getMessageByMessageId('msg-delivered'))?.status,
+        MessageStatus.delivered,
+      );
+    },
+  );
 }

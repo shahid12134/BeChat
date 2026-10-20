@@ -2,7 +2,7 @@ enum MessageType { text, image, file, system }
 
 enum MessageStatus { queued, sending, sent, delivered, read, failed }
 
-enum MessageTransport { local, mesh, cloud, pending }
+enum MessageTransport { local, ble, mesh, cloud, pending }
 
 class Message {
   final String? id;

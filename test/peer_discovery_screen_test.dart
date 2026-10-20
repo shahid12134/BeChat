@@ -7,7 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  testWidgets('demo discovery is hidden and explained when disabled', (
+  testWidgets('normal mode explains that BLE discovery is off until scan', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -21,11 +21,12 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Scan for Demo Devices'), findsNothing);
-    expect(find.text('Bluetooth discovery coming in Phase 2'), findsOneWidget);
+    expect(find.text('Direct BLE messaging is off'), findsOneWidget);
     expect(
-      find.textContaining('Simulated discovery is available only'),
+      find.textContaining('Both phones must be open in the foreground'),
       findsOneWidget,
     );
+    expect(find.text('Scan for Peers'), findsOneWidget);
   });
 }
 
