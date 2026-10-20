@@ -16,6 +16,7 @@ import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
 import 'package:bechat/services/ble/ble_outbox.dart';
+import 'package:bechat/services/ble/ble_status_probe.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -90,8 +91,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     this._ref, {
     CentralManager? centralManager,
     PeripheralManager? peripheralManager,
+    BleStatusProbe? statusProbe,
+    Duration permissionTimeout = const Duration(seconds: 20),
+    bool? isAndroidOverride,
   }) : _centralOverride = centralManager,
        _peripheralOverride = peripheralManager,
+       _statusProbe = statusProbe ?? MethodChannelBleStatusProbe(),
+       _permissionTimeout = permissionTimeout,
+       _isAndroidOverride = isAndroidOverride,
        super(const BleRuntimeState()) {
     _outbox = BleOutbox(
       repository: _ref.read(messageRepositoryProvider),
@@ -106,6 +113,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final Ref _ref;
   final CentralManager? _centralOverride;
   final PeripheralManager? _peripheralOverride;
+  final BleStatusProbe _statusProbe;
+  final Duration _permissionTimeout;
+  final bool? _isAndroidOverride;
   CentralManager? _centralInstance;
   PeripheralManager? _peripheralInstance;
   late final BleOutbox _outbox;
@@ -125,10 +135,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final Map<String, List<Uint8List>> _pendingCentralWrites = {};
 
   Timer? _scanTimer;
+  Future<void>? _startFuture;
+  bool _startAttempted = false;
+  bool _permissionCheckInFlight = false;
   bool _listenersAttached = false;
   bool _initialized = false;
   bool _foreground = true;
-  bool _starting = false;
   bool _discovering = false;
   bool _serviceAdded = false;
   bool _advertising = false;
@@ -171,15 +183,29 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await _outbox.drain(localDeviceId: localDeviceId, peerId: peerId);
   }
 
-  Future<void> ensureStarted() async {
-    if (_disposed || AppConstants.demoDataEnabled || _starting) return;
+  Future<void> ensureStarted() {
+    if (_disposed || AppConstants.demoDataEnabled) {
+      return Future<void>.value();
+    }
+    final inFlight = _startFuture;
+    if (inFlight != null) return inFlight;
     if (state.isConnected ||
         state.status == BleRuntimeStatus.ready ||
         state.status == BleRuntimeStatus.scanning) {
-      return;
+      return Future<void>.value();
     }
 
-    _starting = true;
+    final operation = _startUp();
+    _startFuture = operation;
+    return operation.whenComplete(() {
+      if (identical(_startFuture, operation)) {
+        _startFuture = null;
+      }
+    });
+  }
+
+  Future<void> _startUp() async {
+    _startAttempted = true;
     _foreground = true;
     _setState(
       status: BleRuntimeStatus.starting,
@@ -187,15 +213,24 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       canOpenSettings: false,
     );
     try {
-      if (!Platform.isAndroid) {
+      if (!(_isAndroidOverride ?? Platform.isAndroid)) {
         _setState(status: BleRuntimeStatus.unsupported);
         return;
       }
 
       _attachListeners();
-      final centralAuthorized = await _authorizeCentral();
-      final peripheralAuthorized = await _authorizePeripheral();
-      if (!centralAuthorized || !peripheralAuthorized) {
+      var status = await _readPlatformStatus();
+      if (!status.leSupported) {
+        _setState(status: BleRuntimeStatus.unsupported);
+        return;
+      }
+
+      if (!status.permissionsGranted) {
+        await _requestPermissions();
+        status = await _readPlatformStatus();
+      }
+
+      if (!status.permissionsGranted) {
         _setState(
           status: BleRuntimeStatus.unauthorized,
           canOpenSettings: true,
@@ -205,25 +240,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         );
         return;
       }
-
-      final adapterState = _combinedAdapterState();
-      if (adapterState == BluetoothLowEnergyState.unsupported) {
-        _setState(status: BleRuntimeStatus.unsupported);
-        return;
-      }
-      if (adapterState == BluetoothLowEnergyState.unauthorized) {
-        _setState(
-          status: BleRuntimeStatus.unauthorized,
-          canOpenSettings: true,
-          error: 'Bluetooth permission was not granted.',
-        );
-        return;
-      }
-      if (adapterState == BluetoothLowEnergyState.poweredOff) {
+      if (!status.bluetoothEnabled) {
         _setState(
           status: BleRuntimeStatus.bluetoothOff,
           error: 'Bluetooth is turned off. Enable it and try again.',
         );
+        return;
+      }
+      if (!status.advertisingSupported) {
+        _setState(status: BleRuntimeStatus.unsupported);
         return;
       }
 
@@ -236,11 +261,36 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         clearError: true,
       );
       await _resetOutbox();
+    } on BleStatusProbeException catch (error) {
+      _setState(
+        status: BleRuntimeStatus.error,
+        error: error.message,
+        canOpenSettings: false,
+      );
     } catch (error) {
       _setState(status: BleRuntimeStatus.error, error: _describeError(error));
-    } finally {
-      _starting = false;
     }
+  }
+
+  Future<BlePlatformStatus> _readPlatformStatus() async {
+    try {
+      return await _statusProbe.getStatus();
+    } on BleStatusProbeException {
+      rethrow;
+    } catch (error) {
+      throw BleStatusProbeException(
+        'Could not verify Android Bluetooth status: ${_describeError(error)}',
+      );
+    }
+  }
+
+  Future<void> _requestPermissions() async {
+    try {
+      await _authorizeCentral().timeout(_permissionTimeout);
+    } catch (_) {}
+    try {
+      await _authorizePeripheral().timeout(_permissionTimeout);
+    } catch (_) {}
   }
 
   Future<bool> _authorizeCentral() async {
@@ -257,24 +307,6 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     } on UnsupportedError {
       return true;
     }
-  }
-
-  BluetoothLowEnergyState _combinedAdapterState() {
-    final centralState = _central.state;
-    final peripheralState = _peripheral.state;
-    if (centralState == BluetoothLowEnergyState.unsupported ||
-        peripheralState == BluetoothLowEnergyState.unsupported) {
-      return BluetoothLowEnergyState.unsupported;
-    }
-    if (centralState == BluetoothLowEnergyState.unauthorized ||
-        peripheralState == BluetoothLowEnergyState.unauthorized) {
-      return BluetoothLowEnergyState.unauthorized;
-    }
-    if (centralState == BluetoothLowEnergyState.poweredOff ||
-        peripheralState == BluetoothLowEnergyState.poweredOff) {
-      return BluetoothLowEnergyState.poweredOff;
-    }
-    return BluetoothLowEnergyState.poweredOn;
   }
 
   void _attachListeners() {
@@ -320,17 +352,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     if (_disposed) return;
     switch (adapterState) {
       case BluetoothLowEnergyState.unsupported:
+        _resetBleAfterLoss();
         unawaited(_closeActiveLink());
         _setState(status: BleRuntimeStatus.unsupported, clearActiveLink: true);
       case BluetoothLowEnergyState.unauthorized:
-        unawaited(_closeActiveLink());
-        _setState(
-          status: BleRuntimeStatus.unauthorized,
-          canOpenSettings: true,
-          error: 'Bluetooth permission was not granted.',
-          clearActiveLink: true,
-        );
+        if (_startFuture != null) return;
+        unawaited(_handleUnauthorizedAdapterState());
       case BluetoothLowEnergyState.poweredOff:
+        _resetBleAfterLoss();
         unawaited(_closeActiveLink());
         _setState(
           status: BleRuntimeStatus.bluetoothOff,
@@ -339,12 +368,100 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         );
       case BluetoothLowEnergyState.poweredOn:
       case BluetoothLowEnergyState.unknown:
+        if (_startFuture != null) return;
+        if (_startAttempted && !_initialized && _foreground) {
+          unawaited(ensureStarted());
+          return;
+        }
         if (_initialized &&
             _foreground &&
             !state.isConnected &&
             state.status != BleRuntimeStatus.connecting) {
           unawaited(_recoverAdvertising());
         }
+    }
+  }
+
+  void _resetBleAfterLoss() {
+    _scanTimer?.cancel();
+    _scanTimer = null;
+    _discovering = false;
+    _advertising = false;
+    _serviceAdded = false;
+    _initialized = false;
+  }
+
+  Future<void> _handleUnauthorizedAdapterState() async {
+    if (_disposed || _permissionCheckInFlight) return;
+    _permissionCheckInFlight = true;
+    try {
+      final status = await _readPlatformStatus();
+      if (!status.leSupported) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (!_disposed) {
+          _setState(
+            status: BleRuntimeStatus.unsupported,
+            clearActiveLink: true,
+          );
+        }
+        return;
+      }
+      if (!status.permissionsGranted) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (_disposed) return;
+        _setState(
+          status: BleRuntimeStatus.unauthorized,
+          canOpenSettings: true,
+          error: 'Bluetooth permission was not granted.',
+          clearActiveLink: true,
+        );
+        return;
+      }
+      if (!status.bluetoothEnabled) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (_disposed) return;
+        _setState(
+          status: BleRuntimeStatus.bluetoothOff,
+          error: 'Bluetooth is turned off. Enable it and try again.',
+          clearActiveLink: true,
+        );
+        return;
+      }
+      if (!status.advertisingSupported) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (!_disposed) {
+          _setState(
+            status: BleRuntimeStatus.unsupported,
+            clearActiveLink: true,
+          );
+        }
+        return;
+      }
+      if (_initialized) {
+        if (_foreground &&
+            !state.isConnected &&
+            state.status != BleRuntimeStatus.connecting) {
+          await _recoverAdvertising();
+        }
+        return;
+      }
+      if (_startAttempted && _foreground) {
+        await ensureStarted();
+      }
+    } on BleStatusProbeException catch (error) {
+      if (!_disposed && !state.isConnected) {
+        _setState(status: BleRuntimeStatus.error, error: error.message);
+      }
+    } catch (error) {
+      if (!_disposed && !state.isConnected) {
+        _setState(status: BleRuntimeStatus.error, error: _describeError(error));
+      }
+    } finally {
+      _permissionCheckInFlight = false;
     }
   }
 
@@ -942,7 +1059,17 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> retry() async {
-    await ensureStarted();
+    if (_disposed) return;
+    final inFlight = _startFuture;
+    if (inFlight != null) {
+      await inFlight;
+    } else {
+      await ensureStarted();
+    }
+    if (_disposed || !_foreground || state.status != BleRuntimeStatus.ready) {
+      return;
+    }
+    await startScan();
   }
 
   Future<void> pauseForBackground() async {
@@ -967,8 +1094,75 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Future<void> resumeFromBackground() async {
     if (_disposed) return;
     _foreground = true;
-    if (_initialized) {
-      await _recoverAdvertising();
+    final inFlight = _startFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+    if (!_startAttempted) return;
+    if (!_initialized) {
+      await ensureStarted();
+      return;
+    }
+
+    try {
+      final status = await _readPlatformStatus();
+      if (!status.leSupported) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (!_disposed) {
+          _setState(
+            status: BleRuntimeStatus.unsupported,
+            clearActiveLink: true,
+          );
+        }
+        return;
+      }
+      if (!status.permissionsGranted) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (_disposed) return;
+        _setState(
+          status: BleRuntimeStatus.unauthorized,
+          canOpenSettings: true,
+          error: 'Bluetooth permission was not granted.',
+          clearActiveLink: true,
+        );
+        return;
+      }
+      if (!status.bluetoothEnabled) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (_disposed) return;
+        _setState(
+          status: BleRuntimeStatus.bluetoothOff,
+          error: 'Bluetooth is turned off. Enable it and try again.',
+          clearActiveLink: true,
+        );
+        return;
+      }
+      if (!status.advertisingSupported) {
+        _resetBleAfterLoss();
+        await _closeActiveLink();
+        if (!_disposed) {
+          _setState(
+            status: BleRuntimeStatus.unsupported,
+            clearActiveLink: true,
+          );
+        }
+        return;
+      }
+      if (!state.isConnected && state.status != BleRuntimeStatus.connecting) {
+        await _recoverAdvertising();
+      }
+    } on BleStatusProbeException catch (error) {
+      if (!_disposed && !state.isConnected) {
+        _setState(status: BleRuntimeStatus.error, error: error.message);
+      }
+    } catch (error) {
+      if (!_disposed && !state.isConnected) {
+        _setState(status: BleRuntimeStatus.error, error: _describeError(error));
+      }
     }
   }
 
