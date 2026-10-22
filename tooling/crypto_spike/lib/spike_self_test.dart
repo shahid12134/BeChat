@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'native_identity.dart';
 import 'src/rust/api/noise.dart' as noise;
 
 class SpikeCheck {
@@ -320,6 +321,192 @@ Future<void> _freshSessions() async {
     await noise.closePeer(peerHandle: a);
     await noise.closePeer(peerHandle: b);
   }
+}
+
+Future<void> _installedXxRoundTrip(String installedPublicKeyHex) async {
+  final b = await noise.createTestPeer();
+  int? initiator;
+  int? responder;
+  try {
+    final bPublic = (await noise.publicIdentity(peerHandle: b)).publicKeyHex;
+    initiator = await noise.createInstalledSession(
+      pattern: 'XX',
+      initiator: true,
+    );
+    responder = await noise.createSession(
+      peerHandle: b,
+      pattern: 'XX',
+      initiator: false,
+    );
+
+    final first = await noise.handshakeStart(sessionHandle: initiator);
+    final second = await noise.handshakeStep(
+      sessionHandle: responder,
+      incoming: first.outgoing,
+    );
+    final third = await noise.handshakeStep(
+      sessionHandle: initiator,
+      incoming: second.outgoing,
+    );
+    final fourth = await noise.handshakeStep(
+      sessionHandle: responder,
+      incoming: third.outgoing,
+    );
+    if (!third.finished ||
+        third.remotePublicKeyHex != bPublic ||
+        !fourth.finished ||
+        fourth.remotePublicKeyHex != installedPublicKeyHex) {
+      throw StateError('installed XX identity check failed');
+    }
+
+    final fromInstalled = await noise.encrypt(
+      sessionHandle: initiator,
+      plaintext: utf8Bytes('installed xx'),
+    );
+    final decrypted = await noise.decrypt(
+      sessionHandle: responder,
+      ciphertext: fromInstalled,
+    );
+    if (utf8String(decrypted) != 'installed xx') {
+      throw StateError('installed XX transport round trip failed');
+    }
+  } finally {
+    if (initiator != null) {
+      await noise.closeSession(sessionHandle: initiator);
+    }
+    if (responder != null) {
+      await noise.closeSession(sessionHandle: responder);
+    }
+    await noise.closePeer(peerHandle: b);
+  }
+}
+
+Future<void> _installedIkRoundTrip(String installedPublicKeyHex) async {
+  final b = await noise.createTestPeer();
+  final c = await noise.createTestPeer();
+  int? initiator;
+  int? responder;
+  int? wrongInitiator;
+  int? wrongResponder;
+  try {
+    final bPublic = (await noise.publicIdentity(peerHandle: b)).publicKeyHex;
+    final cPublic = (await noise.publicIdentity(peerHandle: c)).publicKeyHex;
+
+    initiator = await noise.createInstalledSession(
+      pattern: 'IK',
+      initiator: true,
+      expectedRemotePublicKeyHex: bPublic,
+    );
+    responder = await noise.createSession(
+      peerHandle: b,
+      pattern: 'IK',
+      initiator: false,
+      expectedRemotePublicKeyHex: installedPublicKeyHex,
+    );
+
+    final first = await noise.handshakeStart(sessionHandle: initiator);
+    final second = await noise.handshakeStep(
+      sessionHandle: responder,
+      incoming: first.outgoing,
+    );
+    final third = await noise.handshakeStep(
+      sessionHandle: initiator,
+      incoming: second.outgoing,
+    );
+    if (second.remotePublicKeyHex != installedPublicKeyHex ||
+        third.remotePublicKeyHex != bPublic ||
+        !second.finished ||
+        !third.finished) {
+      throw StateError('installed IK identity check failed');
+    }
+
+    final fromInstalled = await noise.encrypt(
+      sessionHandle: initiator,
+      plaintext: utf8Bytes('installed ik'),
+    );
+    final decrypted = await noise.decrypt(
+      sessionHandle: responder,
+      ciphertext: fromInstalled,
+    );
+    if (utf8String(decrypted) != 'installed ik') {
+      throw StateError('installed IK transport round trip failed');
+    }
+
+    wrongInitiator = await noise.createInstalledSession(
+      pattern: 'IK',
+      initiator: true,
+      expectedRemotePublicKeyHex: cPublic,
+    );
+    wrongResponder = await noise.createSession(
+      peerHandle: b,
+      pattern: 'IK',
+      initiator: false,
+      expectedRemotePublicKeyHex: installedPublicKeyHex,
+    );
+    final wrongFirst = await noise.handshakeStart(
+      sessionHandle: wrongInitiator,
+    );
+    await _expectFailure(() async {
+      await noise.handshakeStep(
+        sessionHandle: wrongResponder!,
+        incoming: wrongFirst.outgoing,
+      );
+    }, 'installed identity accepted a mismatched pinned peer');
+  } finally {
+    for (final handle in [
+      initiator,
+      responder,
+      wrongInitiator,
+      wrongResponder,
+    ]) {
+      if (handle != null) {
+        await noise.closeSession(sessionHandle: handle);
+      }
+    }
+    await noise.closePeer(peerHandle: b);
+    await noise.closePeer(peerHandle: c);
+  }
+}
+
+Future<SpikeReport> runNativeIdentitySelfTest() async {
+  final checks = <SpikeCheck>[];
+  String? installedPublicKeyHex;
+  await _runCheck(checks, 'Native identity provision or restore', () async {
+    const service = NativeIdentityService();
+    var identity = await service.status();
+    if (identity.state == 'uninitialized') {
+      identity = await service.provision();
+    }
+    if (!identity.isReady || identity.publicKeyHex == null) {
+      throw StateError('identity unavailable: $identity');
+    }
+    installedPublicKeyHex = identity.publicKeyHex;
+    final restored = await service.restore();
+    if (!restored.isReady || restored.publicKeyHex != installedPublicKeyHex) {
+      throw StateError('identity did not survive restore');
+    }
+    final mismatch = await service.verifyPublicKeyMismatchRejected();
+    if (!mismatch.rejected) {
+      throw StateError('mismatched public identity was accepted');
+    }
+  });
+  await _runCheck(checks, 'Installed identity performs XX handshake', () async {
+    if (installedPublicKeyHex == null) {
+      throw StateError('installed identity is unavailable');
+    }
+    await _installedXxRoundTrip(installedPublicKeyHex!);
+  });
+  await _runCheck(
+    checks,
+    'Installed identity performs IK handshake and rejects wrong pin',
+    () async {
+      if (installedPublicKeyHex == null) {
+        throw StateError('installed identity is unavailable');
+      }
+      await _installedIkRoundTrip(installedPublicKeyHex!);
+    },
+  );
+  return SpikeReport(checks);
 }
 
 Future<SpikeReport> runNoiseSelfTest() async {

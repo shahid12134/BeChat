@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
+use snow::params::DHChoice;
+use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, TransportState};
 use zeroize::Zeroizing;
 
@@ -41,6 +43,7 @@ struct Session {
 struct Engine {
     peers: HashMap<u32, PeerIdentity>,
     sessions: HashMap<u32, Session>,
+    installed: Option<PeerIdentity>,
     next_handle: u32,
 }
 
@@ -51,6 +54,7 @@ fn engine() -> &'static Mutex<Engine> {
         Mutex::new(Engine {
             peers: HashMap::new(),
             sessions: HashMap::new(),
+            installed: None,
             next_handle: 0,
         })
     })
@@ -92,6 +96,64 @@ fn pattern_for(value: &str) -> Result<&'static str, String> {
         "IK" => Ok(IK_PATTERN),
         _ => Err("unsupported Noise pattern".into()),
     }
+}
+
+pub(crate) fn generate_identity_seed() -> Result<Vec<u8>, String> {
+    let builder = Builder::new(XX_PATTERN.parse().map_err(|_| "invalid Noise parameters")?);
+    let keypair = builder
+        .generate_keypair()
+        .map_err(|_| "identity key generation failed")?;
+    if keypair.private.len() != 32 {
+        return Err("invalid generated identity key length".into());
+    }
+    Ok(keypair.private)
+}
+
+pub(crate) fn derive_identity_public_key(seed: &[u8]) -> Result<Vec<u8>, String> {
+    if seed.len() != 32 {
+        return Err("invalid identity seed length".into());
+    }
+    let mut dh = DefaultResolver
+        .resolve_dh(&DHChoice::Curve25519)
+        .ok_or("X25519 implementation unavailable")?;
+    dh.set(seed);
+    let public_key = dh.pubkey();
+    if public_key.len() != 32 {
+        return Err("invalid identity public key length".into());
+    }
+    Ok(public_key.to_vec())
+}
+
+pub(crate) fn install_identity(seed: &[u8], expected_public_hex: &str) -> Result<(), String> {
+    let public_key = derive_identity_public_key(seed)?;
+    let expected_public = decode_public_key(expected_public_hex)?;
+    if public_key != expected_public {
+        return Err("identity public key mismatch".into());
+    }
+
+    with_engine(|engine| {
+        engine.installed = Some(PeerIdentity {
+            private_key: Zeroizing::new(seed.to_vec()),
+            public_key,
+        });
+        Ok(())
+    })
+}
+
+pub(crate) fn clear_installed_identity() {
+    let _ = with_engine(|engine| {
+        engine.installed = None;
+        Ok(())
+    });
+}
+
+pub(crate) fn installed_public_key_hex() -> Result<Option<String>, String> {
+    with_engine(|engine| {
+        Ok(engine
+            .installed
+            .as_ref()
+            .map(|identity| hex::encode(&identity.public_key)))
+    })
 }
 
 fn verify_remote(session: &Session, remote: Option<&[u8]>) -> Result<(), String> {
@@ -142,20 +204,74 @@ pub fn public_identity(peer_handle: u32) -> Result<PublicIdentity, String> {
             .peers
             .get(&peer_handle)
             .ok_or("peer is closed or unknown")?;
-        Ok(PublicIdentity {
-            public_key_hex: hex::encode(&peer.public_key),
-            fingerprint_hex: sha256_hex(&peer.public_key),
-        })
+        Ok(public_identity_from_key(&peer.public_key))
     })
 }
 
-pub fn create_session(
-    peer_handle: u32,
-    pattern: String,
+pub fn installed_public_identity() -> Result<PublicIdentity, String> {
+    with_engine(|engine| {
+        let identity = engine
+            .installed
+            .as_ref()
+            .ok_or("installed identity is unavailable")?;
+        Ok(public_identity_from_key(&identity.public_key))
+    })
+}
+
+fn public_identity_from_key(public_key: &[u8]) -> PublicIdentity {
+    PublicIdentity {
+        public_key_hex: hex::encode(public_key),
+        fingerprint_hex: sha256_hex(public_key),
+    }
+}
+
+fn build_session(
+    engine: &mut Engine,
+    private_key: &[u8],
+    pattern: &'static str,
+    initiator: bool,
+    expected_remote: Option<Vec<u8>>,
+) -> Result<u32, String> {
+    let mut builder = Builder::new(pattern.parse().map_err(|_| "invalid Noise parameters")?)
+        .local_private_key(private_key)
+        .map_err(|_| "invalid local identity key")?
+        .prologue(PROLOGUE)
+        .map_err(|_| "invalid Noise prologue")?;
+
+    if pattern == IK_PATTERN && initiator {
+        builder = builder
+            .remote_public_key(
+                expected_remote
+                    .as_deref()
+                    .ok_or("IK initiator requires an expected remote public key")?,
+            )
+            .map_err(|_| "invalid remote static key")?;
+    }
+
+    let handshake = if initiator {
+        builder.build_initiator()
+    } else {
+        builder.build_responder()
+    }
+    .map_err(|_| "could not initialize Noise handshake")?;
+
+    let handle = next_handle(engine);
+    engine.sessions.insert(
+        handle,
+        Session {
+            stage: SessionStage::Handshake(Box::new(handshake)),
+            expected_remote,
+            remote_public: None,
+        },
+    );
+    Ok(handle)
+}
+
+fn decode_expected_remote(
+    pattern: &'static str,
     initiator: bool,
     expected_remote_public_key_hex: Option<String>,
-) -> Result<u32, String> {
-    let pattern = pattern_for(&pattern)?;
+) -> Result<Option<Vec<u8>>, String> {
     let expected_remote = expected_remote_public_key_hex
         .as_deref()
         .map(decode_public_key)
@@ -165,6 +281,19 @@ pub fn create_session(
         return Err("IK initiator requires an expected remote public key".into());
     }
 
+    Ok(expected_remote)
+}
+
+pub fn create_session(
+    peer_handle: u32,
+    pattern: String,
+    initiator: bool,
+    expected_remote_public_key_hex: Option<String>,
+) -> Result<u32, String> {
+    let pattern = pattern_for(&pattern)?;
+    let expected_remote =
+        decode_expected_remote(pattern, initiator, expected_remote_public_key_hex)?;
+
     with_engine(|engine| {
         let private_key = engine
             .peers
@@ -172,40 +301,27 @@ pub fn create_session(
             .ok_or("peer is closed or unknown")?
             .private_key
             .clone();
+        build_session(engine, &private_key, pattern, initiator, expected_remote)
+    })
+}
 
-        let mut builder = Builder::new(pattern.parse().map_err(|_| "invalid Noise parameters")?)
-            .local_private_key(&private_key)
-            .map_err(|_| "invalid local identity key")?
-            .prologue(PROLOGUE)
-            .map_err(|_| "invalid Noise prologue")?;
+pub fn create_installed_session(
+    pattern: String,
+    initiator: bool,
+    expected_remote_public_key_hex: Option<String>,
+) -> Result<u32, String> {
+    let pattern = pattern_for(&pattern)?;
+    let expected_remote =
+        decode_expected_remote(pattern, initiator, expected_remote_public_key_hex)?;
 
-        if pattern == IK_PATTERN && initiator {
-            builder = builder
-                .remote_public_key(
-                    expected_remote
-                        .as_deref()
-                        .ok_or("IK initiator requires an expected remote public key")?,
-                )
-                .map_err(|_| "invalid remote static key")?;
-        }
-
-        let handshake = if initiator {
-            builder.build_initiator()
-        } else {
-            builder.build_responder()
-        }
-        .map_err(|_| "could not initialize Noise handshake")?;
-
-        let handle = next_handle(engine);
-        engine.sessions.insert(
-            handle,
-            Session {
-                stage: SessionStage::Handshake(Box::new(handshake)),
-                expected_remote,
-                remote_public: None,
-            },
-        );
-        Ok(handle)
+    with_engine(|engine| {
+        let private_key = engine
+            .installed
+            .as_ref()
+            .ok_or("installed identity is unavailable")?
+            .private_key
+            .clone();
+        build_session(engine, &private_key, pattern, initiator, expected_remote)
     })
 }
 
@@ -513,6 +629,74 @@ mod tests {
         let wrong_responder = create_session(b, "IK".into(), false, Some(wrong_pin)).unwrap();
         let first = handshake_start(trusted_initiator).unwrap();
         assert!(handshake_step(wrong_responder, first.outgoing).is_err());
+    }
+
+    #[test]
+    fn installed_identity_works_with_xx_and_ik() {
+        let seed = generate_identity_seed().unwrap();
+        let public = derive_identity_public_key(&seed).unwrap();
+        let public_hex = hex::encode(&public);
+
+        clear_installed_identity();
+        assert!(installed_public_identity().is_err());
+        install_identity(&seed, &public_hex).unwrap();
+        assert_eq!(
+            installed_public_identity().unwrap().public_key_hex,
+            public_hex
+        );
+
+        let wrong_public = hex::encode([0_u8; 32]);
+        assert!(install_identity(&seed, &wrong_public).is_err());
+        assert_eq!(
+            installed_public_identity().unwrap().public_key_hex,
+            public_hex
+        );
+        assert!(install_identity(&seed[..31], &public_hex).is_err());
+
+        let b = create_test_peer().unwrap();
+        let b_public = public_identity(b).unwrap().public_key_hex;
+
+        let a_xx = create_installed_session("XX".into(), true, None).unwrap();
+        let b_xx = create_session(b, "XX".into(), false, None).unwrap();
+        let first = handshake_start(a_xx).unwrap();
+        let second = handshake_step(b_xx, first.outgoing).unwrap();
+        let third = handshake_step(a_xx, second.outgoing).unwrap();
+        assert_eq!(
+            third.remote_public_key_hex.as_deref(),
+            Some(b_public.as_str())
+        );
+        let fourth = handshake_step(b_xx, third.outgoing).unwrap();
+        assert!(fourth.finished);
+        assert_eq!(
+            fourth.remote_public_key_hex.as_deref(),
+            Some(public_hex.as_str())
+        );
+
+        let a_ik = create_installed_session("IK".into(), true, Some(b_public.clone())).unwrap();
+        let b_ik = create_session(b, "IK".into(), false, Some(public_hex.clone())).unwrap();
+        let first = handshake_start(a_ik).unwrap();
+        let second = handshake_step(b_ik, first.outgoing).unwrap();
+        let third = handshake_step(a_ik, second.outgoing).unwrap();
+        assert!(third.finished);
+        assert_eq!(
+            third.remote_public_key_hex.as_deref(),
+            Some(b_public.as_str())
+        );
+
+        let message = encrypt(a_ik, b"installed identity".to_vec()).unwrap();
+        assert_eq!(
+            decrypt(b_ik, message).unwrap(),
+            b"installed identity".to_vec()
+        );
+
+        assert!(close_session(a_xx));
+        assert!(close_session(b_xx));
+        assert!(close_session(a_ik));
+        assert!(close_session(b_ik));
+        assert!(close_peer(b));
+        clear_installed_identity();
+        assert!(installed_public_identity().is_err());
+        assert!(create_installed_session("XX".into(), true, None).is_err());
     }
 
     #[test]

@@ -12,6 +12,7 @@ snow = "=0.10.0"
 sha2 = "=0.11.1"
 hex = "=0.4.3"
 zeroize = "=1.9.1"
+jni = "=0.21.1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

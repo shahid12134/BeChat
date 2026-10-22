@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `decode_public_key`, `engine`, `finish_handshake`, `next_handle`, `pattern_for`, `sha256_hex`, `verify_remote`, `with_engine`
+// These functions are ignored because they are not marked as `pub`: `build_session`, `clear_installed_identity`, `decode_expected_remote`, `decode_public_key`, `derive_identity_public_key`, `engine`, `finish_handshake`, `generate_identity_seed`, `install_identity`, `installed_public_key_hex`, `next_handle`, `pattern_for`, `public_identity_from_key`, `sha256_hex`, `verify_remote`, `with_engine`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Engine`, `PeerIdentity`, `SessionStage`, `Session`
 
 Future<int> createTestPeer() =>
@@ -15,6 +15,9 @@ Future<int> createTestPeer() =>
 Future<PublicIdentity> publicIdentity({required int peerHandle}) =>
     RustLib.instance.api.crateApiNoisePublicIdentity(peerHandle: peerHandle);
 
+Future<PublicIdentity> installedPublicIdentity() =>
+    RustLib.instance.api.crateApiNoiseInstalledPublicIdentity();
+
 Future<int> createSession({
   required int peerHandle,
   required String pattern,
@@ -22,6 +25,16 @@ Future<int> createSession({
   String? expectedRemotePublicKeyHex,
 }) => RustLib.instance.api.crateApiNoiseCreateSession(
   peerHandle: peerHandle,
+  pattern: pattern,
+  initiator: initiator,
+  expectedRemotePublicKeyHex: expectedRemotePublicKeyHex,
+);
+
+Future<int> createInstalledSession({
+  required String pattern,
+  required bool initiator,
+  String? expectedRemotePublicKeyHex,
+}) => RustLib.instance.api.crateApiNoiseCreateInstalledSession(
   pattern: pattern,
   initiator: initiator,
   expectedRemotePublicKeyHex: expectedRemotePublicKeyHex,
