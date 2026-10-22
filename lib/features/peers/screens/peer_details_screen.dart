@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
 import 'package:bechat/core/utils/date_utils.dart';
@@ -19,6 +20,11 @@ class PeerDetailsScreen extends ConsumerStatefulWidget {
 }
 
 class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
+  Future<void> _blockPeer(Peer peer) async {
+    await ref.read(peerListProvider.notifier).blockPeer(peer.peerId);
+    await ref.read(bleRuntimeProvider.notifier).disconnectPeer(peer.peerId);
+  }
+
   Future<void> _openChat(Peer peer) async {
     try {
       await ref.read(peerListProvider.notifier).savePeer(peer);
@@ -83,8 +89,11 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
     Peer peer,
     BleRuntimeState bleState,
   ) {
-    final isBleConnected =
-        bleState.isConnected && bleState.activePeerId == peer.peerId;
+    final presence = resolvePeerPresence(peer, bleState.presenceContext);
+    final isBleConnected = isPeerPresenceConnected(presence);
+    final signalStrength = isBleConnected
+        ? bleState.activeSignalStrength ?? peer.signalStrength
+        : peer.signalStrength;
     return Scaffold(
       appBar: AppBar(
         title: Text(peer.displayName),
@@ -92,9 +101,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
           PopupMenuButton<String>(
             onSelected: (value) async {
               if (value == 'block') {
-                await ref
-                    .read(peerListProvider.notifier)
-                    .blockPeer(peer.peerId);
+                await _blockPeer(peer);
                 if (context.mounted) context.pop();
               } else if (value == 'unblock') {
                 await ref
@@ -146,26 +153,20 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(
-                color:
-                    (isBleConnected ? Colors.green : _statusColor(peer.status))
-                        .withValues(alpha: 0.1),
+                color: _presenceColor(presence).withValues(alpha: 0.1),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Text(
-                isBleConnected
-                    ? 'BLE CONNECTED'
-                    : peer.status.name.toUpperCase(),
+                peerPresenceLabel(presence).toUpperCase(),
                 style: TextStyle(
-                  color: isBleConnected
-                      ? Colors.green
-                      : _statusColor(peer.status),
+                  color: _presenceColor(presence),
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
                 ),
               ),
             ),
             const SizedBox(height: 24),
-            _buildInfoSection(context, peer),
+            _buildInfoSection(context, peer, signalStrength),
             const SizedBox(height: 24),
             _buildSecuritySection(context, peer),
             const SizedBox(height: 24),
@@ -176,7 +177,11 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
     );
   }
 
-  Widget _buildInfoSection(BuildContext context, Peer peer) {
+  Widget _buildInfoSection(
+    BuildContext context,
+    Peer peer,
+    int? signalStrength,
+  ) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -196,9 +201,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             _infoRow(
               context,
               'Signal Strength',
-              peer.signalStrength != null
-                  ? '${peer.signalStrength} dBm'
-                  : 'Unknown',
+              signalStrength != null ? '$signalStrength dBm' : 'Unknown',
             ),
             _infoRow(
               context,
@@ -295,9 +298,7 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             width: double.infinity,
             child: OutlinedButton.icon(
               onPressed: () async {
-                await ref
-                    .read(peerListProvider.notifier)
-                    .blockPeer(peer.peerId);
+                await _blockPeer(peer);
                 if (context.mounted) context.pop();
               },
               icon: const Icon(Icons.block, color: Colors.red),
@@ -346,10 +347,11 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
     );
   }
 
-  Color _statusColor(PeerStatus status) => switch (status) {
-    PeerStatus.online => Colors.green,
-    PeerStatus.offline => Colors.grey,
-    PeerStatus.pairing => Colors.orange,
-    PeerStatus.blocked => Colors.red,
+  Color _presenceColor(PeerPresence presence) => switch (presence) {
+    PeerPresence.connected => Colors.green,
+    PeerPresence.blocked => Colors.red,
+    PeerPresence.awaitingApproval || PeerPresence.handshaking => Colors.orange,
+    PeerPresence.localUnavailable => Colors.orange,
+    PeerPresence.offline => Colors.grey,
   };
 }

@@ -181,15 +181,78 @@ class PeerRepository {
 
   Future<void> updatePeerStatus(String peerId, PeerStatus status) async {
     final db = await _db;
+    final now = DateTime.now().toIso8601String();
+    if (status == PeerStatus.blocked) {
+      await db.update(
+        'peers',
+        {
+          'status': PeerStatus.blocked.name,
+          'is_blocked': 1,
+          'last_seen': now,
+          'updated_at': now,
+        },
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+      );
+      return;
+    }
+    await db.update(
+      'peers',
+      {'status': status.name, 'last_seen': now, 'updated_at': now},
+      where: 'peer_id = ? AND is_blocked = 0 AND status != ?',
+      whereArgs: [peerId, PeerStatus.blocked.name],
+    );
+  }
+
+  Future<void> resetTransientPresence() async {
+    final db = await _db;
+    final now = DateTime.now().toIso8601String();
+    await db.update(
+      'peers',
+      {'status': PeerStatus.offline.name, 'updated_at': now},
+      where: 'is_blocked = 0 AND status IN (?, ?)',
+      whereArgs: [PeerStatus.online.name, PeerStatus.pairing.name],
+    );
+    await db.update(
+      'peers',
+      {'status': PeerStatus.blocked.name, 'updated_at': now},
+      where: 'is_blocked = 1 AND status != ?',
+      whereArgs: [PeerStatus.blocked.name],
+    );
+  }
+
+  Future<void> markPeerOnline(
+    String peerId, {
+    int? signalStrength,
+    DateTime? lastSeen,
+  }) async {
+    final db = await _db;
+    final now = DateTime.now();
     await db.update(
       'peers',
       {
-        'status': status.name,
-        'last_seen': DateTime.now().toIso8601String(),
-        'updated_at': DateTime.now().toIso8601String(),
+        'status': PeerStatus.online.name,
+        if (signalStrength != null) 'signal_strength': signalStrength,
+        'last_seen': (lastSeen ?? now).toIso8601String(),
+        'updated_at': now.toIso8601String(),
       },
-      where: 'peer_id = ?',
-      whereArgs: [peerId],
+      where: 'peer_id = ? AND is_blocked = 0 AND status != ?',
+      whereArgs: [peerId, PeerStatus.blocked.name],
+    );
+  }
+
+  Future<void> markPeerOffline(String peerId, {DateTime? lastSeen}) async {
+    final db = await _db;
+    final now = DateTime.now();
+    await db.update(
+      'peers',
+      {
+        'status': PeerStatus.offline.name,
+        'last_seen': (lastSeen ?? now).toIso8601String(),
+        'updated_at': now.toIso8601String(),
+      },
+      where: 'peer_id = ? AND is_blocked = 0 AND status != ?',
+      whereArgs: [peerId, PeerStatus.blocked.name],
     );
   }
 

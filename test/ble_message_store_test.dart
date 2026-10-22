@@ -45,7 +45,7 @@ void main() {
       expect(receipt.result, BleIncomingResult.stored);
       expect(receipt.chatId, isNotEmpty);
       final peerRow = (await db.query('peers')).single;
-      expect(peerRow['status'], PeerStatus.online.name);
+      expect(peerRow['status'], PeerStatus.offline.name);
       final chat = (await db.query('chats')).single;
       expect(chat['last_message'], 'Hello');
       expect(chat['unread_count'], 1);
@@ -107,6 +107,20 @@ void main() {
       expect((await db.query('chats')).single['unread_count'], 1);
     },
   );
+
+  test('incoming messages do not resurrect a saved offline peer', () async {
+    await peers.insertPeer(remote);
+    await peers.markPeerOffline(remote.peerId);
+
+    final receipt = await store.storeIncoming(
+      payload: _payload(messageId: 'msg-offline'),
+      peer: remote,
+    );
+
+    expect(receipt.result, BleIncomingResult.stored);
+    final peerRow = (await db.query('peers')).single;
+    expect(peerRow['status'], PeerStatus.offline.name);
+  });
 
   test('rejects blocked peers without persistence', () async {
     await peers.insertPeer(remote);

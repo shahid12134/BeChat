@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
+import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 
@@ -32,7 +34,12 @@ class PeerListItem extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final isOnline = peer.status == PeerStatus.online;
+    final bleState = ref.watch(bleRuntimeProvider);
+    final presence = resolvePeerPresence(peer, bleState.presenceContext);
+    final isOnline = isPeerPresenceConnected(presence);
+    final signalStrength = isOnline
+        ? bleState.activeSignalStrength ?? peer.signalStrength
+        : peer.signalStrength;
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -48,15 +55,15 @@ class PeerListItem extends ConsumerWidget {
       ),
       subtitle: Row(
         children: [
-          if (peer.signalStrength != null) ...[
+          if (signalStrength != null) ...[
             Icon(
-              _signalIcon(peer.signalStrength!),
+              _signalIcon(signalStrength),
               size: 14,
-              color: _signalColor(peer.signalStrength!),
+              color: _signalColor(signalStrength),
             ),
             const SizedBox(width: 4),
             Text(
-              '${peer.signalStrength} dBm',
+              '$signalStrength dBm',
               style: TextStyle(
                 fontSize: 12,
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -65,10 +72,23 @@ class PeerListItem extends ConsumerWidget {
             const SizedBox(width: 8),
           ],
           Text(
-            peer.deviceName,
+            peerPresenceLabel(presence),
             style: TextStyle(
               fontSize: 12,
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
+              color: isOnline
+                  ? Colors.green
+                  : Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              peer.deviceName,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
         ],

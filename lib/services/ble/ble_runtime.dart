@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
+import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/data/models/ble_candidate.dart';
 import 'package:bechat/data/models/identity.dart';
@@ -17,8 +18,10 @@ import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/providers/background_service_provider.dart';
 import 'package:bechat/services/background/background_ble_service.dart';
+import 'package:bechat/services/ble/ble_gatt_operation_gate.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
 import 'package:bechat/services/ble/ble_outbox.dart';
+import 'package:bechat/services/ble/ble_presence_monitor.dart';
 import 'package:bechat/services/ble/ble_status_probe.dart';
 import 'package:bechat/services/ble/incoming_connection_policy.dart';
 import 'package:bechat/services/ble/incoming_connection_request.dart';
@@ -105,6 +108,8 @@ class BleRuntimeState {
     this.isForeground = true,
     this.backgroundStatus = BackgroundBleRuntimeStatus.disabled,
     this.backgroundError,
+    this.availabilityEnabled = true,
+    this.activeSignalStrength,
   });
 
   final BleRuntimeStatus status;
@@ -119,12 +124,26 @@ class BleRuntimeState {
   final bool isForeground;
   final BackgroundBleRuntimeStatus backgroundStatus;
   final String? backgroundError;
+  final bool availabilityEnabled;
+  final int? activeSignalStrength;
 
   bool get isConnected =>
       status == BleRuntimeStatus.connected && activePeerId != null;
 
   bool get isBackgroundServiceActive =>
       backgroundStatus == BackgroundBleRuntimeStatus.active;
+
+  PeerPresenceContext get presenceContext => PeerPresenceContext(
+    availabilityEnabled: availabilityEnabled,
+    localUnavailable:
+        status == BleRuntimeStatus.unsupported ||
+        status == BleRuntimeStatus.unauthorized ||
+        status == BleRuntimeStatus.bluetoothOff,
+    connected: isConnected,
+    connecting: status == BleRuntimeStatus.connecting,
+    activePeerId: activePeerId,
+    awaitingApprovalPeerId: incomingRequest?.peerId,
+  );
 
   BleRuntimeState copyWith({
     BleRuntimeStatus? status,
@@ -139,10 +158,13 @@ class BleRuntimeState {
     bool? isForeground,
     BackgroundBleRuntimeStatus? backgroundStatus,
     String? backgroundError,
+    bool? availabilityEnabled,
+    int? activeSignalStrength,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
     bool clearBackgroundError = false,
+    bool clearActiveSignal = false,
   }) {
     return BleRuntimeState(
       status: status ?? this.status,
@@ -163,6 +185,10 @@ class BleRuntimeState {
       backgroundError: clearBackgroundError
           ? null
           : backgroundError ?? this.backgroundError,
+      availabilityEnabled: availabilityEnabled ?? this.availabilityEnabled,
+      activeSignalStrength: clearActiveLink || clearActiveSignal
+          ? null
+          : activeSignalStrength ?? this.activeSignalStrength,
     );
   }
 }
@@ -190,7 +216,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
        _candidateExpiration = candidateExpiration,
        _candidateCleanupInterval = candidateCleanupInterval,
        _clock = clock ?? DateTime.now,
-       super(const BleRuntimeState()) {
+       super(BleRuntimeState(availabilityEnabled: availabilityEnabled)) {
     _outbox = BleOutbox(
       repository: _ref.read(messageRepositoryProvider),
       send: _sendOverLink,
@@ -266,6 +292,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   bool _cleaningLink = false;
   Completer<void>? _linkCleanupCompleter;
   bool _disposed = false;
+  BleGattOperationGate _centralGate = BleGattOperationGate();
+  BlePresenceMonitor? _presenceMonitor;
+  int _presenceGeneration = 0;
+  final Map<String, String?> _teardownPendingByDevice = {};
 
   BleLinkSession? _activeSession;
   BleLinkRole? _activeRole;
@@ -318,6 +348,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
             '${_describeError(error)}',
         candidates: const [],
         isAdvertising: false,
+        availabilityEnabled: false,
         clearActiveLink: true,
       );
       return;
@@ -555,6 +586,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       return Future<void>.value();
     }
     _availabilityEnabled = enabled;
+    _setState(availabilityEnabled: enabled);
     final revision = ++_availabilityRevision;
     final previous = _availabilityOperation ?? Future<void>.value();
     final operation = previous.catchError((Object _) {}).then((_) async {
@@ -818,6 +850,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         if (_startFuture != null) return;
         unawaited(_handleUnauthorizedAdapterState());
       case BluetoothLowEnergyState.poweredOff:
+        _teardownPendingByDevice.clear();
         _resetBleAfterLoss();
         unawaited(_closeActiveLink());
         _setState(
@@ -1105,6 +1138,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         _linkEstablishing) {
       return null;
     }
+    if (_teardownPendingByDevice.containsKey(candidateId)) {
+      _setState(
+        error:
+            'The previous BLE link to this device is still closing. Turn '
+            'Bluetooth off and on, or restart BeChat, before reconnecting.',
+      );
+      return null;
+    }
     final peripheral = _candidatesById[candidateId];
     if (peripheral == null) {
       _setState(
@@ -1152,11 +1193,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         peripheral,
         type: GATTCharacteristicWriteType.withResponse,
       );
+      _centralGate = BleGattOperationGate();
       final transport = _CentralValueTransport(
         manager: _central,
         peripheral: peripheral,
         characteristic: rx,
         maximumWriteLength: maxWriteLength,
+        gate: _centralGate,
       );
       _centralTransport = transport;
       await _enableNotifications(peripheral, tx);
@@ -1299,7 +1342,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       peerId: hello.deviceId,
       displayName: hello.displayName,
       deviceName: _remoteDeviceName ?? existing?.deviceName ?? 'BeChat device',
-      status: PeerStatus.online,
+      status: PeerStatus.offline,
       signalStrength: _remoteRssi,
       firstSeen: existing?.firstSeen ?? now,
       lastSeen: now,
@@ -1418,7 +1461,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       peerId: request.peerId,
       displayName: request.displayName,
       deviceName: request.deviceName,
-      status: PeerStatus.online,
+      status: PeerStatus.offline,
       signalStrength: request.signalStrength,
       firstSeen: existing?.firstSeen ?? now,
       lastSeen: now,
@@ -1447,6 +1490,11 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       clearError: true,
       clearIncomingRequest: true,
     );
+    await _markPeerOnline(peer.peerId, signalStrength: peer.signalStrength);
+    if (_disposed || !identical(_activeSession, session) || !session.isReady) {
+      await _markPeerOffline(peer.peerId);
+      return;
+    }
     try {
       await _ref.read(chatRepositoryProvider).getOrCreateChatForPeer(peer);
       await _ref.read(chatListProvider.notifier).refreshChats();
@@ -1539,9 +1587,16 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
   Future<void> _markPeerOffline(String peerId) async {
     try {
+      await _ref.read(peerRepositoryProvider).markPeerOffline(peerId);
+      await _refreshPeers();
+    } catch (_) {}
+  }
+
+  Future<void> _markPeerOnline(String peerId, {int? signalStrength}) async {
+    try {
       await _ref
           .read(peerRepositoryProvider)
-          .updatePeerStatus(peerId, PeerStatus.offline);
+          .markPeerOnline(peerId, signalStrength: signalStrength);
       await _refreshPeers();
     } catch (_) {}
   }
@@ -1614,6 +1669,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       isAdvertising: false,
       clearError: true,
     );
+    await _markPeerOnline(hello.deviceId, signalStrength: _remoteRssi);
+    if (_disposed || !identical(_activeSession, session) || !session.isReady) {
+      await _markPeerOffline(hello.deviceId);
+      return;
+    }
+    if (role == BleLinkRole.central) {
+      _startPresenceMonitor(hello.deviceId);
+    }
     unawaited(requestDelivery(hello.deviceId));
   }
 
@@ -1642,6 +1705,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         ),
       );
     }
+    _clearTeardownPending(key);
     _pendingCentralWrites.remove(key);
     final activePeripheral = _activePeripheral;
     if (activePeripheral != null &&
@@ -1788,6 +1852,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _linkCleanupCompleter = cleanup;
     try {
       final closingPeerId = _activePeer?.peerId ?? state.activePeerId;
+      _stopPresenceMonitor();
+      _centralGate.close();
       _activeSession = null;
       _activePeer = null;
       _peripheralTransport = null;
@@ -1818,12 +1884,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
 
       if (closingPeerId != null) {
-        try {
-          await _ref
-              .read(peerRepositoryProvider)
-              .updatePeerStatus(closingPeerId, PeerStatus.offline);
-          await _refreshPeers();
-        } catch (_) {}
+        await _markPeerOffline(closingPeerId);
       }
       await _resetOutbox();
 
@@ -1847,7 +1908,110 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
+  void _startPresenceMonitor(String peerId) {
+    _presenceMonitor?.stop();
+    final generation = ++_presenceGeneration;
+    final monitor = BlePresenceMonitor(
+      probe: _probeActiveCentralLink,
+      onSignal: (rssi) => _handlePresenceSignal(rssi, generation),
+      onLost: (reason) => _handlePresenceLoss(reason, generation),
+      foregroundInterval: AppConstants.presenceForegroundInterval,
+      backgroundInterval: AppConstants.presenceBackgroundInterval,
+      probeTimeout: AppConstants.presenceProbeTimeout,
+    );
+    _presenceMonitor = monitor;
+    monitor.start(foreground: _foreground);
+  }
+
+  void _stopPresenceMonitor() {
+    _presenceGeneration++;
+    _presenceMonitor?.stop();
+    _presenceMonitor = null;
+  }
+
+  Future<BlePresenceProbeResult> _probeActiveCentralLink() async {
+    final session = _activeSession;
+    final peripheral = _activePeripheral;
+    if (session == null ||
+        peripheral == null ||
+        _activeRole != BleLinkRole.central ||
+        !session.isReady ||
+        _centralGate.isClosed ||
+        _teardownPendingByDevice.containsKey(peripheral.uuid.toString())) {
+      return const BlePresenceProbeResult.skipped();
+    }
+    final operation = _centralGate.tryRun(() async {
+      if (!identical(_activeSession, session) || !session.isReady) {
+        throw const BleLinkClosedException(
+          'The BLE link closed before the presence probe',
+        );
+      }
+      return _central.readRSSI(peripheral);
+    });
+    if (operation == null) {
+      return const BlePresenceProbeResult.skipped();
+    }
+    try {
+      return BlePresenceProbeResult.signal(await operation);
+    } catch (_) {
+      return const BlePresenceProbeResult.failed();
+    }
+  }
+
+  void _handlePresenceSignal(int rssi, int generation) {
+    if (generation != _presenceGeneration ||
+        !state.isConnected ||
+        _activeRole != BleLinkRole.central) {
+      return;
+    }
+    _activePeer = _activePeer?.copyWith(signalStrength: rssi);
+    _setState(activeSignalStrength: rssi);
+    final peerId = state.activePeerId;
+    if (peerId == null) return;
+    unawaited(
+      _ref
+          .read(peerRepositoryProvider)
+          .updateSignalStrength(peerId, rssi)
+          .catchError((Object _) {}),
+    );
+  }
+
+  Future<void> _handlePresenceLoss(
+    BlePresenceLossReason reason,
+    int generation,
+  ) async {
+    if (generation != _presenceGeneration ||
+        !state.isConnected ||
+        _activeRole != BleLinkRole.central) {
+      return;
+    }
+    final peripheral = _activePeripheral;
+    if (reason == BlePresenceLossReason.stuck) {
+      final peerId = state.activePeerId;
+      final key = peripheral?.uuid.toString();
+      if (key != null) {
+        _teardownPendingByDevice[key] = peerId;
+      }
+      if (peerId != null) {
+        _teardownPendingByDevice[peerId] = key;
+      }
+    }
+    await _closeActiveLink();
+    if (peripheral != null) {
+      await _disconnectCentral(peripheral);
+    }
+  }
+
+  void _clearTeardownPending(String deviceKey) {
+    final related = _teardownPendingByDevice.remove(deviceKey);
+    if (related != null) {
+      _teardownPendingByDevice.remove(related);
+    }
+  }
+
   Future<void> _closeActiveLink() async {
+    _stopPresenceMonitor();
+    _centralGate.close();
     final session = _activeSession;
     if (session == null) {
       _centralTransport = null;
@@ -1863,9 +2027,16 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     if (peripheral != null) await _disconnectCentral(peripheral);
   }
 
+  Future<void> disconnectPeer(String peerId) async {
+    if (state.activePeerId != peerId && _activePeer?.peerId != peerId) return;
+    await disconnect();
+  }
+
   Future<void> _disconnectCentral(Peripheral peripheral) async {
     try {
-      await _central.disconnect(peripheral);
+      await _central
+          .disconnect(peripheral)
+          .timeout(AppConstants.gattTeardownTimeout);
     } catch (_) {}
   }
 
@@ -1913,6 +2084,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         _isBackgroundOperational(state.status);
     _foreground = false;
     _setState(isForeground: false);
+    _presenceMonitor?.updateForeground(false);
     _clearIncomingRequest();
     await stopScan();
     _resetCandidateTracking();
@@ -2031,6 +2203,11 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       if (!_disposed && !state.isConnected) {
         _setState(status: BleRuntimeStatus.error, error: _describeError(error));
       }
+    }
+    final monitor = _presenceMonitor;
+    if (monitor != null && state.isConnected) {
+      monitor.updateForeground(true);
+      unawaited(monitor.checkNow());
     }
     await reconcileBackgroundBle();
   }
@@ -2309,10 +2486,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     bool? isForeground,
     BackgroundBleRuntimeStatus? backgroundStatus,
     String? backgroundError,
+    bool? availabilityEnabled,
+    int? activeSignalStrength,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
     bool clearBackgroundError = false,
+    bool clearActiveSignal = false,
   }) {
     if (_disposed) return;
     state = state.copyWith(
@@ -2328,10 +2508,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       isForeground: isForeground,
       backgroundStatus: backgroundStatus,
       backgroundError: backgroundError,
+      availabilityEnabled: availabilityEnabled,
+      activeSignalStrength: activeSignalStrength,
       clearActiveLink: clearActiveLink,
       clearError: clearError,
       clearIncomingRequest: clearIncomingRequest,
       clearBackgroundError: clearBackgroundError,
+      clearActiveSignal: clearActiveSignal,
     );
     if (_backgroundServiceRunning) {
       unawaited(_refreshBackgroundServiceState());
@@ -2341,6 +2524,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   @override
   void dispose() {
     _disposed = true;
+    _stopPresenceMonitor();
+    _centralGate.close();
     _scanTimer?.cancel();
     _candidateCleanupTimer?.cancel();
     _incomingRequestTimer?.cancel();
@@ -2371,9 +2556,12 @@ class _CentralValueTransport implements BleTransport {
     required this.peripheral,
     required this.characteristic,
     required this.maximumWriteLength,
-  }) : _manager = manager;
+    required BleGattOperationGate gate,
+  }) : _manager = manager,
+       _gate = gate;
 
   final CentralManager _manager;
+  final BleGattOperationGate _gate;
   final Peripheral peripheral;
   final GATTCharacteristic characteristic;
   final StreamController<Uint8List> _incoming = StreamController<Uint8List>();
@@ -2392,12 +2580,15 @@ class _CentralValueTransport implements BleTransport {
   @override
   Future<void> write(Uint8List value) async {
     if (_closed) throw const BleLinkClosedException();
-    await _manager.writeCharacteristic(
-      peripheral,
-      characteristic,
-      value: value,
-      type: GATTCharacteristicWriteType.withResponse,
-    );
+    await _gate.run(() async {
+      if (_closed) throw const BleLinkClosedException();
+      await _manager.writeCharacteristic(
+        peripheral,
+        characteristic,
+        value: value,
+        type: GATTCharacteristicWriteType.withResponse,
+      );
+    });
   }
 
   @override

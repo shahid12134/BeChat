@@ -276,6 +276,7 @@ void main() {
     await harness.controller.startScan();
 
     expect(harness.controller.state.status, BleRuntimeStatus.idle);
+    expect(harness.controller.state.availabilityEnabled, isFalse);
     verifyNever(harness.central.authorize());
     verifyNever(harness.peripheral.addService(any));
     verifyNever(
@@ -295,6 +296,7 @@ void main() {
     await harness.controller.reconcileAvailability();
 
     expect(harness.controller.state.status, BleRuntimeStatus.ready);
+    expect(harness.controller.state.availabilityEnabled, isTrue);
     expect(harness.controller.state.isAdvertising, isTrue);
   });
 
@@ -311,6 +313,7 @@ void main() {
       await harness.controller.reconcileAvailability();
 
       expect(harness.controller.state.status, BleRuntimeStatus.idle);
+      expect(harness.controller.state.availabilityEnabled, isFalse);
       verifyNever(harness.peripheral.addService(any));
     },
   );
@@ -330,6 +333,7 @@ void main() {
       await harness.controller.setAvailabilityEnabled(false);
 
       expect(harness.controller.state.status, BleRuntimeStatus.idle);
+      expect(harness.controller.state.availabilityEnabled, isFalse);
       expect(harness.controller.state.candidates, isEmpty);
       expect(harness.controller.state.isAdvertising, isFalse);
       verify(harness.peripheral.stopAdvertising()).called(1);

@@ -69,7 +69,6 @@ class BleMessageStore {
           {
             'display_name': peer.displayName,
             'device_name': peer.deviceName,
-            'status': PeerStatus.online.name,
             'last_seen': TimestampUtils.toUtcIso8601(now),
             'updated_at': TimestampUtils.toUtcIso8601(now),
           },
@@ -82,7 +81,7 @@ class BleMessageStore {
           peerId: peer.peerId,
           displayName: peer.displayName,
           deviceName: peer.deviceName,
-          status: PeerStatus.online,
+          status: PeerStatus.offline,
           firstSeen: now,
           lastSeen: now,
           createdAt: now,

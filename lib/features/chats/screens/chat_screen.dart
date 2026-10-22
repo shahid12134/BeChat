@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:uuid/uuid.dart';
+import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/data/models/message.dart';
+import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
 import 'package:bechat/core/utils/date_utils.dart';
 import 'package:bechat/core/constants/app_constants.dart';
@@ -182,8 +184,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         ?.where((p) => p.peerId == chat?.peerId)
         .firstOrNull;
     final peerName = peer?.displayName ?? chat?.title ?? 'Unknown';
-    final isOnline =
-        bleState.isConnected && bleState.activePeerId == chat?.peerId;
+    final resolvedPeer =
+        peer ??
+        (chat == null
+            ? null
+            : Peer(peerId: chat.peerId, displayName: peerName, deviceName: ''));
+    final presence = resolvedPeer == null
+        ? PeerPresence.offline
+        : resolvePeerPresence(resolvedPeer, bleState.presenceContext);
+    final isOnline = isPeerPresenceConnected(presence);
+    final presenceLabel = presence == PeerPresence.offline
+        ? 'Last seen ${AppDateUtils.formatRelativeTime(peer?.lastSeen)}'
+        : peerPresenceLabel(presence);
 
     return Scaffold(
       appBar: AppBar(
@@ -207,13 +219,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                     ),
                   ),
                   Text(
-                    isOnline
-                        ? 'Online'
-                        : 'Last seen ${AppDateUtils.formatRelativeTime(peer?.lastSeen)}',
+                    presenceLabel,
                     style: TextStyle(
                       fontSize: 12,
                       color: isOnline
                           ? Colors.green
+                          : presence == PeerPresence.blocked
+                          ? Theme.of(context).colorScheme.error
                           : Theme.of(context).colorScheme.onSurfaceVariant,
                     ),
                   ),

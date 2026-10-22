@@ -7,6 +7,7 @@ import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/data/database/database_helper.dart';
 import 'package:bechat/data/mock/mock_data.dart';
 import 'package:bechat/data/repositories/identity_repository.dart';
+import 'package:bechat/data/repositories/peer_repository.dart';
 
 class BootstrapHost extends StatefulWidget {
   final Future<void> Function()? bootstrap;
@@ -40,6 +41,7 @@ class _BootstrapHostState extends State<BootstrapHost> {
   static Future<void> _initializeApp() async {
     await DatabaseHelper.database;
     final identity = await IdentityRepository().ensureIdentity();
+    await PeerRepository().resetTransientPresence();
     if (AppConstants.demoDataEnabled) {
       await MockData.seedDemoData(identity);
     }

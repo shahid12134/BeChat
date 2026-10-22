@@ -21,6 +21,10 @@ class AppConstants {
   static const Duration candidateCleanupInterval = Duration(seconds: 2);
   static const Duration incomingRequestTimeout = Duration(seconds: 30);
   static const Duration declineCooldown = Duration(seconds: 60);
+  static const Duration presenceForegroundInterval = Duration(seconds: 20);
+  static const Duration presenceBackgroundInterval = Duration(seconds: 60);
+  static const Duration presenceProbeTimeout = Duration(seconds: 5);
+  static const Duration gattTeardownTimeout = Duration(seconds: 5);
   static const Duration mockResponseDelay = Duration(milliseconds: 800);
   static const Duration messageTtlDefault = Duration(hours: 24);
 

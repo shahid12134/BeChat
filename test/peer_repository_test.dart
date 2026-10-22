@@ -144,6 +144,68 @@ void main() {
     expect(peer.lastSeen, isNotNull);
   });
 
+  test(
+    'startup reset clears transient presence and preserves blocked',
+    () async {
+      await repository.upsertPeer(
+        const Peer(
+          peerId: 'peer-online',
+          displayName: 'Online',
+          deviceName: 'Online phone',
+          status: PeerStatus.online,
+          signalStrength: -55,
+        ),
+      );
+      await repository.upsertPeer(
+        const Peer(
+          peerId: 'peer-pairing',
+          displayName: 'Pairing',
+          deviceName: 'Pairing phone',
+          status: PeerStatus.pairing,
+        ),
+      );
+      await repository.upsertPeer(
+        const Peer(
+          peerId: 'peer-blocked',
+          displayName: 'Blocked',
+          deviceName: 'Blocked phone',
+          status: PeerStatus.blocked,
+          isBlocked: true,
+        ),
+      );
+
+      await repository.resetTransientPresence();
+
+      final online = await repository.getPeerByPeerId('peer-online');
+      final pairing = await repository.getPeerByPeerId('peer-pairing');
+      final blocked = await repository.getPeerByPeerId('peer-blocked');
+      expect(online!.status, PeerStatus.offline);
+      expect(online.signalStrength, -55);
+      expect(pairing!.status, PeerStatus.offline);
+      expect(blocked!.status, PeerStatus.blocked);
+      expect(blocked.isBlocked, isTrue);
+    },
+  );
+
+  test('presence transitions never overwrite a blocked peer', () async {
+    await repository.insertPeer(
+      const Peer(
+        peerId: 'peer-blocked-2',
+        displayName: 'Blocked',
+        deviceName: 'Blocked phone',
+      ),
+    );
+    await repository.blockPeer('peer-blocked-2');
+
+    await repository.markPeerOnline('peer-blocked-2', signalStrength: -40);
+    await repository.markPeerOffline('peer-blocked-2');
+    await repository.updatePeerStatus('peer-blocked-2', PeerStatus.pairing);
+
+    final peer = await repository.getPeerByPeerId('peer-blocked-2');
+    expect(peer!.status, PeerStatus.blocked);
+    expect(peer.isBlocked, isTrue);
+  });
+
   test('foreign keys remain valid after peer operations', () async {
     await repository.upsertPeer(
       const Peer(

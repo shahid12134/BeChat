@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/data/models/chat.dart';
+import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
 import 'package:bechat/core/widgets/status_indicator.dart';
 import 'package:bechat/core/utils/date_utils.dart';
+import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 
 class ChatListItem extends ConsumerWidget {
@@ -15,9 +18,16 @@ class ChatListItem extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final peersAsync = ref.watch(peerListProvider);
-    final peer = peersAsync.valueOrNull?.where((p) => p.peerId == chat.peerId).firstOrNull;
+    final bleState = ref.watch(bleRuntimeProvider);
+    final peer = peersAsync.valueOrNull
+        ?.where((p) => p.peerId == chat.peerId)
+        .firstOrNull;
     final peerName = peer?.displayName ?? chat.title ?? 'Unknown';
-    final isOnline = peer?.status.name == 'online';
+    final presence = resolvePeerPresence(
+      peer ?? Peer(peerId: chat.peerId, displayName: peerName, deviceName: ''),
+      bleState.presenceContext,
+    );
+    final isOnline = isPeerPresenceConnected(presence);
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
@@ -52,6 +62,16 @@ class ChatListItem extends ConsumerWidget {
         children: [
           const StatusIndicator(status: TransportStatus.local, compact: true),
           const SizedBox(width: 4),
+          if (presence != PeerPresence.offline)
+            Text(
+              '${peerPresenceLabel(presence)} · ',
+              style: TextStyle(
+                fontSize: 12,
+                color: isOnline
+                    ? Colors.green
+                    : Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
           Expanded(
             child: Text(
               chat.lastMessage ?? 'No messages yet',
@@ -72,7 +92,11 @@ class ChatListItem extends ConsumerWidget {
               ),
               child: Text(
                 '${chat.unreadCount}',
-                style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
           ],
