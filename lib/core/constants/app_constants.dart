@@ -2,7 +2,19 @@ class AppConstants {
   static const String appName = 'BeChat';
   static const String appVersion = '1.0.0';
   static const String databaseName = 'bechat.db';
-  static const int databaseVersion = 2;
+  static const int databaseVersion = 3;
+
+  // Persistent application settings.
+  static const String settingBleEnabled = 'ble_enabled';
+  static const String settingAllowNewConnections = 'allow_new_connections';
+  static const String settingBackgroundBleEnabled = 'background_ble_enabled';
+  static const String settingMessagePreviewsEnabled =
+      'message_previews_enabled';
+
+  static const bool defaultBleEnabled = false;
+  static const bool defaultAllowNewConnections = true;
+  static const bool defaultBackgroundBleEnabled = false;
+  static const bool defaultMessagePreviewsEnabled = false;
 
   static const Duration scanTimeout = Duration(seconds: 15);
   static const Duration mockResponseDelay = Duration(milliseconds: 800);

@@ -69,6 +69,7 @@ lib/
       ble_candidate.dart             # Nearby BLE discovery hint
     repositories/
       app_data_repository.dart       # Transactional user-data clearing
+      app_settings_repository.dart   # Persistent application preferences
       peer_repository.dart           # Peer CRUD operations
       chat_repository.dart           # Chat CRUD operations
       message_repository.dart        # Message CRUD + BLE delivery states
@@ -84,6 +85,7 @@ lib/
       ble_message_store.dart         # Atomic incoming message persistence
       ble_outbox.dart                # Queued delivery and bounded retries
   providers/
+    app_settings_providers.dart      # Persistent application settings state
     ble_providers.dart               # BLE runtime state provider
     chat_providers.dart              # Chat state management
     peer_providers.dart              # Peer state management
@@ -118,13 +120,29 @@ lib/
 | `messages` | Individual messages |
 | `attachments` | File attachment metadata |
 | `message_routes` | Future store-and-forward routing |
+| `app_settings` | Persistent application preferences |
 
 ### Key Features
 
 - Foreign key constraints enabled
 - Indexes on frequently queried columns (chat_id, timestamp, peer_id, route status)
-- Versioned schema with migration support
+- Versioned schema with migration support (current version: 3)
 - Repository pattern for clean data access
+
+### Persistent Application Settings
+
+Database version 3 adds an `app_settings` key/value table. Settings are read
+through typed repository methods and survive application restarts.
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `ble_enabled` | `false` | Intended BeChat BLE availability preference |
+| `allow_new_connections` | `true` | Permit requests from previously unknown peers |
+| `background_ble_enabled` | `false` | Opt-in preference for future background operation |
+| `message_previews_enabled` | `false` | Whether future notifications may show message contents |
+
+These values are preferences only. They do not start BLE, run background
+services, or enable notifications in this stage.
 
 ---
 
@@ -273,7 +291,7 @@ screen uses real BLE discovery only.
 
 Demo seeding does not create or replace the real local identity. It runs only when demo mode is enabled and the peers table is empty, so repeated startup does not duplicate records.
 
-To remove demo data, open **Settings > Debug Information > Clear Database**. This deletes peers, chats, messages, attachments, and routing records while keeping the local identity. If demo mode remains enabled, sample data may be seeded again on a later startup when the peers table is empty.
+To remove demo data, open **Settings > Debug Information > Clear Database**. This deletes peers, chats, messages, attachments, and routing records while keeping the local identity and application settings. If demo mode remains enabled, sample data may be seeded again on a later startup when the peers table is empty.
 
 ---
 

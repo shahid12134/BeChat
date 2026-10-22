@@ -47,6 +47,23 @@ class DatabaseHelper {
     if (oldVersion < 2) {
       await migrateToUtcTimestamps(db);
     }
+    if (oldVersion < 3) {
+      await migrateToVersion3(db);
+    }
+  }
+
+  /// Adds the persistent application settings table without touching user data.
+  ///
+  /// sqflite runs `onUpgrade` inside a transaction, so this method must not
+  /// start a nested transaction.
+  static Future<void> migrateToVersion3(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
   }
 
   /// Rewrites legacy timestamp columns to the canonical UTC representation.
@@ -195,6 +212,14 @@ class DatabaseHelper {
         queued_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       )
     ''');
   }

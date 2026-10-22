@@ -1,6 +1,7 @@
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/repositories/app_data_repository.dart';
+import 'package:bechat/data/repositories/app_settings_repository.dart';
 import 'package:bechat/data/repositories/chat_repository.dart';
 import 'package:bechat/data/repositories/identity_repository.dart';
 import 'package:bechat/data/repositories/message_repository.dart';
@@ -62,6 +63,11 @@ void main() {
         'queued_at': now.toIso8601String(),
         'updated_at': now.toIso8601String(),
       });
+      final settingsRepository = AppSettingsRepository(
+        database: () async => db,
+      );
+      await settingsRepository.setBleEnabled(true);
+      await settingsRepository.setAllowNewConnections(false);
 
       await AppDataRepository(database: () async => db).clearUserData();
 
@@ -82,6 +88,10 @@ void main() {
           reason: '$table should be empty',
         );
       }
+      final settings = await settingsRepository.loadSettings();
+      expect(settings.bleEnabled, isTrue);
+      expect(settings.allowNewConnections, isFalse);
+      expect(await db.query('app_settings'), isNotEmpty);
       expect(await db.rawQuery('PRAGMA foreign_key_check'), isEmpty);
     },
   );
