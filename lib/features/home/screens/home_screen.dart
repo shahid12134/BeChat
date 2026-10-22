@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:bechat/features/chats/screens/chat_list_screen.dart';
@@ -22,6 +24,10 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(ref.read(bleRuntimeProvider.notifier).reconcileAvailability());
+    });
   }
 
   @override
@@ -34,9 +40,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final ble = ref.read(bleRuntimeProvider.notifier);
     if (state == AppLifecycleState.paused) {
-      ble.pauseForBackground();
+      unawaited(ble.pauseForBackground());
     } else if (state == AppLifecycleState.resumed) {
-      ble.resumeFromBackground();
+      unawaited(ble.resumeFromBackground());
     }
   }
 

@@ -23,6 +23,8 @@ class BleProtocol {
   static const String txCharacteristicUuid =
       '6f1b8e30-6c4a-4f4f-9f4c-424543484102';
 
+  static const String approvalPendingReason = 'connection_approval_pending';
+
   static const String capabilityText = 'text';
   static const String capabilityAck = 'ack';
   static const String capabilityBleForeground = 'ble-foreground';

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/core/widgets/ble_availability_button.dart';
 import 'package:bechat/core/widgets/empty_state.dart';
 import 'package:bechat/data/models/app_settings.dart';
 import 'package:bechat/data/models/ble_candidate.dart';
@@ -21,32 +22,56 @@ class PeerDiscoveryScreen extends ConsumerStatefulWidget {
       _PeerDiscoveryScreenState();
 }
 
-class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _scanController;
+class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
   Object? _scanError;
   String? _connectingId;
   bool _savingConnectionSetting = false;
 
-  @override
-  void initState() {
-    super.initState();
-    _scanController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    );
-  }
-
-  @override
-  void dispose() {
-    _scanController.dispose();
-    super.dispose();
-  }
-
   Future<void> _startScan() async {
     setState(() => _scanError = null);
     if (!AppConstants.demoDataEnabled) {
+      final settings = ref.read(appSettingsProvider).valueOrNull;
+      if (settings == null) {
+        _showError('Could not load the BeChat availability setting.');
+        return;
+      }
+      if (!settings.bleEnabled) {
+        final enable = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Turn on BeChat?'),
+            content: const Text(
+              'Scanning and advertising are off while BeChat is offline. '
+              'Turn on BeChat to look for nearby devices? This does not change '
+              'the system Bluetooth switch.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Turn On'),
+              ),
+            ],
+          ),
+        );
+        if (enable != true || !mounted) return;
+        await _setAvailability(true);
+        if (!mounted) return;
+      }
+      final currentSettings = ref.read(appSettingsProvider).valueOrNull;
+      if (currentSettings == null || !currentSettings.bleEnabled) return;
+
       await ref.read(bleRuntimeProvider.notifier).startScan();
+      if (!mounted) return;
+      final bleState = ref.read(bleRuntimeProvider);
+      if (bleState.status != BleRuntimeStatus.scanning &&
+          bleState.status != BleRuntimeStatus.ready &&
+          bleState.status != BleRuntimeStatus.connected) {
+        _showError(bleState.error ?? 'Unable to start scanning.');
+      }
       return;
     }
     if (ref.read(scanningProvider)) return;
@@ -54,7 +79,6 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     final scanningState = ref.read(scanningProvider.notifier);
     scanningState.state = true;
     ref.read(discoveredPeersProvider.notifier).state = [];
-    _scanController.repeat();
 
     try {
       final discoveryRepo = ref.read(peerDiscoveryRepositoryProvider);
@@ -66,12 +90,23 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     } catch (e) {
       if (mounted) setState(() => _scanError = e);
     } finally {
-      if (mounted) {
-        _scanController.stop();
-        _scanController.reset();
-      }
       scanningState.state = false;
     }
+  }
+
+  Future<void> _setAvailability(bool enabled) async {
+    try {
+      await ref.read(appSettingsProvider.notifier).setBleEnabled(enabled);
+      await ref
+          .read(bleRuntimeProvider.notifier)
+          .setAvailabilityEnabled(enabled);
+    } catch (error) {
+      _showError('Could not update BeChat availability: $error');
+    }
+  }
+
+  Future<void> _stopScan() async {
+    await ref.read(bleRuntimeProvider.notifier).stopScan();
   }
 
   Future<void> _connect(BleCandidate candidate) async {
@@ -152,15 +187,6 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
   Widget build(BuildContext context) {
     final demoEnabled = AppConstants.demoDataEnabled;
     final bleState = ref.watch(bleRuntimeProvider);
-    ref.listen(bleRuntimeProvider, (previous, next) {
-      if (demoEnabled) return;
-      if (next.status == BleRuntimeStatus.scanning) {
-        if (!_scanController.isAnimating) _scanController.repeat();
-      } else if (_scanController.isAnimating) {
-        _scanController.stop();
-        _scanController.reset();
-      }
-    });
     final isDemoScanning = ref.watch(scanningProvider);
     final isScanning = demoEnabled
         ? isDemoScanning
@@ -168,87 +194,211 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     final discoveredPeers = ref.watch(discoveredPeersProvider);
     final allPeersAsync = ref.watch(peerListProvider);
     final appSettingsAsync = ref.watch(appSettingsProvider);
+    final settings = appSettingsAsync.valueOrNull;
+    final beChatEnabled = settings?.bleEnabled ?? false;
+    final operationInProgress =
+        bleState.status == BleRuntimeStatus.starting ||
+        bleState.status == BleRuntimeStatus.connecting;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Nearby Peers'),
-        actions: [
-          if (isScanning)
-            const Padding(
-              padding: EdgeInsets.only(right: 16),
-              child: SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
-            )
-          else if (!bleState.isConnected)
-            IconButton(
-              tooltip: 'Scan for peers',
-              onPressed: _startScan,
-              icon: const Icon(Icons.bluetooth_searching),
-            ),
-        ],
+        actions: const [BleAvailabilityButton()],
       ),
-      body: Column(
-        children: [
-          if (demoEnabled)
-            Container(
-              width: double.infinity,
-              color: Theme.of(context).colorScheme.secondaryContainer,
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-              child: Text(
-                'Demo mode: nearby devices and discovery are simulated. '
-                'No Bluetooth hardware is used.',
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.onSecondaryContainer,
-                ),
-              ),
-            ),
-          if (!demoEnabled) _buildConnectionSettings(context, appSettingsAsync),
-          if (!demoEnabled)
-            ConstrainedBox(
-              constraints: BoxConstraints(
-                maxHeight: MediaQuery.sizeOf(context).height * 0.45,
-              ),
-              child: SingleChildScrollView(
-                child: _buildBleBanner(context, bleState),
-              ),
-            ),
-          if (demoEnabled)
-            Container(
-              padding: const EdgeInsets.all(16),
-              child: SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: isScanning ? null : _startScan,
-                  icon: isScanning
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(Icons.bluetooth_searching),
-                  label: Text(
-                    isScanning ? 'Scanning...' : 'Scan for Demo Devices',
+      body: demoEnabled
+          ? Column(
+              children: [
+                Container(
+                  width: double.infinity,
+                  color: Theme.of(context).colorScheme.secondaryContainer,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 10,
+                  ),
+                  child: Text(
+                    'Demo mode: nearby devices and discovery are simulated. '
+                    'No Bluetooth hardware is used.',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSecondaryContainer,
+                    ),
                   ),
                 ),
-              ),
-            ),
-          Expanded(
-            child: demoEnabled
-                ? _buildDemoContent(
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      onPressed: isScanning ? null : _startScan,
+                      icon: isScanning
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.bluetooth_searching),
+                      label: Text(
+                        isScanning ? 'Scanning...' : 'Scan for Demo Devices',
+                      ),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: _buildDemoContent(
                     context,
                     isScanning: isScanning,
                     discoveredPeers: discoveredPeers,
                     allPeersAsync: allPeersAsync,
-                  )
-                : _buildRealContent(context, bleState, allPeersAsync),
+                  ),
+                ),
+              ],
+            )
+          : SingleChildScrollView(
+              child: Column(
+                children: [
+                  _buildAvailabilityCard(
+                    context,
+                    appSettingsAsync,
+                    beChatEnabled,
+                  ),
+                  _buildConnectionSettings(context, appSettingsAsync),
+                  _buildScanControl(
+                    context,
+                    enabled: beChatEnabled,
+                    isScanning: isScanning,
+                    isStarting: bleState.status == BleRuntimeStatus.starting,
+                    operationInProgress: operationInProgress,
+                    isConnected: bleState.isConnected,
+                  ),
+                  _buildBleBanner(context, bleState),
+                  _buildRealContent(context, bleState, allPeersAsync),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _buildAvailabilityCard(
+    BuildContext context,
+    AsyncValue<AppSettings> settingsAsync,
+    bool enabled,
+  ) {
+    final theme = Theme.of(context);
+    if (settingsAsync.hasError) {
+      return Card(
+        margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+        child: ListTile(
+          leading: Icon(Icons.error_outline, color: theme.colorScheme.error),
+          title: const Text('Availability setting unavailable'),
+          subtitle: const Text(
+            'Could not load the BeChat availability setting. Restart the app '
+            'and try again.',
           ),
-        ],
+        ),
+      );
+    }
+    if (settingsAsync.isLoading || enabled) return const SizedBox.shrink();
+
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      color: theme.colorScheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            const Icon(Icons.power_settings_new),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'BeChat is offline',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    'Nearby discovery and incoming connections are off. '
+                    'Saved chats and peers are still available.',
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(
+              onPressed: () => _setAvailability(true),
+              child: const Text('Turn On'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildScanControl(
+    BuildContext context, {
+    required bool enabled,
+    required bool isScanning,
+    required bool isStarting,
+    required bool operationInProgress,
+    required bool isConnected,
+  }) {
+    final canScan = !isScanning && !operationInProgress && !isConnected;
+    final showProgress = isScanning || isStarting;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Nearby Scan',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: isScanning
+                      ? _stopScan
+                      : canScan
+                      ? _startScan
+                      : null,
+                  icon: Icon(isScanning ? Icons.stop : Icons.refresh),
+                  label: Text(isScanning ? 'Stop Scanning' : 'Scan'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (showProgress) ...[
+              const LinearProgressIndicator(minHeight: 2),
+              const SizedBox(height: 8),
+            ],
+            Text(
+              isConnected
+                  ? 'Disconnect from the active peer before scanning again.'
+                  : isScanning
+                  ? 'Scanning for nearby BeChat devices. Results refresh as '
+                        'advertisements arrive.'
+                  : isStarting
+                  ? 'Starting BeChat before the scan begins.'
+                  : enabled
+                  ? 'Scans stop automatically after '
+                        '${AppConstants.scanTimeout.inSeconds} seconds. '
+                        'Recently seen devices remain for '
+                        '${AppConstants.candidateExpiration.inSeconds} seconds.'
+                  : 'Turn on BeChat to scan. Scanning never enables BeChat by '
+                        'itself.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -266,7 +416,8 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
         subtitle: Text(
           settingsAsync.hasError
               ? 'Could not load this setting. Restart BeChat and try again.'
-              : 'Allow unknown nearby devices to request a connection.',
+              : 'Allow unknown nearby devices to request a connection while '
+                    'BeChat is on.',
         ),
         value:
             settings?.allowNewConnections ??
@@ -431,9 +582,9 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     AsyncValue<List<Peer>> allPeersAsync,
   ) {
     if (bleState.status == BleRuntimeStatus.connecting) {
-      return Center(
+      return Padding(
+        padding: const EdgeInsets.all(24),
         child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
           children: [
             const CircularProgressIndicator(),
             const SizedBox(height: 16),
@@ -449,32 +600,21 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
         ),
       );
     }
-    if (bleState.status == BleRuntimeStatus.scanning) {
-      return _buildScanningAnimation(
-        context,
-        title: 'Scanning for BeChat devices...',
-        subtitle:
-            'This phone is advertising while it scans. '
-            'Range and Android BLE scanning limits apply.',
-      );
-    }
-    if (bleState.status == BleRuntimeStatus.ready &&
-        bleState.candidates.isEmpty) {
-      return allPeersAsync.when(
-        data: (peers) => peers.isEmpty
-            ? EmptyState(type: EmptyStateType.noPeers, onAction: _startScan)
-            : _buildSavedPeers(context, peers),
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => Center(child: Text('Error loading peers: $e')),
-      );
-    }
-
     return allPeersAsync.when(
       data: (peers) {
+        if (bleState.candidates.isEmpty && peers.isEmpty) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 24),
+            child: EmptyState(
+              type: EmptyStateType.noPeers,
+              onAction: _startScan,
+            ),
+          );
+        }
         final showSaved = bleState.candidates.isEmpty && peers.isNotEmpty;
         if (showSaved) return _buildSavedPeers(context, peers);
-        return ListView(
-          padding: const EdgeInsets.symmetric(vertical: 8),
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (bleState.candidates.isNotEmpty) ...[
               const _SectionLabel(
@@ -499,11 +639,18 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
               ),
               ...peers.map((peer) => PeerListItem(peer: peer)),
             ],
+            const SizedBox(height: 16),
           ],
         );
       },
-      loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) => Center(child: Text('Error loading peers: $e')),
+      loading: () => const Padding(
+        padding: EdgeInsets.all(24),
+        child: Center(child: CircularProgressIndicator()),
+      ),
+      error: (e, _) => Padding(
+        padding: const EdgeInsets.all(24),
+        child: Center(child: Text('Error loading peers: $e')),
+      ),
     );
   }
 
@@ -514,11 +661,7 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     required AsyncValue<List<Peer>> allPeersAsync,
   }) {
     if (isScanning) {
-      return _buildScanningAnimation(
-        context,
-        title: 'Scanning for simulated devices...',
-        subtitle: 'Demo mode only; no Bluetooth hardware is used.',
-      );
+      return const Center(child: Text('Scanning for simulated devices...'));
     }
 
     if (_scanError != null) {
@@ -540,61 +683,18 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
         if (peers.isEmpty) {
           return EmptyState(type: EmptyStateType.noPeers, onAction: _startScan);
         }
-        return _buildSavedPeers(context, peers);
+        return _buildSavedPeers(context, peers, scrollable: true);
       },
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(child: Text('Error loading peers: $e')),
     );
   }
 
-  Widget _buildScanningAnimation(
-    BuildContext context, {
-    required String title,
-    required String subtitle,
+  Widget _buildSavedPeers(
+    BuildContext context,
+    List<Peer> peers, {
+    bool scrollable = false,
   }) {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          AnimatedBuilder(
-            animation: _scanController,
-            builder: (context, child) {
-              return Container(
-                width: 120,
-                height: 120,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: Theme.of(context).colorScheme.primary.withValues(
-                      alpha: 0.3 + (_scanController.value * 0.7),
-                    ),
-                    width: 2,
-                  ),
-                ),
-                child: Icon(
-                  Icons.bluetooth_searching,
-                  size: 48,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-              );
-            },
-          ),
-          const SizedBox(height: 24),
-          Text(title, style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          Text(
-            subtitle,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSavedPeers(BuildContext context, List<Peer> peers) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -602,15 +702,20 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
           label: 'SAVED PEERS',
           detail: 'Saved only after a valid BLE identity handshake',
         ),
-        Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.symmetric(vertical: 4),
-            itemCount: peers.length,
-            itemBuilder: (context, index) {
-              return PeerListItem(peer: peers[index]);
-            },
-          ),
-        ),
+        if (scrollable)
+          Expanded(
+            child: ListView.builder(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              itemCount: peers.length,
+              itemBuilder: (context, index) {
+                return PeerListItem(peer: peers[index]);
+              },
+            ),
+          )
+        else ...[
+          ...peers.map((peer) => PeerListItem(peer: peer)),
+          const SizedBox(height: 16),
+        ],
       ],
     );
   }

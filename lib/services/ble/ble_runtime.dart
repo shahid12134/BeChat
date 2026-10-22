@@ -131,11 +131,19 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     BleStatusProbe? statusProbe,
     Duration permissionTimeout = const Duration(seconds: 20),
     bool? isAndroidOverride,
+    bool availabilityEnabled = AppConstants.defaultBleEnabled,
+    Duration candidateExpiration = AppConstants.candidateExpiration,
+    Duration candidateCleanupInterval = AppConstants.candidateCleanupInterval,
+    DateTime Function()? clock,
   }) : _centralOverride = centralManager,
        _peripheralOverride = peripheralManager,
        _statusProbe = statusProbe ?? MethodChannelBleStatusProbe(),
        _permissionTimeout = permissionTimeout,
        _isAndroidOverride = isAndroidOverride,
+       _availabilityEnabled = availabilityEnabled,
+       _candidateExpiration = candidateExpiration,
+       _candidateCleanupInterval = candidateCleanupInterval,
+       _clock = clock ?? DateTime.now,
        super(const BleRuntimeState()) {
     _outbox = BleOutbox(
       repository: _ref.read(messageRepositoryProvider),
@@ -153,6 +161,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final BleStatusProbe _statusProbe;
   final Duration _permissionTimeout;
   final bool? _isAndroidOverride;
+  final Duration _candidateExpiration;
+  final Duration _candidateCleanupInterval;
+  final DateTime Function() _clock;
   CentralManager? _centralInstance;
   PeripheralManager? _peripheralInstance;
   late final BleOutbox _outbox;
@@ -172,10 +183,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final Map<String, List<Uint8List>> _pendingCentralWrites = {};
 
   Timer? _scanTimer;
+  Timer? _candidateCleanupTimer;
   Timer? _incomingRequestTimer;
   BleLinkSession? _incomingRequestSession;
   final Map<String, DateTime> _declinedUntil = {};
   Future<void>? _startFuture;
+  Future<void>? _availabilityOperation;
+  int _availabilityRevision = 0;
+  bool _availabilityEnabled;
   bool _startAttempted = false;
   bool _permissionCheckInFlight = false;
   bool _listenersAttached = false;
@@ -224,8 +239,102 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await _outbox.drain(localDeviceId: localDeviceId, peerId: peerId);
   }
 
-  Future<void> ensureStarted() {
+  Future<void> reconcileAvailability() async {
+    if (_disposed || AppConstants.demoDataEnabled) return;
+    final revision = _availabilityRevision;
+    bool enabled;
+    try {
+      enabled = await _ref.read(appSettingsRepositoryProvider).getBleEnabled();
+    } catch (error) {
+      if (_disposed || revision != _availabilityRevision) return;
+      _availabilityEnabled = false;
+      _setState(
+        status: BleRuntimeStatus.error,
+        error:
+            'Could not load the BeChat availability setting: '
+            '${_describeError(error)}',
+        candidates: const [],
+        isAdvertising: false,
+        clearActiveLink: true,
+      );
+      return;
+    }
+    if (_disposed || revision != _availabilityRevision) return;
+    await setAvailabilityEnabled(enabled);
+  }
+
+  Future<void> setAvailabilityEnabled(bool enabled) {
     if (_disposed || AppConstants.demoDataEnabled) {
+      return Future<void>.value();
+    }
+    _availabilityEnabled = enabled;
+    final revision = ++_availabilityRevision;
+    final previous = _availabilityOperation ?? Future<void>.value();
+    final operation = previous.catchError((Object _) {}).then((_) async {
+      if (_disposed || revision != _availabilityRevision) return;
+      if (enabled) {
+        await ensureStarted();
+      } else {
+        await _shutdownAvailability();
+      }
+    });
+    _availabilityOperation = operation;
+    return operation.whenComplete(() {
+      if (identical(_availabilityOperation, operation)) {
+        _availabilityOperation = null;
+      }
+    });
+  }
+
+  Future<void> _shutdownAvailability() async {
+    _startAttempted = false;
+    _clearIncomingRequest();
+    final inFlight = _startFuture;
+    if (inFlight != null) {
+      try {
+        await inFlight;
+      } catch (_) {}
+    }
+    if (_disposed) return;
+
+    _initialized = false;
+    for (final waiter in _connectionWaiters.values) {
+      if (!waiter.isCompleted) {
+        waiter.completeError(
+          const BleLinkException('BeChat availability was turned off'),
+        );
+      }
+    }
+    _connectionWaiters.clear();
+    _pendingCentralWrites.clear();
+    _declinedUntil.clear();
+    final peripheral = _activePeripheral;
+    final central = _activeCentral;
+    await _closeActiveLink();
+    if (peripheral != null) {
+      await _disconnectCentral(peripheral);
+    }
+    if (central != null) {
+      try {
+        await _peripheral.disconnect(central);
+      } catch (_) {}
+    }
+    await _stopAdvertisingForLink();
+    await _stopDiscoveryOnly();
+    _resetBleAfterLoss();
+    _resetCandidateTracking(updateState: false);
+    _setState(
+      status: BleRuntimeStatus.idle,
+      candidates: const [],
+      isAdvertising: false,
+      clearActiveLink: true,
+      clearError: true,
+    );
+    await _resetOutbox();
+  }
+
+  Future<void> ensureStarted() {
+    if (_disposed || AppConstants.demoDataEnabled || !_availabilityEnabled) {
       return Future<void>.value();
     }
     final inFlight = _startFuture;
@@ -246,6 +355,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> _startUp() async {
+    if (!_availabilityEnabled) {
+      _setState(status: BleRuntimeStatus.idle);
+      return;
+    }
     _startAttempted = true;
     _foreground = true;
     _setState(
@@ -261,6 +374,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
       _attachListeners();
       var status = await _readPlatformStatus();
+      if (!_availabilityEnabled) return;
       if (!status.leSupported) {
         _setState(status: BleRuntimeStatus.unsupported);
         return;
@@ -268,7 +382,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
       if (!status.permissionsGranted) {
         await _requestPermissions();
+        if (!_availabilityEnabled) return;
         status = await _readPlatformStatus();
+        if (!_availabilityEnabled) return;
       }
 
       if (!status.permissionsGranted) {
@@ -294,6 +410,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
 
       await _preparePeripheral();
+      if (!_availabilityEnabled) return;
       if (state.status == BleRuntimeStatus.error) return;
       _initialized = true;
       _setState(
@@ -391,6 +508,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
   void _handleAdapterState(BluetoothLowEnergyState adapterState) {
     if (_disposed) return;
+    if (!_availabilityEnabled) {
+      _resetBleAfterLoss();
+      return;
+    }
     switch (adapterState) {
       case BluetoothLowEnergyState.unsupported:
         _resetBleAfterLoss();
@@ -409,7 +530,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         );
       case BluetoothLowEnergyState.poweredOn:
       case BluetoothLowEnergyState.unknown:
-        if (_startFuture != null) return;
+        if (_startFuture != null || !_availabilityEnabled) return;
         if (_startAttempted && !_initialized && _foreground) {
           unawaited(ensureStarted());
           return;
@@ -427,6 +548,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _scanTimer?.cancel();
     _scanTimer = null;
     _clearIncomingRequest();
+    _resetCandidateTracking();
     _discovering = false;
     _advertising = false;
     _serviceAdded = false;
@@ -485,13 +607,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
       if (_initialized) {
         if (_foreground &&
+            _availabilityEnabled &&
             !state.isConnected &&
             state.status != BleRuntimeStatus.connecting) {
           await _recoverAdvertising();
         }
         return;
       }
-      if (_startAttempted && _foreground) {
+      if (_startAttempted && _foreground && _availabilityEnabled) {
         await ensureStarted();
       }
     } on BleStatusProbeException catch (error) {
@@ -508,7 +631,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> _recoverAdvertising() async {
-    if (_disposed || !_foreground || _advertising) return;
+    if (_disposed || !_foreground || !_availabilityEnabled || _advertising) {
+      return;
+    }
     if (_isTerminalStatus(state.status)) return;
     try {
       await _preparePeripheral();
@@ -562,9 +687,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> startScan() async {
-    if (AppConstants.demoDataEnabled || _disposed) return;
+    if (AppConstants.demoDataEnabled || _disposed || !_availabilityEnabled) {
+      return;
+    }
     await ensureStarted();
     if (_disposed ||
+        !_availabilityEnabled ||
         state.isConnected ||
         _activeSession != null ||
         _linkEstablishing ||
@@ -574,12 +702,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
     if (state.status != BleRuntimeStatus.ready) return;
 
-    _setState(
-      status: BleRuntimeStatus.scanning,
-      candidates: const [],
-      clearError: true,
-    );
-    _candidatesById.clear();
+    _setState(status: BleRuntimeStatus.scanning, clearError: true);
     try {
       await _central.startDiscovery(serviceUUIDs: [_serviceUuid]);
       _discovering = true;
@@ -628,7 +751,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       id: id,
       displayName: displayName,
       rssi: event.rssi,
-      lastSeen: DateTime.now(),
+      lastSeen: _clock(),
     );
     final updated = [...state.candidates];
     final index = updated.indexWhere((item) => item.id == id);
@@ -639,10 +762,53 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
     updated.sort((a, b) => b.rssi.compareTo(a.rssi));
     _setState(candidates: updated);
+    _ensureCandidateCleanup();
+  }
+
+  void _ensureCandidateCleanup() {
+    if (_candidateCleanupTimer != null) return;
+    _candidateCleanupTimer = Timer.periodic(
+      _candidateCleanupInterval,
+      (_) => _expireCandidates(),
+    );
+  }
+
+  void _expireCandidates() {
+    if (_disposed) return;
+    final now = _clock();
+    final remaining = state.candidates
+        .where(
+          (candidate) =>
+              candidate.lastSeen.add(_candidateExpiration).isAfter(now),
+        )
+        .toList();
+    if (remaining.length == state.candidates.length) return;
+
+    final remainingIds = remaining.map((candidate) => candidate.id).toSet();
+    _candidatesById.removeWhere((id, _) => !remainingIds.contains(id));
+    _setState(candidates: remaining);
+    if (remaining.isEmpty) {
+      _candidateCleanupTimer?.cancel();
+      _candidateCleanupTimer = null;
+    }
+  }
+
+  void _resetCandidateTracking({bool updateState = true}) {
+    _candidateCleanupTimer?.cancel();
+    _candidateCleanupTimer = null;
+    _candidatesById.clear();
+    if (updateState && !_disposed && state.candidates.isNotEmpty) {
+      _setState(candidates: const []);
+    }
   }
 
   Future<String?> connectToCandidate(String candidateId) async {
-    if (_disposed || _activeSession != null || _linkEstablishing) return null;
+    if (_disposed ||
+        !_availabilityEnabled ||
+        _activeSession != null ||
+        _linkEstablishing) {
+      return null;
+    }
     final peripheral = _candidatesById[candidateId];
     if (peripheral == null) {
       _setState(
@@ -679,6 +845,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     try {
       await _central.connect(peripheral).timeout(const Duration(seconds: 15));
       await waiter.future.timeout(const Duration(seconds: 15));
+      if (!_availabilityEnabled) {
+        throw const BleLinkException('BeChat was turned off');
+      }
       final services = await _central.discoverGATT(peripheral);
       final characteristics = _findBeChatCharacteristics(services);
       final tx = characteristics.tx;
@@ -695,9 +864,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       );
       _centralTransport = transport;
       await _enableNotifications(peripheral, tx);
+      if (!_availabilityEnabled) {
+        throw const BleLinkException('BeChat was turned off');
+      }
       final session = _createSession(transport, BleLinkRole.central);
       _activeSession = session;
       final hello = await session.start();
+      if (!_availabilityEnabled) {
+        throw const BleLinkException('BeChat was turned off');
+      }
       _linkEstablishing = false;
       await _onLinkReady(session, hello);
       return hello.deviceId;
@@ -712,10 +887,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       _remoteDeviceName = null;
       _remoteRssi = null;
       if (!_disposed) {
+        final turnedOff = !_availabilityEnabled;
         _setState(
-          status: BleRuntimeStatus.error,
-          error: 'Connection failed: ${_describeError(error)}',
+          status: turnedOff ? BleRuntimeStatus.idle : BleRuntimeStatus.error,
+          error: turnedOff
+              ? null
+              : 'Connection failed: ${_describeError(error)}',
           clearActiveLink: true,
+          clearError: turnedOff,
         );
       }
       return null;
@@ -865,6 +1044,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       expiresAt: now.add(AppConstants.incomingRequestTimeout),
     );
     _incomingRequestSession = session;
+    _resetCandidateTracking(updateState: false);
     _incomingRequestTimer?.cancel();
     _incomingRequestTimer = Timer(AppConstants.incomingRequestTimeout, () {
       final current = state.incomingRequest;
@@ -887,9 +1067,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     final identity = _ref.read(identityProvider).valueOrNull;
     if (peer == null || identity == null) {
       if (state.incomingRequest != null) {
-        throw const BleLinkException(
-          'The connection request is awaiting approval',
-        );
+        throw const BleLinkException(BleProtocol.approvalPendingReason);
       }
       throw const BleLinkException('The BLE link has no validated peer');
     }
@@ -950,6 +1128,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _activePeer = peer;
     _remoteDeviceName = peer.deviceName;
     _clearIncomingRequest();
+    _resetCandidateTracking(updateState: false);
     _setState(
       status: BleRuntimeStatus.connected,
       candidates: const [],
@@ -1099,11 +1278,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Future<void> _onLinkReady(BleLinkSession session, BleHello hello) async {
     if (_disposed || _activeSession != session) return;
     _linkEstablishing = false;
-    if (!_foreground) {
+    if (!_foreground || !_availabilityEnabled) {
       await _closeActiveLink();
       return;
     }
     await _stopAdvertisingForLink();
+    _resetCandidateTracking(updateState: false);
     if (state.incomingRequest?.peerId == hello.deviceId) {
       _setState(
         status: BleRuntimeStatus.ready,
@@ -1308,12 +1488,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       _remoteDeviceName = null;
       _remoteRssi = null;
       _clearIncomingRequest();
+      _resetCandidateTracking(updateState: false);
 
       if (!_linkEstablishing &&
           !_disposed &&
           !_isTerminalStatus(state.status)) {
         _setState(
-          status: _foreground ? BleRuntimeStatus.ready : BleRuntimeStatus.idle,
+          status: _foreground && _availabilityEnabled
+              ? BleRuntimeStatus.ready
+              : BleRuntimeStatus.idle,
           candidates: const [],
           clearActiveLink: true,
           clearError:
@@ -1340,7 +1523,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         } catch (_) {}
       }
 
-      if (_foreground && _initialized && !_disposed) {
+      if (_foreground && _availabilityEnabled && _initialized && !_disposed) {
         await _recoverAdvertising();
       }
     } finally {
@@ -1396,7 +1579,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> retry() async {
-    if (_disposed) return;
+    if (_disposed || !_availabilityEnabled) return;
     final inFlight = _startFuture;
     if (inFlight != null) {
       await inFlight;
@@ -1413,6 +1596,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _foreground = false;
     _clearIncomingRequest();
     await stopScan();
+    _resetCandidateTracking();
     await _closeActiveLink();
     if (_advertising) {
       try {
@@ -1432,6 +1616,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Future<void> resumeFromBackground() async {
     if (_disposed) return;
     _foreground = true;
+    if (!_availabilityEnabled) return;
     final inFlight = _startFuture;
     if (inFlight != null) {
       await inFlight;
@@ -1562,7 +1747,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   void dispose() {
     _disposed = true;
     _scanTimer?.cancel();
+    _candidateCleanupTimer?.cancel();
     _incomingRequestTimer?.cancel();
+    for (final waiter in _connectionWaiters.values) {
+      if (!waiter.isCompleted) {
+        waiter.completeError(const BleLinkException('BLE runtime disposed'));
+      }
+    }
+    _connectionWaiters.clear();
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }

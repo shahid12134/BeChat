@@ -1,3 +1,4 @@
+import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/repositories/message_repository.dart';
@@ -92,6 +93,52 @@ void main() {
       await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
 
       expect(attempts, 1);
+      expect(repository.statusOf('msg-1'), MessageStatus.queued);
+    },
+  );
+
+  test('retries while the peer is waiting for connection approval', () async {
+    final repository = _FakeMessageRepository([_message()]);
+    var attempts = 0;
+    final outbox = BleOutbox(
+      repository: repository,
+      send: (message, {onTransmitted}) async {
+        attempts++;
+        await onTransmitted?.call();
+        if (attempts == 1) {
+          throw const BleApprovalPendingException('msg-1');
+        }
+        return BleAckResult.stored;
+      },
+      isLinkUsable: () => true,
+      onChanged: (message) async {},
+      approvalRetryDelay: Duration.zero,
+    );
+
+    await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+
+    expect(attempts, 2);
+    expect(repository.statusOf('msg-1'), MessageStatus.delivered);
+  });
+
+  test(
+    'leaves a message queued when approval does not arrive in time',
+    () async {
+      final repository = _FakeMessageRepository([_message()]);
+      final outbox = BleOutbox(
+        repository: repository,
+        send: (message, {onTransmitted}) async {
+          await onTransmitted?.call();
+          throw const BleApprovalPendingException('msg-1');
+        },
+        isLinkUsable: () => true,
+        onChanged: (message) async {},
+        approvalRetryWindow: Duration.zero,
+        approvalRetryDelay: Duration.zero,
+      );
+
+      await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+
       expect(repository.statusOf('msg-1'), MessageStatus.queued);
     },
   );

@@ -71,6 +71,20 @@ void main() {
     expect(pair.sessionB.isReady, isFalse);
   });
 
+  test(
+    'approval-pending rejection is distinguishable from a final rejection',
+    () async {
+      final pair = _SessionPair(approvalPending: true);
+      await pair.start();
+
+      await expectLater(
+        pair.sessionA.sendMessage(_message()),
+        throwsA(isA<BleApprovalPendingException>()),
+      );
+      expect(pair.sessionA.isReady, isTrue);
+    },
+  );
+
   test('send after close fails instead of pretending delivery', () async {
     final pair = _SessionPair();
     await pair.start();
@@ -103,6 +117,7 @@ class _SessionPair {
   _SessionPair({
     this.duplicateAfterFirst = false,
     this.blockedPeer = false,
+    this.approvalPending = false,
     this.deliveryDelay = Duration.zero,
     BleAckPolicy ackPolicyA = const BleAckPolicy(),
   }) {
@@ -135,6 +150,9 @@ class _SessionPair {
       onMessage: (payload) async {
         receivedOnB.add(payload);
         await Future<void>.delayed(deliveryDelay);
+        if (approvalPending) {
+          throw const BleLinkException(BleProtocol.approvalPendingReason);
+        }
         if (duplicateAfterFirst && receivedOnB.length > 1) {
           return BleAckResult.duplicate;
         }
@@ -148,6 +166,7 @@ class _SessionPair {
 
   final bool duplicateAfterFirst;
   final bool blockedPeer;
+  final bool approvalPending;
   final Duration deliveryDelay;
   final List<BleMessagePayload> receivedOnB = [];
   int visibleMessagesOnB = 0;

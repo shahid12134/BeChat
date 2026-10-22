@@ -1,4 +1,5 @@
 import 'package:bechat/data/models/app_settings.dart';
+import 'package:bechat/data/models/ble_candidate.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/repositories/app_settings_repository.dart';
 import 'package:bechat/data/repositories/peer_repository.dart';
@@ -30,12 +31,92 @@ void main() {
     expect(find.text('Scan for Demo Devices'), findsNothing);
     expect(find.text('Allow New Connections'), findsOneWidget);
     expect(
-      find.text('Allow unknown nearby devices to request a connection.'),
+      find.text(
+        'Allow unknown nearby devices to request a connection while '
+        'BeChat is on.',
+      ),
       findsOneWidget,
     );
     expect(find.text('Direct BLE messaging is off'), findsNothing);
     expect(find.text('Scan for Peers'), findsNothing);
     expect(tester.widget<Switch>(find.byType(Switch)).value, isTrue);
+    expect(find.text('BeChat is offline'), findsOneWidget);
+    expect(find.text('Nearby Scan'), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsNothing);
+  });
+
+  testWidgets('scan with BeChat off asks before enabling anything', (
+    tester,
+  ) async {
+    final settings = _FakeAppSettingsRepository();
+    late _FakeBleRuntimeController runtime;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          peerRepositoryProvider.overrideWithValue(_EmptyPeerRepository()),
+          appSettingsRepositoryProvider.overrideWithValue(settings),
+          bleRuntimeProvider.overrideWith((ref) {
+            runtime = _FakeBleRuntimeController(ref, const BleRuntimeState());
+            return runtime;
+          }),
+        ],
+        child: const MaterialApp(home: PeerDiscoveryScreen()),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Scan'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Turn on BeChat?'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+
+    expect(settings.bleEnabled, isFalse);
+    expect(runtime.scanCalls, 0);
+  });
+
+  testWidgets('scanning shows candidates, thin progress, and a stop control', (
+    tester,
+  ) async {
+    final settings = _FakeAppSettingsRepository(bleEnabled: true);
+    late _FakeBleRuntimeController runtime;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          peerRepositoryProvider.overrideWithValue(_EmptyPeerRepository()),
+          appSettingsRepositoryProvider.overrideWithValue(settings),
+          bleRuntimeProvider.overrideWith((ref) {
+            runtime = _FakeBleRuntimeController(
+              ref,
+              BleRuntimeState(
+                status: BleRuntimeStatus.scanning,
+                candidates: [
+                  BleCandidate(
+                    id: 'candidate-1',
+                    displayName: 'Nearby Bob',
+                    rssi: -42,
+                    lastSeen: DateTime.utc(2026, 1, 1),
+                  ),
+                ],
+              ),
+            );
+            return runtime;
+          }),
+        ],
+        child: const MaterialApp(home: PeerDiscoveryScreen()),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('Nearby Bob'), findsOneWidget);
+    expect(find.byType(LinearProgressIndicator), findsOneWidget);
+    expect(find.text('Stop Scanning'), findsOneWidget);
+
+    await tester.tap(find.text('Stop Scanning'));
+    await tester.pump();
+    expect(runtime.stopCalls, 1);
   });
 
   testWidgets('turning new connections off is persisted', (tester) async {
@@ -120,14 +201,30 @@ class _EmptyPeerRepository extends PeerRepository {
 }
 
 class _FakeAppSettingsRepository extends AppSettingsRepository {
-  _FakeAppSettingsRepository({this.failWrites = false});
+  _FakeAppSettingsRepository({
+    this.failWrites = false,
+    this.bleEnabled = false,
+  });
 
   final bool failWrites;
   bool allowNewConnections = true;
+  bool bleEnabled;
 
   @override
   Future<AppSettings> loadSettings() async {
-    return AppSettings(allowNewConnections: allowNewConnections);
+    return AppSettings(
+      allowNewConnections: allowNewConnections,
+      bleEnabled: bleEnabled,
+    );
+  }
+
+  @override
+  Future<bool> getBleEnabled() async => bleEnabled;
+
+  @override
+  Future<void> setBleEnabled(bool value) async {
+    if (failWrites) throw Exception('database unavailable');
+    bleEnabled = value;
   }
 
   @override
@@ -141,4 +238,20 @@ class _FakeBleRuntimeController extends BleRuntimeController {
   _FakeBleRuntimeController(super.ref, BleRuntimeState initialState) {
     state = initialState;
   }
+
+  int scanCalls = 0;
+  int stopCalls = 0;
+
+  @override
+  Future<void> startScan() async {
+    scanCalls++;
+  }
+
+  @override
+  Future<void> stopScan() async {
+    stopCalls++;
+  }
+
+  @override
+  Future<void> setAvailabilityEnabled(bool enabled) async {}
 }

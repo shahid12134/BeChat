@@ -13,6 +13,13 @@ Nearby screen includes a persistent **Allow New Connections** switch. Delivery
 is acknowledged end-to-end with an application ACK; messages remain queued
 until the intended peer is connected and acknowledges them.
 
+A persistent **BeChat availability** control is available from the Chats and
+Nearby app bars. Turning it on verifies Android Bluetooth and permissions before
+BeChat advertises; turning it off stops scanning and advertising, closes active
+links, and clears runtime state without deleting chats or peers. The Nearby
+screen uses a manual scan with a 15-second timeout, retains candidates across a
+refresh, and expires stale discovery hints after about 10 seconds.
+
 This phase does **not** provide message encryption, cryptographic peer
 authentication, background delivery, multi-hop mesh routing, store-and-forward
 relay, or cloud fallback.
@@ -55,6 +62,7 @@ lib/
     utils/
       date_utils.dart                # Date formatting utilities
     widgets/
+      ble_availability_button.dart   # Shared BeChat on/off app-bar control
       empty_state.dart               # Empty state widget
       avatar_widget.dart             # Peer avatar with initials
       status_indicator.dart          # Transport status indicator
@@ -147,9 +155,12 @@ through typed repository methods and survive application restarts.
 | `background_ble_enabled` | `false` | Opt-in preference for future background operation |
 | `message_previews_enabled` | `false` | Whether future notifications may show message contents |
 
-`allow_new_connections` is enforced for unknown inbound peers. The other values
-are preferences only: they do not start BLE, run background services, or enable
-notifications in this stage.
+`ble_enabled` is the user's intended BeChat availability preference. On startup,
+BeChat reconciles it with the actual Android adapter and permission state before
+advertising; the preference alone never proves that BLE is operational.
+`allow_new_connections` is enforced for unknown inbound peers. The background
+and notification settings remain preferences only: they do not start background
+services or enable notifications in this stage.
 
 ---
 
@@ -229,33 +240,41 @@ adb install build/app/outputs/flutter-apk/app-debug.apk
 
 ## Direct BLE Text Messaging
 
-Both phones advertise the BeChat GATT service and scan for it. The app uses
-the standard BLE central and peripheral roles at the same time, so either phone
-can initiate a connection.
+BeChat is off by default. Once turned on, both phones advertise the BeChat GATT
+service and can scan for it. The app uses the standard BLE central and
+peripheral roles at the same time, so either phone can initiate a connection.
 
 1. Install the same build on both phones and open BeChat on both.
-2. Open **Nearby** and tap **Scan for Peers** on both phones.
+2. Tap the Bluetooth availability icon in the Chats or Nearby app bar to turn
+   BeChat on. This does not change the system Bluetooth radio.
 3. Grant the Android **Nearby devices** permission when prompted. Android 11
-   and earlier also require location permission for BLE scanning.
-4. Tap a discovered BeChat device on one phone.
-5. Wait for the GATT connection and application HELLO handshake. A saved peer
+   and earlier also require location permission for BLE scanning. If Bluetooth
+   is off, enable it in Android settings as prompted, then retry.
+4. Open **Nearby** and tap **Scan** on both phones. Scanning stops automatically
+   after 15 seconds; tap **Scan** again to refresh. Recently seen devices remain
+   visible for about 10 seconds.
+5. Tap a discovered BeChat device on one phone.
+6. Wait for the GATT connection and application HELLO handshake. A saved peer
    reconnects directly; an unknown peer triggers a connection request dialog on
    the receiving phone.
-6. On the receiving phone, choose **Accept**, **Decline**, or **Block**. The
+7. On the receiving phone, choose **Accept**, **Decline**, or **Block**. The
    peer is saved only after acceptance and is then shown in **Saved Peers**.
-7. Open the peer's chat and send text.
+8. Open the peer's chat and send text.
 
 ### Incoming Connection Approval
 
 - **Allow New Connections** in Nearby defaults to on and persists across
   restarts. Turning it off rejects unknown inbound peers but still allows
-  saved, unblocked peers to reconnect.
+  saved, unblocked peers to reconnect. Turning BeChat itself off overrides this
+  setting and closes all links.
 - A request expires after 30 seconds. Declining rejects the link and suppresses
   new prompts from that device for about 60 seconds. The cooldown is in memory
   only.
 - Blocking an unknown requester saves a blocked peer record, so later HELLO
   attempts are rejected and the existing block/unblock flow still applies.
-- Messages received before approval receive a rejected ACK and are not stored.
+- Messages received before approval receive a transient rejected ACK and are
+  not stored. The sender keeps the message queued and retries during the
+  30-second approval window instead of marking it permanently failed.
 - Request dialogs are disabled for barrier/back dismissal, but the request can
   expire or be cancelled by turning new connections off.
 - The pending request is not persisted, marked online, or shown as an approved
@@ -270,7 +289,8 @@ Delivery behavior:
 - `sent` means every BLE frame was written; it is not proof of receipt.
 - `delivered` requires an application ACK from the peer.
 - If the link drops or an ACK times out, the message is returned to the outbox.
-  Retries are bounded.
+  Ordinary retries are bounded; connection-approval retries continue only
+  until the pending request expires.
 - Messages for another peer remain queued while a different peer is connected.
 - Incoming messages are stored atomically. Duplicate message IDs are
   acknowledged as duplicates without creating a second message or unread count.
@@ -343,7 +363,10 @@ The following belong to future phases:
 ### Phase 2 Limitations
 
 - Text only, with a maximum of 4096 UTF-8 bytes per message.
-- Both phones must have BeChat in the foreground.
+- Both phones must have BeChat in the foreground, and BeChat must be explicitly
+  turned on. BLE does not run while the app is backgrounded.
+- A scan is manual and stops after 15 seconds. Nearby candidates are ephemeral
+  discovery hints that expire after about 10 seconds.
 - BLE range, discovery time, and connection reliability depend on the phones
   and radio environment.
 - The link is not encrypted and the exchanged identity is not authenticated.
@@ -389,8 +412,12 @@ Tests cover:
 - BLE frame codec, transfer framing, reassembly, checksums, and size limits
 - HELLO validation, message payload UTF-8 boundaries, and ACKs
 - Session handshake, ACK timeout, disconnect handling, and transfer limits
-- Outbox transitions, ACK outcomes, requeue behavior, and bounded retries
+- Outbox transitions, ACK outcomes, requeue behavior, bounded retries, and
+  connection-approval retry handling
 - Atomic incoming-message persistence, duplicate handling, and blocked peers
+- Persistent BeChat availability reconciliation, serialized toggles, shutdown,
+  scan gating, candidate expiration, and app-bar availability states
+- Nearby scan prompting, retained candidates, progress, and stop controls
 - Bootstrap failure recovery and key widget interactions
 
 Manual BLE validation still requires two physical Android phones; emulator and

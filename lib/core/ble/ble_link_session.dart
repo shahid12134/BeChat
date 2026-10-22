@@ -30,6 +30,16 @@ class BleAckTimeoutException implements Exception {
       '${timeout.inMilliseconds} ms';
 }
 
+class BleApprovalPendingException implements Exception {
+  const BleApprovalPendingException(this.messageId);
+
+  final String messageId;
+
+  @override
+  String toString() =>
+      'BleApprovalPendingException: $messageId is awaiting approval';
+}
+
 class BleHelloRejectedException implements Exception {
   const BleHelloRejectedException(this.message);
 
@@ -79,7 +89,7 @@ class BleLinkSession {
   final int Function() _transferIdFactory;
 
   final BleTransferAssembler _assembler = BleTransferAssembler();
-  final Map<String, Completer<BleAckResult>> _pendingAcks = {};
+  final Map<String, Completer<BleAck>> _pendingAcks = {};
   final Completer<BleHello> _helloCompleter = Completer<BleHello>();
 
   StreamSubscription<Uint8List>? _subscription;
@@ -177,7 +187,7 @@ class BleLinkSession {
       bytes: payload.length,
       frameCount: frames.length,
     );
-    final completer = Completer<BleAckResult>();
+    final completer = Completer<BleAck>();
     _pendingAcks[message.messageId] = completer;
 
     try {
@@ -187,7 +197,12 @@ class BleLinkSession {
         }
       });
       await onTransmitted?.call();
-      return await completer.future.timeout(timeout);
+      final ack = await completer.future.timeout(timeout);
+      if (ack.result == BleAckResult.rejected &&
+          ack.reason?.contains(BleProtocol.approvalPendingReason) == true) {
+        throw BleApprovalPendingException(message.messageId);
+      }
+      return ack.result;
     } on TimeoutException {
       throw BleAckTimeoutException(message.messageId, timeout);
     } finally {
@@ -304,7 +319,7 @@ class BleLinkSession {
     final ack = BleAck.decode(bytes);
     final completer = _pendingAcks.remove(ack.messageId);
     if (completer == null || completer.isCompleted) return;
-    completer.complete(ack.result);
+    completer.complete(ack);
   }
 
   Future<void> _sendError(String code, String message) async {

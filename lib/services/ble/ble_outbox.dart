@@ -1,6 +1,8 @@
 import 'dart:async';
 
+import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/repositories/message_repository.dart';
 
@@ -20,6 +22,8 @@ class BleOutbox {
     required BleOutboxChanged onChanged,
     this.maxAttempts = 2,
     this.retryDelay = _defaultRetryDelay,
+    this.approvalRetryWindow = AppConstants.incomingRequestTimeout,
+    this.approvalRetryDelay = const Duration(seconds: 2),
   }) : _repository = repository,
        _send = send,
        _isLinkUsable = isLinkUsable,
@@ -31,6 +35,8 @@ class BleOutbox {
   final BleOutboxChanged _onChanged;
   final int maxAttempts;
   final Duration Function(int attempt) retryDelay;
+  final Duration approvalRetryWindow;
+  final Duration approvalRetryDelay;
 
   bool _running = false;
   bool _rerun = false;
@@ -67,8 +73,11 @@ class BleOutbox {
   }
 
   Future<void> _deliver(Message message) async {
-    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+    final approvalDeadline = DateTime.now().add(approvalRetryWindow);
+    var attempt = 0;
+    while (true) {
       if (!_isLinkUsable()) return;
+      attempt++;
       await _repository.markMessageSending(message.messageId);
       await _onChanged(message.copyWith(status: MessageStatus.sending));
 
@@ -91,6 +100,12 @@ class BleOutbox {
             await _onChanged(message.copyWith(status: MessageStatus.failed));
             return;
         }
+      } on BleApprovalPendingException {
+        await _repository.requeueMessage(message.messageId);
+        await _onChanged(message.copyWith(status: MessageStatus.queued));
+        if (!_isLinkUsable()) return;
+        if (!DateTime.now().isBefore(approvalDeadline)) return;
+        await Future<void>.delayed(approvalRetryDelay);
       } catch (_) {
         await _repository.requeueMessage(message.messageId);
         await _onChanged(message.copyWith(status: MessageStatus.queued));

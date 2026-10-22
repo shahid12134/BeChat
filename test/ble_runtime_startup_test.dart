@@ -1,5 +1,9 @@
 import 'dart:async';
 
+import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/data/models/app_settings.dart';
+import 'package:bechat/data/repositories/app_settings_repository.dart';
+import 'package:bechat/providers/app_settings_providers.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/services/ble/ble_runtime.dart';
@@ -257,6 +261,147 @@ void main() {
 
     expect(harness.controller.state.status, BleRuntimeStatus.scanning);
   });
+
+  test('disabled availability does not initialize BLE', () async {
+    final harness = _Harness(
+      _FakeStatusProbe(_status()),
+      availabilityEnabled: false,
+    );
+    addTearDown(harness.dispose);
+
+    await harness.controller.ensureStarted();
+    await harness.controller.startScan();
+
+    expect(harness.controller.state.status, BleRuntimeStatus.idle);
+    verifyNever(harness.central.authorize());
+    verifyNever(harness.peripheral.addService(any));
+    verifyNever(
+      harness.central.startDiscovery(serviceUUIDs: anyNamed('serviceUUIDs')),
+    );
+  });
+
+  test('startup reconciles a saved enabled preference', () async {
+    final settings = _FakeAppSettingsRepository(bleEnabled: true);
+    final harness = _Harness(
+      _FakeStatusProbe(_status()),
+      availabilityEnabled: false,
+      settings: settings,
+    );
+    addTearDown(harness.dispose);
+
+    await harness.controller.reconcileAvailability();
+
+    expect(harness.controller.state.status, BleRuntimeStatus.ready);
+    expect(harness.controller.state.isAdvertising, isTrue);
+  });
+
+  test(
+    'startup keeps BLE idle when the saved preference is disabled',
+    () async {
+      final harness = _Harness(
+        _FakeStatusProbe(_status()),
+        availabilityEnabled: true,
+        settings: _FakeAppSettingsRepository(bleEnabled: false),
+      );
+      addTearDown(harness.dispose);
+
+      await harness.controller.reconcileAvailability();
+
+      expect(harness.controller.state.status, BleRuntimeStatus.idle);
+      verifyNever(harness.peripheral.addService(any));
+    },
+  );
+
+  test(
+    'turning availability off stops advertising and clears candidates',
+    () async {
+      final harness = _Harness(_FakeStatusProbe(_status()));
+      addTearDown(harness.dispose);
+
+      await harness.controller.ensureStarted();
+      await harness.controller.startScan();
+      harness.discovered.add(_discovered('device-b', name: 'Bob', rssi: -40));
+      await pumpEventQueue();
+      expect(harness.controller.state.candidates, hasLength(1));
+
+      await harness.controller.setAvailabilityEnabled(false);
+
+      expect(harness.controller.state.status, BleRuntimeStatus.idle);
+      expect(harness.controller.state.candidates, isEmpty);
+      expect(harness.controller.state.isAdvertising, isFalse);
+      verify(harness.peripheral.stopAdvertising()).called(1);
+      verify(harness.central.stopDiscovery()).called(greaterThanOrEqualTo(1));
+    },
+  );
+
+  test('repeated enabling shares one initialization', () async {
+    final harness = _Harness(
+      _FakeStatusProbe(_status()),
+      availabilityEnabled: false,
+    );
+    addTearDown(harness.dispose);
+
+    await Future.wait([
+      harness.controller.setAvailabilityEnabled(true),
+      harness.controller.setAvailabilityEnabled(true),
+    ]);
+
+    expect(harness.controller.state.status, BleRuntimeStatus.ready);
+    verify(harness.peripheral.removeAllServices()).called(1);
+    verify(harness.peripheral.addService(any)).called(1);
+    verify(harness.peripheral.startAdvertising(any)).called(1);
+  });
+
+  test(
+    'scan keeps candidates and expires them after the configured window',
+    () async {
+      final now = DateTime(2026, 1, 1, 12);
+      var clockNow = now;
+      final harness = _Harness(
+        _FakeStatusProbe(_status()),
+        candidateExpiration: const Duration(milliseconds: 30),
+        candidateCleanupInterval: const Duration(milliseconds: 5),
+        clock: () => clockNow,
+      );
+      addTearDown(harness.dispose);
+
+      await harness.controller.ensureStarted();
+      await harness.controller.startScan();
+      harness.discovered.add(_discovered('device-b', name: 'Bob', rssi: -50));
+      await pumpEventQueue();
+      expect(harness.controller.state.candidates, hasLength(1));
+
+      harness.discovered.add(_discovered('device-b', name: 'Bob', rssi: -35));
+      await pumpEventQueue();
+      expect(harness.controller.state.candidates.single.rssi, -35);
+      expect(harness.controller.state.candidates.single.lastSeen, now);
+
+      await harness.controller.stopScan();
+      expect(harness.controller.state.candidates, hasLength(1));
+
+      clockNow = now.add(const Duration(milliseconds: 40));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(harness.controller.state.candidates, isEmpty);
+    },
+  );
+}
+
+DiscoveredEventArgs _discovered(
+  String id, {
+  required String name,
+  required int rssi,
+}) {
+  final value = id.codeUnits.fold<int>(0, (sum, unit) => sum + unit);
+  final suffix = value.toRadixString(16).padLeft(12, '0');
+  return DiscoveredEventArgs(
+    _FakePeripheral(UUID.fromString('00000000-0000-0000-0000-$suffix')),
+    rssi,
+    Advertisement(
+      name: name,
+      serviceUUIDs: [UUID.fromString(BleProtocol.serviceUuid)],
+    ),
+  );
 }
 
 BlePlatformStatus _status({
@@ -315,11 +460,19 @@ class _Harness {
   _Harness(
     BleStatusProbe probe, {
     Duration permissionTimeout = const Duration(milliseconds: 100),
+    bool availabilityEnabled = true,
+    _FakeAppSettingsRepository? settings,
+    Duration candidateExpiration = const Duration(seconds: 10),
+    Duration candidateCleanupInterval = const Duration(seconds: 2),
+    DateTime Function()? clock,
   }) {
     _stubManagers();
     container = ProviderContainer(
       overrides: [
         localDeviceIdProvider.overrideWithValue(null),
+        appSettingsRepositoryProvider.overrideWithValue(
+          settings ?? _FakeAppSettingsRepository(),
+        ),
         bleRuntimeProvider.overrideWith(
           (ref) => BleRuntimeController(
             ref,
@@ -328,6 +481,10 @@ class _Harness {
             statusProbe: probe,
             permissionTimeout: permissionTimeout,
             isAndroidOverride: true,
+            availabilityEnabled: availabilityEnabled,
+            candidateExpiration: candidateExpiration,
+            candidateCleanupInterval: candidateCleanupInterval,
+            clock: clock,
           ),
         ),
       ],
@@ -341,6 +498,7 @@ class _Harness {
       StreamController<BluetoothLowEnergyStateChangedEventArgs>.broadcast();
   final peripheralStates =
       StreamController<BluetoothLowEnergyStateChangedEventArgs>.broadcast();
+  final discovered = StreamController<DiscoveredEventArgs>.broadcast();
 
   late final ProviderContainer container;
   late final BleRuntimeController controller;
@@ -350,9 +508,7 @@ class _Harness {
     when(peripheral.state).thenReturn(BluetoothLowEnergyState.unauthorized);
     when(central.stateChanged).thenAnswer((_) => centralStates.stream);
     when(peripheral.stateChanged).thenAnswer((_) => peripheralStates.stream);
-    when(
-      central.discovered,
-    ).thenAnswer((_) => const Stream<DiscoveredEventArgs>.empty());
+    when(central.discovered).thenAnswer((_) => discovered.stream);
     when(central.connectionStateChanged).thenAnswer(
       (_) => const Stream<PeripheralConnectionStateChangedEventArgs>.empty(),
     );
@@ -386,7 +542,37 @@ class _Harness {
     container.dispose();
     await centralStates.close();
     await peripheralStates.close();
+    await discovered.close();
   }
+}
+
+class _FakeAppSettingsRepository extends AppSettingsRepository {
+  _FakeAppSettingsRepository({this.bleEnabled = false});
+
+  bool bleEnabled;
+
+  @override
+  Future<AppSettings> loadSettings() async {
+    return AppSettings(bleEnabled: bleEnabled);
+  }
+
+  @override
+  Future<bool> getBleEnabled() async => bleEnabled;
+
+  @override
+  Future<bool> getAllowNewConnections() async => true;
+
+  @override
+  Future<void> setBleEnabled(bool value) async {
+    bleEnabled = value;
+  }
+}
+
+class _FakePeripheral implements Peripheral {
+  _FakePeripheral(this.uuid);
+
+  @override
+  final UUID uuid;
 }
 
 class _MockCentralManager extends Mock implements CentralManager {

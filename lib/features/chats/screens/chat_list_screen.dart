@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:bechat/core/widgets/ble_availability_button.dart';
 import 'package:bechat/features/chats/widgets/chat_list_item.dart';
 import 'package:bechat/core/widgets/empty_state.dart';
 import 'package:bechat/providers/chat_providers.dart';
@@ -44,6 +45,7 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
               )
             : const Text('BeChat'),
         actions: [
+          const BleAvailabilityButton(),
           IconButton(
             icon: Icon(_isSearching ? Icons.close : Icons.search),
             onPressed: () {
