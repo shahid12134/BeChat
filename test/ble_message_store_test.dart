@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/identity.dart';
@@ -146,6 +148,57 @@ void main() {
       linkedPeerId: remote.peerId,
     );
     expect(result, BleAckResult.stored);
+  });
+
+  test('notifies only when a new message is stored', () async {
+    var notifications = 0;
+    final handler = BleIncomingMessageHandler(
+      identity: local,
+      store: store,
+      onStored: (payload, receipt) async {
+        notifications++;
+      },
+    );
+
+    final first = await handler.handle(
+      _payload(messageId: 'msg-notify'),
+      peer: remote,
+      linkedPeerId: remote.peerId,
+    );
+    final duplicate = await handler.handle(
+      _payload(messageId: 'msg-notify'),
+      peer: remote,
+      linkedPeerId: remote.peerId,
+    );
+
+    expect(first, BleAckResult.stored);
+    expect(duplicate, BleAckResult.duplicate);
+    expect(notifications, 1);
+  });
+
+  test('notification work does not block the delivery ACK', () async {
+    final callbackStarted = Completer<void>();
+    final callbackFinished = Completer<void>();
+    final handler = BleIncomingMessageHandler(
+      identity: local,
+      store: store,
+      onStored: (payload, receipt) {
+        callbackStarted.complete();
+        return callbackFinished.future;
+      },
+    );
+
+    final result = await handler
+        .handle(
+          _payload(messageId: 'msg-nonblocking'),
+          peer: remote,
+          linkedPeerId: remote.peerId,
+        )
+        .timeout(const Duration(seconds: 1));
+
+    expect(result, BleAckResult.stored);
+    await callbackStarted.future;
+    callbackFinished.complete();
   });
 
   test('a failed database write propagates instead of succeeding', () async {

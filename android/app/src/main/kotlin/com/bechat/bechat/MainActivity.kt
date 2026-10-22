@@ -2,6 +2,7 @@ package com.bechat.bechat
 
 import android.Manifest
 import android.bluetooth.BluetoothManager
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
@@ -32,6 +33,41 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        val backgroundChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            BACKGROUND_CHANNEL,
+        )
+        backgroundChannel.setMethodCallHandler { call, result ->
+            BackgroundBleBridge.handleMethodCall(this, call, result)
+        }
+        BackgroundBleBridge.attach(this, backgroundChannel)
+        BackgroundBleBridge.handleLaunchIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        BackgroundBleBridge.handleLaunchIntent(intent)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val granted = grantResults.isNotEmpty() &&
+            grantResults[0] == PackageManager.PERMISSION_GRANTED
+        BackgroundBleBridge.onRequestPermissionsResult(requestCode, granted)
+    }
+
+    override fun onDestroy() {
+        if (isFinishing) {
+            BeChatForegroundService.stop(applicationContext)
+        }
+        BackgroundBleBridge.detach(this)
+        super.onDestroy()
     }
 
     @Suppress("MissingPermission")
@@ -99,5 +135,8 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val BLE_STATUS_CHANNEL = "bechat/ble_status"
+        private const val BACKGROUND_CHANNEL = "bechat/background"
+        const val ACTION_OPEN_CHAT = "com.bechat.bechat.OPEN_CHAT"
+        const val EXTRA_CHAT_ID = "chatId"
     }
 }

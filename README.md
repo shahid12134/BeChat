@@ -7,7 +7,7 @@ Wi-Fi Direct and adaptive cloud switching.**
 
 **Phase 2: Direct Offline BLE Text Messaging.** BeChat can advertise, scan,
 connect, exchange application identities over a GATT link, and send text
-messages of up to 4096 UTF-8 bytes between two foreground Android phones.
+messages of up to 4096 UTF-8 bytes between two Android phones.
 Unknown inbound devices must be approved before a link is usable, and the
 Nearby screen includes a persistent **Allow New Connections** switch. Delivery
 is acknowledged end-to-end with an application ACK; messages remain queued
@@ -20,9 +20,13 @@ links, and clears runtime state without deleting chats or peers. The Nearby
 screen uses a manual scan with a 15-second timeout, retains candidates across a
 refresh, and expires stale discovery hints after about 10 seconds.
 
-This phase does **not** provide message encryption, cryptographic peer
-authentication, background delivery, multi-hop mesh routing, store-and-forward
-relay, or cloud fallback.
+An optional Android **Background messaging** setting keeps BeChat available for
+nearby messages while the app is minimized, using a visible foreground-service
+notification. It requires notification permission and does not guarantee
+delivery if Android stops the app process. This phase does **not** provide
+message encryption, cryptographic peer authentication, delivery after
+force-stop or process death, multi-hop mesh routing, store-and-forward relay, or
+cloud fallback.
 
 ---
 
@@ -47,6 +51,7 @@ lib/
   main.dart                          # App entry point
   app/
     app.dart                         # MaterialApp widget
+    app_messenger.dart               # Global scaffold messenger for service errors
     bootstrap_host.dart              # Database/identity bootstrap and retry UI
     theme/
       app_theme.dart                 # Light/dark themes, colors
@@ -91,6 +96,9 @@ lib/
     mock/
       mock_data.dart                 # Demo data seeder
   services/
+    background/
+      background_ble_service.dart    # Dart bridge to Android background service
+      background_action_coordinator.dart # Notification action routing
     ble/
       ble_runtime.dart               # Android permissions, GATT, links, UI state
       ble_message_store.dart         # Atomic incoming message persistence
@@ -99,6 +107,7 @@ lib/
       incoming_connection_request.dart # Pending approval request model
   providers/
     app_settings_providers.dart      # Persistent application settings state
+    background_service_provider.dart # Android background bridge provider
     ble_providers.dart               # BLE runtime state provider
     chat_providers.dart              # Chat state management
     peer_providers.dart              # Peer state management
@@ -118,6 +127,12 @@ lib/
       widgets/peer_list_item.dart    # Peer list item widget
     settings/
       screens/settings_screen.dart   # App settings/info
+android/app/src/main/kotlin/com/bechat/bechat/
+  MainActivity.kt                    # Flutter host, BLE status, intent routing
+  BackgroundBleBridge.kt             # Channel, permissions, queued events
+  BeChatForegroundService.kt         # Visible Android foreground service
+  BackgroundNotifications.kt         # Service/message/request notifications
+  BackgroundActionReceiver.kt        # Accept/decline/block notification actions
 ```
 
 ---
@@ -152,15 +167,18 @@ through typed repository methods and survive application restarts.
 |---------|---------|---------|
 | `ble_enabled` | `false` | Intended BeChat BLE availability preference |
 | `allow_new_connections` | `true` | Permit requests from previously unknown peers |
-| `background_ble_enabled` | `false` | Opt-in preference for future background operation |
-| `message_previews_enabled` | `false` | Whether future notifications may show message contents |
+| `background_ble_enabled` | `false` | Opt-in preference for Android background messaging |
+| `message_previews_enabled` | `false` | Whether message notifications include message text |
 
 `ble_enabled` is the user's intended BeChat availability preference. On startup,
 BeChat reconciles it with the actual Android adapter and permission state before
 advertising; the preference alone never proves that BLE is operational.
-`allow_new_connections` is enforced for unknown inbound peers. The background
-and notification settings remain preferences only: they do not start background
-services or enable notifications in this stage.
+`allow_new_connections` is enforced for unknown inbound peers.
+`background_ble_enabled` is saved only after Android notification permission and
+background-service checks succeed. It never enables BeChat availability by
+itself, and a saved preference does not prove the foreground service is running.
+Sender names are always shown in message notifications; message text is shown
+only when `message_previews_enabled` is on.
 
 ---
 
@@ -190,9 +208,10 @@ services or enable notifications in this stage.
 3. **Two physical Android phones** with:
    - Android 7.0+ (API 24+)
    - BLE hardware
-   - USB Debugging enabled
-   - Bluetooth turned on
-   - BeChat open in the foreground on both phones
+    - USB Debugging enabled
+    - Bluetooth turned on
+    - BeChat turned on; background messaging is optional after enabling it on
+      each phone
 
 ### Setup Steps
 
@@ -314,6 +333,45 @@ not a cryptographic integrity mechanism.
 
 ---
 
+## Background Messaging
+
+Background messaging is opt-in and Android-only. Open **Settings > Background**
+and turn on **Background messaging**. BeChat explains the Android battery
+limits, requests notification permission, and starts an Android foreground
+service only after BeChat availability, Bluetooth, and notification checks
+succeed. The persistent service notification is required by Android.
+
+While background mode is active and BeChat is minimized:
+
+- Existing links and advertising remain available, but manual nearby discovery
+  stops. BeChat does not continuously scan in the background.
+- New messages are stored before an ACK or notification is produced. Message
+  notifications show the sender name, but show only `New message` unless
+  **Message previews** is enabled. Duplicate message IDs do not create duplicate
+  notifications.
+- Unknown connection requests appear as high-priority notifications with
+  **Accept**, **Decline**, and **Block** actions. The action carries the exact
+  request ID and is processed by the Dart runtime; stale or expired actions fail
+  safely. Tapping the notification opens BeChat rather than launching a dialog
+  over another app.
+- Tapping a message notification opens the corresponding chat.
+
+Turning background mode off stops the service and cancels its connection-request
+notification. Turning BeChat availability off also stops background operation.
+Restarting BeChat reconciles the saved preference with the actual notification
+permission and service state.
+
+A foreground service does **not** keep Flutter or Dart alive forever. Android may
+stop the process for battery, memory, or user force-stop reasons. BeChat does not
+restart itself after process death and does not claim guaranteed background
+delivery. On some device vendors, additional battery settings may be required.
+
+The native implementation only hosts the foreground service and notifications;
+the Dart BLE runtime remains the single owner of scanning, advertising, and GATT.
+No second Kotlin BLE stack is used.
+
+---
+
 ## Demo Mode and Simulated Peers
 
 Demo mode is disabled by default. Ordinary startup creates only the local identity and does not seed peers, chats, or messages.
@@ -350,7 +408,7 @@ The following belong to future phases:
 
 - Message encryption or cryptographic peer authentication
 - Key generation, verification, or out-of-band identity comparison
-- Background BLE operation or notifications
+- Guaranteed background delivery after process death or force-stop
 - More than one simultaneous BLE link
 - Wi-Fi Direct
 - Store-and-forward relay
@@ -363,10 +421,13 @@ The following belong to future phases:
 ### Phase 2 Limitations
 
 - Text only, with a maximum of 4096 UTF-8 bytes per message.
-- Both phones must have BeChat in the foreground, and BeChat must be explicitly
-  turned on. BLE does not run while the app is backgrounded.
+- BeChat must be explicitly turned on. Without background messaging, BLE pauses
+  when the app leaves the foreground. With background messaging enabled, Android
+  may still stop the app process, so delivery is best-effort rather than
+  guaranteed.
 - A scan is manual and stops after 15 seconds. Nearby candidates are ephemeral
-  discovery hints that expire after about 10 seconds.
+  discovery hints that expire after about 10 seconds. Background mode never
+  performs continuous scanning.
 - BLE range, discovery time, and connection reliability depend on the phones
   and radio environment.
 - The link is not encrypted and the exchanged identity is not authenticated.
@@ -391,6 +452,10 @@ Declared in `AndroidManifest.xml`:
   `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`
 - Android 12 and above: `BLUETOOTH_SCAN` (with `neverForLocation`),
   `BLUETOOTH_CONNECT`, `BLUETOOTH_ADVERTISE`
+- Android 13 and above: `POST_NOTIFICATIONS`, requested only when enabling
+  background messaging
+- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_CONNECTED_DEVICE` for the visible
+  background service
 - `android.hardware.bluetooth_le` is optional so the app can install on devices
   without BLE; runtime BLE use then reports that it is unsupported.
 
@@ -414,15 +479,20 @@ Tests cover:
 - Session handshake, ACK timeout, disconnect handling, and transfer limits
 - Outbox transitions, ACK outcomes, requeue behavior, bounded retries, and
   connection-approval retry handling
-- Atomic incoming-message persistence, duplicate handling, and blocked peers
+- Atomic incoming-message persistence, duplicate handling, blocked peers, and
+  notification callbacks only for newly stored messages
+- Background enable/disable, notification-permission denial, service retention
+  while paused, service-failure state, and notification-action routing
+- Message notification privacy defaults and preview opt-in
 - Persistent BeChat availability reconciliation, serialized toggles, shutdown,
   scan gating, candidate expiration, and app-bar availability states
 - Nearby scan prompting, retained candidates, progress, and stop controls
 - Bootstrap failure recovery and key widget interactions
 
 Manual BLE validation still requires two physical Android phones; emulator and
-unit tests cannot verify radio behavior, GATT interoperability, or real
-throughput.
+unit tests cannot verify radio behavior, GATT interoperability, real throughput,
+foreground-service behavior, notification delivery, OEM battery restrictions, or
+process-death recovery.
 
 ---
 

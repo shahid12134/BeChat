@@ -15,6 +15,8 @@ import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
+import 'package:bechat/providers/background_service_provider.dart';
+import 'package:bechat/services/background/background_ble_service.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
 import 'package:bechat/services/ble/ble_outbox.dart';
 import 'package:bechat/services/ble/ble_status_probe.dart';
@@ -38,6 +40,30 @@ enum BleRuntimeStatus {
 }
 
 enum BleLinkRole { central, peripheral }
+
+enum BackgroundBleRuntimeStatus {
+  disabled,
+  starting,
+  active,
+  paused,
+  permissionDenied,
+  error,
+}
+
+class BackgroundBleToggleResult {
+  const BackgroundBleToggleResult.success({this.message})
+    : succeeded = true,
+      permissionDenied = false;
+
+  const BackgroundBleToggleResult.failure({
+    required this.message,
+    this.permissionDenied = false,
+  }) : succeeded = false;
+
+  final bool succeeded;
+  final bool permissionDenied;
+  final String? message;
+}
 
 /// Runs [operation] again after a transient failure, up to [maxAttempts].
 ///
@@ -76,6 +102,9 @@ class BleRuntimeState {
     this.canOpenSettings = false,
     this.isAdvertising = false,
     this.incomingRequest,
+    this.isForeground = true,
+    this.backgroundStatus = BackgroundBleRuntimeStatus.disabled,
+    this.backgroundError,
   });
 
   final BleRuntimeStatus status;
@@ -87,9 +116,15 @@ class BleRuntimeState {
   final bool canOpenSettings;
   final bool isAdvertising;
   final IncomingConnectionRequest? incomingRequest;
+  final bool isForeground;
+  final BackgroundBleRuntimeStatus backgroundStatus;
+  final String? backgroundError;
 
   bool get isConnected =>
       status == BleRuntimeStatus.connected && activePeerId != null;
+
+  bool get isBackgroundServiceActive =>
+      backgroundStatus == BackgroundBleRuntimeStatus.active;
 
   BleRuntimeState copyWith({
     BleRuntimeStatus? status,
@@ -101,9 +136,13 @@ class BleRuntimeState {
     bool? canOpenSettings,
     bool? isAdvertising,
     IncomingConnectionRequest? incomingRequest,
+    bool? isForeground,
+    BackgroundBleRuntimeStatus? backgroundStatus,
+    String? backgroundError,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
+    bool clearBackgroundError = false,
   }) {
     return BleRuntimeState(
       status: status ?? this.status,
@@ -119,6 +158,11 @@ class BleRuntimeState {
       incomingRequest: clearIncomingRequest
           ? null
           : incomingRequest ?? this.incomingRequest,
+      isForeground: isForeground ?? this.isForeground,
+      backgroundStatus: backgroundStatus ?? this.backgroundStatus,
+      backgroundError: clearBackgroundError
+          ? null
+          : backgroundError ?? this.backgroundError,
     );
   }
 }
@@ -135,9 +179,11 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     Duration candidateExpiration = AppConstants.candidateExpiration,
     Duration candidateCleanupInterval = AppConstants.candidateCleanupInterval,
     DateTime Function()? clock,
+    BackgroundBleService? backgroundBleService,
   }) : _centralOverride = centralManager,
        _peripheralOverride = peripheralManager,
        _statusProbe = statusProbe ?? MethodChannelBleStatusProbe(),
+       _backgroundOverride = backgroundBleService,
        _permissionTimeout = permissionTimeout,
        _isAndroidOverride = isAndroidOverride,
        _availabilityEnabled = availabilityEnabled,
@@ -164,6 +210,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final Duration _candidateExpiration;
   final Duration _candidateCleanupInterval;
   final DateTime Function() _clock;
+  final BackgroundBleService? _backgroundOverride;
   CentralManager? _centralInstance;
   PeripheralManager? _peripheralInstance;
   late final BleOutbox _outbox;
@@ -172,6 +219,18 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       _centralInstance ??= _centralOverride ?? CentralManager();
   PeripheralManager get _peripheral =>
       _peripheralInstance ??= _peripheralOverride ?? PeripheralManager();
+
+  BackgroundBleService get _backgroundService =>
+      _backgroundOverride ?? _ref.read(backgroundBleServiceProvider);
+
+  bool get _backgroundRuntimeActive =>
+      _availabilityEnabled &&
+      _backgroundBleEnabled &&
+      _backgroundServiceRunning &&
+      state.backgroundStatus == BackgroundBleRuntimeStatus.active;
+
+  bool get _canContinueBle =>
+      _foreground || (_backgroundRuntimeActive && _initialized);
 
   final UUID _serviceUuid = UUID.fromString(BleProtocol.serviceUuid);
   final UUID _rxUuid = UUID.fromString(BleProtocol.rxCharacteristicUuid);
@@ -191,6 +250,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Future<void>? _availabilityOperation;
   int _availabilityRevision = 0;
   bool _availabilityEnabled;
+  bool _backgroundBleEnabled = false;
+  bool _backgroundNotificationsAllowed = false;
+  bool _backgroundServiceRunning = false;
+  bool _backgroundStartInFlight = false;
   bool _startAttempted = false;
   bool _permissionCheckInFlight = false;
   bool _listenersAttached = false;
@@ -263,6 +326,230 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await setAvailabilityEnabled(enabled);
   }
 
+  Future<BackgroundBleToggleResult> enableBackgroundBle() async {
+    if (_disposed || AppConstants.demoDataEnabled) {
+      return const BackgroundBleToggleResult.failure(
+        message: 'Background mode is not available in this build.',
+      );
+    }
+    BackgroundBlePlatformStatus platformStatus;
+    try {
+      platformStatus = await _backgroundService.getStatus();
+    } catch (error) {
+      final message = 'Could not check Android background support: $error';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+      return BackgroundBleToggleResult.failure(message: message);
+    }
+    if (!platformStatus.supported) {
+      const message =
+          'Android background BLE operation is not available on this device.';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+      return const BackgroundBleToggleResult.failure(message: message);
+    }
+
+    var notificationsAllowed = platformStatus.notificationsAllowed;
+    if (!notificationsAllowed) {
+      notificationsAllowed = await _backgroundService
+          .requestNotificationPermission();
+    }
+    if (!notificationsAllowed) {
+      const message =
+          'Notification permission is required for background messaging. '
+          'Enable notifications for BeChat in Android settings.';
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.permissionDenied,
+        message,
+      );
+      return const BackgroundBleToggleResult.failure(
+        message: message,
+        permissionDenied: true,
+      );
+    }
+
+    if (_availabilityEnabled) {
+      await ensureStarted();
+      if (!_isBackgroundOperational(state.status)) {
+        const message =
+            'Background mode needs BeChat to be online. Turn on Bluetooth and '
+            'BeChat availability, then try again.';
+        _setBackgroundStatus(BackgroundBleRuntimeStatus.paused, message);
+        return const BackgroundBleToggleResult.failure(message: message);
+      }
+    }
+
+    try {
+      if (_availabilityEnabled) {
+        await _startBackgroundService();
+      }
+      await _ref
+          .read(appSettingsProvider.notifier)
+          .setBackgroundBleEnabled(true);
+    } catch (error) {
+      if (_backgroundServiceRunning) {
+        await _stopBackgroundService();
+      }
+      final message =
+          error is BackgroundBleServiceException &&
+              state.backgroundError != null
+          ? state.backgroundError!
+          : 'Could not enable background mode: $error';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+      return BackgroundBleToggleResult.failure(message: message);
+    }
+
+    _backgroundBleEnabled = true;
+    _backgroundNotificationsAllowed = true;
+    _setBackgroundStatus(
+      _availabilityEnabled
+          ? BackgroundBleRuntimeStatus.active
+          : BackgroundBleRuntimeStatus.paused,
+      _availabilityEnabled ? null : 'Background mode starts when BeChat is on.',
+    );
+    await _updateBackgroundServiceNotification();
+    return BackgroundBleToggleResult.success(
+      message: _availabilityEnabled
+          ? null
+          : 'Background mode enabled. It starts when BeChat is turned on.',
+    );
+  }
+
+  Future<BackgroundBleToggleResult> disableBackgroundBle() async {
+    if (_disposed) {
+      return const BackgroundBleToggleResult.failure(
+        message: 'BeChat is shutting down.',
+      );
+    }
+    try {
+      await _ref
+          .read(appSettingsProvider.notifier)
+          .setBackgroundBleEnabled(false);
+    } catch (error) {
+      final message = 'Could not disable background mode: $error';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+      return BackgroundBleToggleResult.failure(message: message);
+    }
+    _backgroundBleEnabled = false;
+    _backgroundNotificationsAllowed = false;
+    await _cancelConnectionRequestNotification();
+    await _stopBackgroundService(force: true);
+    _setBackgroundStatus(BackgroundBleRuntimeStatus.disabled, null);
+    return const BackgroundBleToggleResult.success();
+  }
+
+  Future<void> reconcileBackgroundBle() async {
+    if (_disposed || AppConstants.demoDataEnabled) return;
+    bool enabled;
+    try {
+      enabled = await _ref
+          .read(appSettingsRepositoryProvider)
+          .getBackgroundBleEnabled();
+    } catch (error) {
+      final message = 'Could not load background mode: $error';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+      return;
+    }
+    _backgroundBleEnabled = enabled;
+    if (!enabled) {
+      await _stopBackgroundService(force: true);
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.disabled, null);
+      return;
+    }
+    if (!_availabilityEnabled) {
+      await _stopBackgroundService(force: true);
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.paused,
+        'Background mode starts when BeChat is on.',
+      );
+      return;
+    }
+
+    BackgroundBlePlatformStatus platformStatus;
+    try {
+      platformStatus = await _backgroundService.getStatus();
+    } catch (error) {
+      final message = 'Could not check background mode: $error';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+      return;
+    }
+    if (!platformStatus.supported) {
+      await _stopBackgroundService(force: true);
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.error,
+        'Android background BLE operation is not available on this device.',
+      );
+      return;
+    }
+    _backgroundNotificationsAllowed = platformStatus.notificationsAllowed;
+    if (!platformStatus.notificationsAllowed) {
+      await _stopBackgroundService(force: true);
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.permissionDenied,
+        'Notification permission is required for background messaging.',
+      );
+      return;
+    }
+
+    if (platformStatus.serviceRunning) {
+      _backgroundServiceRunning = true;
+      await _refreshBackgroundServiceState();
+      return;
+    }
+
+    if (!_foreground || !_isBackgroundOperational(state.status)) {
+      _backgroundServiceRunning = false;
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.paused,
+        _foreground
+            ? 'Background mode waits for BeChat to be online.'
+            : 'Background service is not running.',
+      );
+      return;
+    }
+
+    try {
+      await _startBackgroundService();
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.active, null);
+    } catch (error) {
+      final message = 'Could not start background mode: $error';
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+    }
+  }
+
+  Future<void> openNotificationSettings() =>
+      _backgroundService.openNotificationSettings();
+
+  void markBackgroundServiceFailed(String message) {
+    if (_disposed ||
+        (!_backgroundBleEnabled &&
+            !_backgroundStartInFlight &&
+            !_backgroundServiceRunning)) {
+      return;
+    }
+    _backgroundServiceRunning = false;
+    _setBackgroundStatus(BackgroundBleRuntimeStatus.error, message);
+    if (!_foreground) {
+      unawaited(_pauseUnavailableBackground());
+    }
+  }
+
+  Future<void> _pauseUnavailableBackground() async {
+    await _cancelConnectionRequestNotification();
+    await _stopDiscoveryOnly();
+    _resetCandidateTracking();
+    await _closeActiveLink();
+    if (_advertising) {
+      try {
+        await _peripheral.stopAdvertising();
+      } catch (_) {}
+      _advertising = false;
+    }
+    _setState(
+      status: BleRuntimeStatus.idle,
+      isAdvertising: false,
+      clearActiveLink: true,
+    );
+  }
+
   Future<void> setAvailabilityEnabled(bool enabled) {
     if (_disposed || AppConstants.demoDataEnabled) {
       return Future<void>.value();
@@ -274,6 +561,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       if (_disposed || revision != _availabilityRevision) return;
       if (enabled) {
         await ensureStarted();
+        await _syncBackgroundServiceForState(startIfNeeded: true);
       } else {
         await _shutdownAvailability();
       }
@@ -321,6 +609,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
     await _stopAdvertisingForLink();
     await _stopDiscoveryOnly();
+    await _stopBackgroundService();
     _resetBleAfterLoss();
     _resetCandidateTracking(updateState: false);
     _setState(
@@ -329,6 +618,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       isAdvertising: false,
       clearActiveLink: true,
       clearError: true,
+    );
+    _setBackgroundStatus(
+      _backgroundBleEnabled
+          ? BackgroundBleRuntimeStatus.paused
+          : BackgroundBleRuntimeStatus.disabled,
+      _backgroundBleEnabled
+          ? 'Background mode starts when BeChat is on.'
+          : null,
     );
     await _resetOutbox();
   }
@@ -360,7 +657,6 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       return;
     }
     _startAttempted = true;
-    _foreground = true;
     _setState(
       status: BleRuntimeStatus.starting,
       clearError: true,
@@ -419,6 +715,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         clearError: true,
       );
       await _resetOutbox();
+      await _syncBackgroundServiceForState(startIfNeeded: true);
     } on BleStatusProbeException catch (error) {
       _setState(
         status: BleRuntimeStatus.error,
@@ -531,12 +828,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       case BluetoothLowEnergyState.poweredOn:
       case BluetoothLowEnergyState.unknown:
         if (_startFuture != null || !_availabilityEnabled) return;
-        if (_startAttempted && !_initialized && _foreground) {
+        if (_startAttempted && !_initialized && _canContinueBle) {
           unawaited(ensureStarted());
           return;
         }
         if (_initialized &&
-            _foreground &&
+            _canContinueBle &&
             !state.isConnected &&
             state.status != BleRuntimeStatus.connecting) {
           unawaited(_recoverAdvertising());
@@ -606,15 +903,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         return;
       }
       if (_initialized) {
-        if (_foreground &&
-            _availabilityEnabled &&
+        if (_canContinueBle &&
             !state.isConnected &&
             state.status != BleRuntimeStatus.connecting) {
           await _recoverAdvertising();
         }
         return;
       }
-      if (_startAttempted && _foreground && _availabilityEnabled) {
+      if (_startAttempted && _canContinueBle) {
         await ensureStarted();
       }
     } on BleStatusProbeException catch (error) {
@@ -631,7 +927,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> _recoverAdvertising() async {
-    if (_disposed || !_foreground || !_availabilityEnabled || _advertising) {
+    if (_disposed || !_canContinueBle || _advertising) {
       return;
     }
     if (_isTerminalStatus(state.status)) return;
@@ -1033,6 +1329,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     BleHello hello,
     BleLinkSession session,
   ) async {
+    final previousRequest = state.incomingRequest;
+    if (previousRequest != null) {
+      unawaited(_cancelIncomingRequestNotification(previousRequest));
+    }
     final now = DateTime.now();
     final request = IncomingConnectionRequest(
       requestId: const Uuid().v4(),
@@ -1060,6 +1360,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       clearActiveLink: true,
       clearError: true,
     );
+    if (!_foreground) {
+      unawaited(_showIncomingRequestNotification(request));
+    }
   }
 
   Future<BleAckResult> _handleIncoming(BleMessagePayload payload) async {
@@ -1074,6 +1377,11 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     final handler = BleIncomingMessageHandler(
       identity: identity,
       store: BleMessageStore(),
+      onStored: (storedPayload, receipt) => _notifyIncomingMessage(
+        payload: storedPayload,
+        peer: peer,
+        receipt: receipt,
+      ),
     );
     final result = await handler.handle(
       payload,
@@ -1219,11 +1527,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   void _clearIncomingRequest() {
+    final request = state.incomingRequest;
     _incomingRequestTimer?.cancel();
     _incomingRequestTimer = null;
     _incomingRequestSession = null;
-    if (!_disposed && state.incomingRequest != null) {
+    if (!_disposed && request != null) {
       _setState(clearIncomingRequest: true);
+      unawaited(_cancelIncomingRequestNotification(request));
     }
   }
 
@@ -1278,7 +1588,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Future<void> _onLinkReady(BleLinkSession session, BleHello hello) async {
     if (_disposed || _activeSession != session) return;
     _linkEstablishing = false;
-    if (!_foreground || !_availabilityEnabled) {
+    if (!_canContinueBle) {
       await _closeActiveLink();
       return;
     }
@@ -1457,7 +1767,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         final rejected = error is BleHelloRejectedException;
         _setState(
           status: rejected
-              ? (_foreground ? BleRuntimeStatus.ready : BleRuntimeStatus.idle)
+              ? (_canContinueBle
+                    ? BleRuntimeStatus.ready
+                    : BleRuntimeStatus.idle)
               : BleRuntimeStatus.error,
           error: rejected
               ? null
@@ -1494,7 +1806,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
           !_disposed &&
           !_isTerminalStatus(state.status)) {
         _setState(
-          status: _foreground && _availabilityEnabled
+          status: _canContinueBle
               ? BleRuntimeStatus.ready
               : BleRuntimeStatus.idle,
           candidates: const [],
@@ -1523,7 +1835,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         } catch (_) {}
       }
 
-      if (_foreground && _availabilityEnabled && _initialized && !_disposed) {
+      if (_canContinueBle && _initialized && !_disposed) {
         await _recoverAdvertising();
       }
     } finally {
@@ -1593,11 +1905,40 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> pauseForBackground() async {
+    if (_disposed || !_foreground) return;
+    final keepActive =
+        _backgroundBleEnabled &&
+        _backgroundNotificationsAllowed &&
+        _backgroundServiceRunning &&
+        _isBackgroundOperational(state.status);
     _foreground = false;
+    _setState(isForeground: false);
     _clearIncomingRequest();
     await stopScan();
     _resetCandidateTracking();
-    await _closeActiveLink();
+    if (!keepActive) {
+      await _closeActiveLink();
+      if (_advertising) {
+        try {
+          await _peripheral.stopAdvertising();
+        } catch (_) {}
+        _advertising = false;
+      }
+      if (!_disposed) {
+        _setState(
+          status: BleRuntimeStatus.idle,
+          isAdvertising: false,
+          clearActiveLink: true,
+        );
+      }
+      if (_backgroundServiceRunning) {
+        await _stopBackgroundService();
+      } else {
+        await _syncBackgroundServiceForState(startIfNeeded: false);
+      }
+      return;
+    }
+    if (state.isConnected) return;
     if (_advertising) {
       try {
         await _peripheral.stopAdvertising();
@@ -1606,16 +1947,20 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
     if (!_disposed) {
       _setState(
-        status: BleRuntimeStatus.idle,
+        status: BleRuntimeStatus.ready,
         isAdvertising: false,
-        clearActiveLink: true,
+        clearError: true,
       );
     }
+    await _updateBackgroundServiceNotification();
   }
 
   Future<void> resumeFromBackground() async {
     if (_disposed) return;
     _foreground = true;
+    _setState(isForeground: true);
+    await _cancelConnectionRequestNotification();
+    await reconcileBackgroundBle();
     if (!_availabilityEnabled) return;
     final inFlight = _startFuture;
     if (inFlight != null) {
@@ -1687,6 +2032,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         _setState(status: BleRuntimeStatus.error, error: _describeError(error));
       }
     }
+    await reconcileBackgroundBle();
   }
 
   Identity _requireIdentity() {
@@ -1712,6 +2058,244 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     return error.toString();
   }
 
+  bool _isBackgroundOperational(BleRuntimeStatus status) =>
+      status == BleRuntimeStatus.ready ||
+      status == BleRuntimeStatus.scanning ||
+      status == BleRuntimeStatus.connected;
+
+  void _setBackgroundStatus(BackgroundBleRuntimeStatus status, String? error) {
+    if (_disposed) return;
+    state = state.copyWith(
+      backgroundStatus: status,
+      backgroundError: error,
+      clearBackgroundError: error == null,
+    );
+  }
+
+  Future<void> _syncBackgroundServiceForState({
+    required bool startIfNeeded,
+  }) async {
+    if (_disposed) return;
+    if (!_backgroundBleEnabled) {
+      if (_backgroundServiceRunning) await _stopBackgroundService();
+      if (state.backgroundStatus != BackgroundBleRuntimeStatus.disabled) {
+        _setBackgroundStatus(BackgroundBleRuntimeStatus.disabled, null);
+      }
+      return;
+    }
+    if (!_availabilityEnabled) {
+      if (_backgroundServiceRunning) await _stopBackgroundService();
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.paused,
+        'Background mode starts when BeChat is on.',
+      );
+      return;
+    }
+    if (!_backgroundNotificationsAllowed) {
+      if (_backgroundServiceRunning) await _stopBackgroundService();
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.permissionDenied,
+        'Notification permission is required for background messaging.',
+      );
+      return;
+    }
+    if (!_isBackgroundOperational(state.status)) {
+      if (_backgroundServiceRunning) {
+        await _refreshBackgroundServiceState();
+      } else {
+        _setBackgroundStatus(
+          BackgroundBleRuntimeStatus.paused,
+          'Background mode waits for BeChat to be online.',
+        );
+      }
+      return;
+    }
+    if (_backgroundServiceRunning) {
+      _setBackgroundStatus(BackgroundBleRuntimeStatus.active, null);
+      await _updateBackgroundServiceNotification();
+      return;
+    }
+    if (!startIfNeeded || !_foreground) return;
+    try {
+      await _startBackgroundService();
+    } catch (error) {
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.error,
+        'Could not start background mode: ${_describeError(error)}',
+      );
+    }
+  }
+
+  Future<void> _startBackgroundService() async {
+    if (_disposed || _backgroundServiceRunning || _backgroundStartInFlight) {
+      return;
+    }
+    _setBackgroundStatus(BackgroundBleRuntimeStatus.starting, null);
+    _backgroundStartInFlight = true;
+    try {
+      await _backgroundService.startService(
+        statusText: _backgroundNotificationText(state),
+      );
+    } finally {
+      _backgroundStartInFlight = false;
+    }
+    if (_disposed) return;
+    if (state.backgroundStatus == BackgroundBleRuntimeStatus.error) {
+      throw BackgroundBleServiceException(
+        state.backgroundError ?? 'The background service did not start.',
+      );
+    }
+    _backgroundServiceRunning = true;
+    _setBackgroundStatus(BackgroundBleRuntimeStatus.active, null);
+  }
+
+  Future<void> _stopBackgroundService({bool force = false}) async {
+    final wasRunning = _backgroundServiceRunning;
+    _backgroundServiceRunning = false;
+    if (!wasRunning && !force) return;
+    try {
+      await _backgroundService.stopService();
+    } catch (_) {}
+    if (!_disposed && wasRunning) {
+      _setBackgroundStatus(
+        _backgroundBleEnabled
+            ? BackgroundBleRuntimeStatus.paused
+            : BackgroundBleRuntimeStatus.disabled,
+        _backgroundBleEnabled
+            ? 'Background mode starts when BeChat is on.'
+            : null,
+      );
+    }
+  }
+
+  Future<void> _refreshBackgroundServiceState() async {
+    if (_disposed || !_backgroundServiceRunning) return;
+    switch (state.status) {
+      case BleRuntimeStatus.ready:
+      case BleRuntimeStatus.scanning:
+      case BleRuntimeStatus.connected:
+        _setBackgroundStatus(BackgroundBleRuntimeStatus.active, null);
+      case BleRuntimeStatus.idle:
+      case BleRuntimeStatus.bluetoothOff:
+      case BleRuntimeStatus.unauthorized:
+      case BleRuntimeStatus.unsupported:
+        _setBackgroundStatus(
+          BackgroundBleRuntimeStatus.paused,
+          _backgroundStatePauseMessage(state.status),
+        );
+      case BleRuntimeStatus.starting:
+      case BleRuntimeStatus.connecting:
+        _setBackgroundStatus(BackgroundBleRuntimeStatus.starting, null);
+      case BleRuntimeStatus.error:
+        _setBackgroundStatus(
+          BackgroundBleRuntimeStatus.error,
+          state.error ?? 'Background messaging needs attention.',
+        );
+    }
+    await _updateBackgroundServiceNotification();
+  }
+
+  String _backgroundStatePauseMessage(BleRuntimeStatus status) {
+    return switch (status) {
+      BleRuntimeStatus.bluetoothOff =>
+        'Bluetooth is off. Background messaging is paused.',
+      BleRuntimeStatus.unauthorized =>
+        'Bluetooth permission is required. Background messaging is paused.',
+      BleRuntimeStatus.unsupported =>
+        'BLE is unavailable. Background messaging is paused.',
+      BleRuntimeStatus.idle => 'BeChat is off. Background messaging is paused.',
+      _ => 'Background messaging is paused.',
+    };
+  }
+
+  String _backgroundNotificationText(BleRuntimeState current) {
+    return switch (current.status) {
+      BleRuntimeStatus.ready => 'BeChat is available for nearby messaging.',
+      BleRuntimeStatus.scanning =>
+        'BeChat is available. Background scanning is paused.',
+      BleRuntimeStatus.connected =>
+        'Connected to a nearby peer. More messaging is available.',
+      BleRuntimeStatus.starting ||
+      BleRuntimeStatus.connecting => 'Starting nearby messaging...',
+      BleRuntimeStatus.bluetoothOff =>
+        'Bluetooth is off. Background messaging is paused.',
+      BleRuntimeStatus.unauthorized =>
+        'Bluetooth permission is needed. Background messaging is paused.',
+      BleRuntimeStatus.unsupported =>
+        'BLE is unavailable. Background messaging is paused.',
+      BleRuntimeStatus.error =>
+        'Background messaging needs attention. Open BeChat for details.',
+      BleRuntimeStatus.idle => 'BeChat is off. Background messaging is paused.',
+    };
+  }
+
+  Future<void> _updateBackgroundServiceNotification() async {
+    if (_disposed || !_backgroundServiceRunning) return;
+    try {
+      await _backgroundService.updateService(
+        statusText: _backgroundNotificationText(state),
+      );
+    } catch (error) {
+      if (_disposed || !_backgroundServiceRunning) return;
+      _backgroundServiceRunning = false;
+      _setBackgroundStatus(
+        BackgroundBleRuntimeStatus.error,
+        'Background service failed: ${_describeError(error)}',
+      );
+      if (!_foreground) {
+        unawaited(_pauseUnavailableBackground());
+      }
+    }
+  }
+
+  Future<void> _showIncomingRequestNotification(
+    IncomingConnectionRequest request,
+  ) async {
+    if (_disposed || !_backgroundRuntimeActive || _foreground) return;
+    try {
+      await _backgroundService.showConnectionRequestNotification(
+        requestId: request.requestId,
+        peerName: request.displayName,
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _cancelIncomingRequestNotification(
+    IncomingConnectionRequest? request,
+  ) async {
+    if (request == null) return;
+    try {
+      await _backgroundService.cancelConnectionRequestNotification(
+        request.requestId,
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _cancelConnectionRequestNotification() =>
+      _cancelIncomingRequestNotification(state.incomingRequest);
+
+  Future<void> _notifyIncomingMessage({
+    required BleMessagePayload payload,
+    required Peer peer,
+    required BleIncomingReceipt receipt,
+  }) async {
+    if (_disposed || _foreground || !_backgroundRuntimeActive) return;
+    try {
+      final previewsEnabled = await _ref
+          .read(appSettingsRepositoryProvider)
+          .getMessagePreviewsEnabled();
+      await _backgroundService.showMessageNotification(
+        messageId: payload.metadata.messageId,
+        chatId: receipt.chatId,
+        senderName: peer.displayName,
+        body: BackgroundNotificationPolicy.messageBody(
+          previewsEnabled: previewsEnabled,
+          content: payload.content,
+        ),
+      );
+    } catch (_) {}
+  }
+
   void _setState({
     BleRuntimeStatus? status,
     List<BleCandidate>? candidates,
@@ -1722,9 +2306,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     bool? canOpenSettings,
     bool? isAdvertising,
     IncomingConnectionRequest? incomingRequest,
+    bool? isForeground,
+    BackgroundBleRuntimeStatus? backgroundStatus,
+    String? backgroundError,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
+    bool clearBackgroundError = false,
   }) {
     if (_disposed) return;
     state = state.copyWith(
@@ -1737,10 +2325,17 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       canOpenSettings: canOpenSettings,
       isAdvertising: isAdvertising,
       incomingRequest: incomingRequest,
+      isForeground: isForeground,
+      backgroundStatus: backgroundStatus,
+      backgroundError: backgroundError,
       clearActiveLink: clearActiveLink,
       clearError: clearError,
       clearIncomingRequest: clearIncomingRequest,
+      clearBackgroundError: clearBackgroundError,
     );
+    if (_backgroundServiceRunning) {
+      unawaited(_refreshBackgroundServiceState());
+    }
   }
 
   @override

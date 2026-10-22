@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:bechat/core/ble/ble_protocol.dart';
@@ -186,10 +187,21 @@ class BleIncomingMessageHandler {
   BleIncomingMessageHandler({
     required this.identity,
     required BleMessageStore store,
-  }) : _store = store;
+    Future<void> Function(
+      BleMessagePayload payload,
+      BleIncomingReceipt receipt,
+    )?
+    onStored,
+  }) : _store = store,
+       _onStored = onStored;
 
   final Identity identity;
   final BleMessageStore _store;
+  final Future<void> Function(
+    BleMessagePayload payload,
+    BleIncomingReceipt receipt,
+  )?
+  _onStored;
 
   Future<BleAckResult> handle(
     BleMessagePayload payload, {
@@ -218,10 +230,22 @@ class BleIncomingMessageHandler {
     }
 
     final receipt = await _store.storeIncoming(payload: payload, peer: peer);
+    if (receipt.result == BleIncomingResult.stored) {
+      unawaited(_notifyStored(payload, receipt));
+    }
     return switch (receipt.result) {
       BleIncomingResult.stored => BleAckResult.stored,
       BleIncomingResult.duplicate => BleAckResult.duplicate,
       BleIncomingResult.blocked => BleAckResult.rejected,
     };
+  }
+
+  Future<void> _notifyStored(
+    BleMessagePayload payload,
+    BleIncomingReceipt receipt,
+  ) async {
+    try {
+      await _onStored?.call(payload, receipt);
+    } catch (_) {}
   }
 }

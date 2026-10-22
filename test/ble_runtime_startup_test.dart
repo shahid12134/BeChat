@@ -4,8 +4,11 @@ import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/data/models/app_settings.dart';
 import 'package:bechat/data/repositories/app_settings_repository.dart';
 import 'package:bechat/providers/app_settings_providers.dart';
+import 'package:bechat/providers/background_service_provider.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
+import 'package:bechat/services/background/background_action_coordinator.dart';
+import 'package:bechat/services/background/background_ble_service.dart';
 import 'package:bechat/services/ble/ble_runtime.dart';
 import 'package:bechat/services/ble/ble_status_probe.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
@@ -353,6 +356,148 @@ void main() {
   });
 
   test(
+    'enabling background mode starts and disable stops the service',
+    () async {
+      final settings = _FakeAppSettingsRepository();
+      final background = _FakeBackgroundBleService();
+      final harness = _Harness(
+        _FakeStatusProbe(_status()),
+        settings: settings,
+        backgroundService: background,
+      );
+      addTearDown(harness.dispose);
+
+      await harness.controller.ensureStarted();
+      expect(background.starts, 0);
+
+      final enabled = await harness.controller.enableBackgroundBle();
+
+      expect(enabled.succeeded, isTrue);
+      expect(settings.backgroundBleEnabled, isTrue);
+      expect(background.starts, 1);
+      expect(
+        harness.controller.state.backgroundStatus,
+        BackgroundBleRuntimeStatus.active,
+      );
+
+      final disabled = await harness.controller.disableBackgroundBle();
+
+      expect(disabled.succeeded, isTrue);
+      expect(settings.backgroundBleEnabled, isFalse);
+      expect(background.stops, 1);
+      expect(
+        harness.controller.state.backgroundStatus,
+        BackgroundBleRuntimeStatus.disabled,
+      );
+    },
+  );
+
+  test('background mode requires notification permission', () async {
+    final settings = _FakeAppSettingsRepository();
+    final background = _FakeBackgroundBleService()
+      ..notificationsAllowed = false
+      ..requestGranted = false;
+    final harness = _Harness(
+      _FakeStatusProbe(_status()),
+      settings: settings,
+      backgroundService: background,
+    );
+    addTearDown(harness.dispose);
+
+    final result = await harness.controller.enableBackgroundBle();
+
+    expect(result.succeeded, isFalse);
+    expect(result.permissionDenied, isTrue);
+    expect(settings.backgroundBleEnabled, isFalse);
+    expect(background.starts, 0);
+    expect(
+      harness.controller.state.backgroundStatus,
+      BackgroundBleRuntimeStatus.permissionDenied,
+    );
+  });
+
+  test('background pause keeps the service but stops advertising', () async {
+    final background = _FakeBackgroundBleService();
+    final harness = _Harness(
+      _FakeStatusProbe(_status()),
+      backgroundService: background,
+    );
+    addTearDown(harness.dispose);
+
+    await harness.controller.ensureStarted();
+    await harness.controller.enableBackgroundBle();
+    expect(background.starts, 1);
+
+    await harness.controller.pauseForBackground();
+
+    expect(harness.controller.state.isForeground, isFalse);
+    expect(harness.controller.state.status, BleRuntimeStatus.ready);
+    expect(harness.controller.state.isAdvertising, isFalse);
+    expect(
+      harness.controller.state.backgroundStatus,
+      BackgroundBleRuntimeStatus.active,
+    );
+    expect(background.stops, 0);
+    verify(harness.peripheral.stopAdvertising()).called(1);
+
+    await harness.controller.resumeFromBackground();
+
+    expect(harness.controller.state.isForeground, isTrue);
+    expect(harness.controller.state.status, BleRuntimeStatus.ready);
+    expect(harness.controller.state.isAdvertising, isTrue);
+    expect(background.starts, 1);
+  });
+
+  test(
+    'service failure is surfaced without claiming background is active',
+    () async {
+      final background = _FakeBackgroundBleService();
+      final harness = _Harness(
+        _FakeStatusProbe(_status()),
+        backgroundService: background,
+      );
+      addTearDown(harness.dispose);
+
+      await harness.controller.ensureStarted();
+      await harness.controller.enableBackgroundBle();
+      expect(harness.controller.state.isBackgroundServiceActive, isTrue);
+
+      harness.controller.markBackgroundServiceFailed('Service stopped');
+
+      expect(
+        harness.controller.state.backgroundStatus,
+        BackgroundBleRuntimeStatus.error,
+      );
+      expect(harness.controller.state.isBackgroundServiceActive, isFalse);
+      expect(harness.controller.state.backgroundError, 'Service stopped');
+    },
+  );
+
+  test('notification request actions are routed to the runtime', () async {
+    final background = _FakeBackgroundBleService();
+    final harness = _Harness(
+      _FakeStatusProbe(_status()),
+      backgroundService: background,
+    );
+    addTearDown(harness.dispose);
+    final coordinator = harness.container.read(
+      backgroundActionCoordinatorProvider,
+    );
+    await coordinator.initialize();
+
+    background.emit(
+      const BackgroundBleEvent(
+        type: BackgroundBleEventType.acceptConnectionRequest,
+        eventId: 'event-accept',
+        requestId: 'missing-request',
+      ),
+    );
+    await pumpEventQueue();
+
+    expect(background.cancelledRequests, contains('missing-request'));
+  });
+
+  test(
     'scan keeps candidates and expires them after the configured window',
     () async {
       final now = DateTime(2026, 1, 1, 12);
@@ -462,17 +607,20 @@ class _Harness {
     Duration permissionTimeout = const Duration(milliseconds: 100),
     bool availabilityEnabled = true,
     _FakeAppSettingsRepository? settings,
+    _FakeBackgroundBleService? backgroundService,
     Duration candidateExpiration = const Duration(seconds: 10),
     Duration candidateCleanupInterval = const Duration(seconds: 2),
     DateTime Function()? clock,
   }) {
     _stubManagers();
+    background = backgroundService ?? _FakeBackgroundBleService();
     container = ProviderContainer(
       overrides: [
         localDeviceIdProvider.overrideWithValue(null),
         appSettingsRepositoryProvider.overrideWithValue(
           settings ?? _FakeAppSettingsRepository(),
         ),
+        backgroundBleServiceProvider.overrideWithValue(background),
         bleRuntimeProvider.overrideWith(
           (ref) => BleRuntimeController(
             ref,
@@ -485,6 +633,7 @@ class _Harness {
             candidateExpiration: candidateExpiration,
             candidateCleanupInterval: candidateCleanupInterval,
             clock: clock,
+            backgroundBleService: background,
           ),
         ),
       ],
@@ -502,6 +651,7 @@ class _Harness {
 
   late final ProviderContainer container;
   late final BleRuntimeController controller;
+  late final _FakeBackgroundBleService background;
 
   void _stubManagers() {
     when(central.state).thenReturn(BluetoothLowEnergyState.unauthorized);
@@ -543,6 +693,7 @@ class _Harness {
     await centralStates.close();
     await peripheralStates.close();
     await discovered.close();
+    await background._events.close();
   }
 }
 
@@ -550,10 +701,16 @@ class _FakeAppSettingsRepository extends AppSettingsRepository {
   _FakeAppSettingsRepository({this.bleEnabled = false});
 
   bool bleEnabled;
+  bool backgroundBleEnabled = false;
+  bool messagePreviewsEnabled = false;
 
   @override
   Future<AppSettings> loadSettings() async {
-    return AppSettings(bleEnabled: bleEnabled);
+    return AppSettings(
+      bleEnabled: bleEnabled,
+      backgroundBleEnabled: backgroundBleEnabled,
+      messagePreviewsEnabled: messagePreviewsEnabled,
+    );
   }
 
   @override
@@ -563,8 +720,108 @@ class _FakeAppSettingsRepository extends AppSettingsRepository {
   Future<bool> getAllowNewConnections() async => true;
 
   @override
+  Future<bool> getBackgroundBleEnabled() async => backgroundBleEnabled;
+
+  @override
+  Future<bool> getMessagePreviewsEnabled() async => messagePreviewsEnabled;
+
+  @override
   Future<void> setBleEnabled(bool value) async {
     bleEnabled = value;
+  }
+
+  @override
+  Future<void> setBackgroundBleEnabled(bool value) async {
+    backgroundBleEnabled = value;
+  }
+
+  @override
+  Future<void> setMessagePreviewsEnabled(bool value) async {
+    messagePreviewsEnabled = value;
+  }
+}
+
+class _FakeBackgroundBleService implements BackgroundBleService {
+  final StreamController<BackgroundBleEvent> _events =
+      StreamController<BackgroundBleEvent>.broadcast();
+  final List<String> messageBodies = [];
+  final List<String> cancelledRequests = [];
+
+  bool supported = true;
+  bool notificationsAllowed = true;
+  bool requestGranted = true;
+  bool serviceRunning = false;
+  int starts = 0;
+  int stops = 0;
+  int updates = 0;
+  int openedSettings = 0;
+
+  @override
+  Stream<BackgroundBleEvent> get events => _events.stream;
+
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  Future<BackgroundBlePlatformStatus> getStatus() async {
+    return BackgroundBlePlatformStatus(
+      supported: supported,
+      notificationsAllowed: notificationsAllowed,
+      serviceRunning: serviceRunning,
+    );
+  }
+
+  @override
+  Future<bool> requestNotificationPermission() async {
+    notificationsAllowed = requestGranted;
+    return requestGranted;
+  }
+
+  @override
+  Future<void> openNotificationSettings() async {
+    openedSettings++;
+  }
+
+  @override
+  Future<void> startService({required String statusText}) async {
+    starts++;
+    serviceRunning = true;
+  }
+
+  @override
+  Future<void> updateService({required String statusText}) async {
+    updates++;
+  }
+
+  @override
+  Future<void> stopService() async {
+    stops++;
+    serviceRunning = false;
+  }
+
+  @override
+  Future<void> showMessageNotification({
+    required String messageId,
+    required String chatId,
+    required String senderName,
+    required String body,
+  }) async {
+    messageBodies.add(body);
+  }
+
+  @override
+  Future<void> showConnectionRequestNotification({
+    required String requestId,
+    required String peerName,
+  }) async {}
+
+  @override
+  Future<void> cancelConnectionRequestNotification(String requestId) async {
+    cancelledRequests.add(requestId);
+  }
+
+  void emit(BackgroundBleEvent event) {
+    _events.add(event);
   }
 }
 

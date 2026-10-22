@@ -26,7 +26,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      unawaited(ref.read(bleRuntimeProvider.notifier).reconcileAvailability());
+      final ble = ref.read(bleRuntimeProvider.notifier);
+      unawaited(ble.reconcileAvailability());
+      unawaited(ble.reconcileBackgroundBle());
     });
   }
 

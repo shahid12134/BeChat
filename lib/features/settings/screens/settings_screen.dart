@@ -1,10 +1,16 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:bechat/data/models/app_settings.dart';
+import 'package:bechat/providers/app_settings_providers.dart';
+import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/services/ble/ble_runtime.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
@@ -16,6 +22,7 @@ class SettingsScreen extends ConsumerStatefulWidget {
 class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   final _nameController = TextEditingController();
   bool _isEditingName = false;
+  bool _backgroundBusy = false;
 
   @override
   void dispose() {
@@ -27,6 +34,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Widget build(BuildContext context) {
     final identityAsync = ref.watch(identityProvider);
     final dbInfoAsync = ref.watch(databaseInfoProvider);
+    final runtime = ref.watch(bleRuntimeProvider);
+    final settings = ref.watch(appSettingsProvider).valueOrNull;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -34,6 +43,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         children: [
           // Profile section
           _buildProfileSection(context, identityAsync),
+          const Divider(height: 1),
+
+          _buildBackgroundSection(context, runtime, settings),
           const Divider(height: 1),
 
           // Database info
@@ -101,6 +113,130 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         leading: const CircleAvatar(child: Icon(Icons.error)),
         title: const Text('Error loading profile'),
         subtitle: Text('$e'),
+      ),
+    );
+  }
+
+  Widget _buildBackgroundSection(
+    BuildContext context,
+    BleRuntimeState runtime,
+    AppSettings? settings,
+  ) {
+    final enabled = settings?.backgroundBleEnabled == true;
+    final previewsEnabled = settings?.messagePreviewsEnabled == true;
+    final permissionDenied =
+        runtime.backgroundStatus == BackgroundBleRuntimeStatus.permissionDenied;
+    final needsAttention =
+        runtime.backgroundStatus == BackgroundBleRuntimeStatus.error;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+          child: Text(
+            'Background',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.notifications_active_outlined),
+          title: const Text('Background messaging'),
+          subtitle: Text(_backgroundStatusText(runtime)),
+          trailing: Switch.adaptive(
+            value: enabled,
+            onChanged: _backgroundBusy
+                ? null
+                : (value) => unawaited(_toggleBackground(value)),
+          ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.visibility_outlined),
+          title: const Text('Message previews'),
+          subtitle: const Text(
+            'Show message text in notifications. Sender names are always shown.',
+          ),
+          trailing: Switch.adaptive(
+            value: previewsEnabled,
+            onChanged: settings == null
+                ? null
+                : (value) => ref
+                      .read(appSettingsProvider.notifier)
+                      .setMessagePreviewsEnabled(value),
+          ),
+        ),
+        if (permissionDenied)
+          ListTile(
+            leading: const Icon(Icons.notifications_off_outlined),
+            title: const Text('Notification permission needed'),
+            subtitle: const Text(
+              'Android requires a visible notification for background mode.',
+            ),
+            trailing: TextButton(
+              onPressed: () => ref
+                  .read(bleRuntimeProvider.notifier)
+                  .openNotificationSettings(),
+              child: const Text('Open settings'),
+            ),
+          ),
+        if (needsAttention)
+          ListTile(
+            leading: const Icon(Icons.error_outline),
+            title: const Text('Background mode needs attention'),
+            trailing: TextButton(
+              onPressed: () => ref
+                  .read(bleRuntimeProvider.notifier)
+                  .reconcileBackgroundBle(),
+              child: const Text('Retry'),
+            ),
+          ),
+        const ListTile(
+          leading: Icon(Icons.battery_saver_outlined),
+          title: Text('Android battery limits'),
+          subtitle: Text(
+            'Android may pause background work to save battery. Keep BeChat '
+            'open for the most reliable nearby messaging.',
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _backgroundStatusText(BleRuntimeState runtime) {
+    final error = runtime.backgroundError;
+    return switch (runtime.backgroundStatus) {
+      BackgroundBleRuntimeStatus.disabled =>
+        'Off. Nearby messaging pauses when BeChat leaves the foreground.',
+      BackgroundBleRuntimeStatus.starting => 'Starting background mode...',
+      BackgroundBleRuntimeStatus.active =>
+        'On. BeChat can receive nearby messages while minimized.',
+      BackgroundBleRuntimeStatus.paused =>
+        error ?? 'Paused. Background mode starts when BeChat is online.',
+      BackgroundBleRuntimeStatus.permissionDenied =>
+        error ?? 'Notification permission is required.',
+      BackgroundBleRuntimeStatus.error =>
+        error ?? 'Background mode stopped. Open BeChat to restart.',
+    };
+  }
+
+  Future<void> _toggleBackground(bool enabled) async {
+    setState(() => _backgroundBusy = true);
+    final runtime = ref.read(bleRuntimeProvider.notifier);
+    final result = enabled
+        ? await runtime.enableBackgroundBle()
+        : await runtime.disableBackgroundBle();
+    if (!mounted) return;
+    setState(() => _backgroundBusy = false);
+    final message = result.message;
+    if (message == null || message.isEmpty) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        action: result.permissionDenied
+            ? SnackBarAction(
+                label: 'Settings',
+                onPressed: runtime.openNotificationSettings,
+              )
+            : null,
       ),
     );
   }
