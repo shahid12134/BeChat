@@ -8,8 +8,10 @@ Wi-Fi Direct and adaptive cloud switching.**
 **Phase 2: Direct Offline BLE Text Messaging.** BeChat can advertise, scan,
 connect, exchange application identities over a GATT link, and send text
 messages of up to 4096 UTF-8 bytes between two foreground Android phones.
-Delivery is acknowledged end-to-end with an application ACK; messages remain
-queued until the intended peer is connected and acknowledges them.
+Unknown inbound devices must be approved before a link is usable, and the
+Nearby screen includes a persistent **Allow New Connections** switch. Delivery
+is acknowledged end-to-end with an application ACK; messages remain queued
+until the intended peer is connected and acknowledges them.
 
 This phase does **not** provide message encryption, cryptographic peer
 authentication, background delivery, multi-hop mesh routing, store-and-forward
@@ -60,6 +62,7 @@ lib/
     database/
       database_helper.dart           # SQLite database initialization
     models/
+      app_settings.dart              # Persistent application preferences
       peer.dart                      # Peer data model
       chat.dart                      # Chat data model
       message.dart                   # Message data model
@@ -84,6 +87,8 @@ lib/
       ble_runtime.dart               # Android permissions, GATT, links, UI state
       ble_message_store.dart         # Atomic incoming message persistence
       ble_outbox.dart                # Queued delivery and bounded retries
+      incoming_connection_policy.dart # Inbound peer approval decisions
+      incoming_connection_request.dart # Pending approval request model
   providers/
     app_settings_providers.dart      # Persistent application settings state
     ble_providers.dart               # BLE runtime state provider
@@ -101,6 +106,7 @@ lib/
     peers/
       screens/peer_discovery_screen.dart # Nearby peers scan
       screens/peer_details_screen.dart   # Peer info/pairing UI
+      widgets/incoming_request_dialog.dart # Incoming connection prompt
       widgets/peer_list_item.dart    # Peer list item widget
     settings/
       screens/settings_screen.dart   # App settings/info
@@ -141,8 +147,9 @@ through typed repository methods and survive application restarts.
 | `background_ble_enabled` | `false` | Opt-in preference for future background operation |
 | `message_previews_enabled` | `false` | Whether future notifications may show message contents |
 
-These values are preferences only. They do not start BLE, run background
-services, or enable notifications in this stage.
+`allow_new_connections` is enforced for unknown inbound peers. The other values
+are preferences only: they do not start BLE, run background services, or enable
+notifications in this stage.
 
 ---
 
@@ -231,9 +238,31 @@ can initiate a connection.
 3. Grant the Android **Nearby devices** permission when prompted. Android 11
    and earlier also require location permission for BLE scanning.
 4. Tap a discovered BeChat device on one phone.
-5. Wait for the GATT connection and application HELLO handshake. The peer is
-   saved only after a valid HELLO and is shown in **Saved Peers**.
-6. Open the peer's chat and send text.
+5. Wait for the GATT connection and application HELLO handshake. A saved peer
+   reconnects directly; an unknown peer triggers a connection request dialog on
+   the receiving phone.
+6. On the receiving phone, choose **Accept**, **Decline**, or **Block**. The
+   peer is saved only after acceptance and is then shown in **Saved Peers**.
+7. Open the peer's chat and send text.
+
+### Incoming Connection Approval
+
+- **Allow New Connections** in Nearby defaults to on and persists across
+  restarts. Turning it off rejects unknown inbound peers but still allows
+  saved, unblocked peers to reconnect.
+- A request expires after 30 seconds. Declining rejects the link and suppresses
+  new prompts from that device for about 60 seconds. The cooldown is in memory
+  only.
+- Blocking an unknown requester saves a blocked peer record, so later HELLO
+  attempts are rejected and the existing block/unblock flow still applies.
+- Messages received before approval receive a rejected ACK and are not stored.
+- Request dialogs are disabled for barrier/back dismissal, but the request can
+  expire or be cancelled by turning new connections off.
+- The pending request is not persisted, marked online, or shown as an approved
+  peer before acceptance.
+- Device names and IDs come from the other phone. They are not
+  cryptographically authenticated, and a device can present a different ID.
+  Blocking is an application-level control, not a cryptographic ban.
 
 Delivery behavior:
 

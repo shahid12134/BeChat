@@ -114,18 +114,55 @@ class PeerRepository {
     await db.delete('peers', where: 'peer_id = ?', whereArgs: [peerId]);
   }
 
-  Future<void> blockPeer(String peerId) async {
+  Future<void> blockPeer(
+    String peerId, {
+    String? displayName,
+    String? deviceName,
+    int? signalStrength,
+  }) async {
     final db = await _db;
-    await db.update(
-      'peers',
-      {
-        'is_blocked': 1,
-        'status': 'blocked',
-        'updated_at': DateTime.now().toIso8601String(),
-      },
-      where: 'peer_id = ?',
-      whereArgs: [peerId],
-    );
+    final now = DateTime.now();
+    await db.transaction((txn) async {
+      final existing = await txn.query(
+        'peers',
+        columns: ['id'],
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        limit: 1,
+      );
+      if (existing.isEmpty) {
+        final blocked = Peer(
+          id: const Uuid().v4(),
+          peerId: peerId,
+          displayName: _nonEmpty(displayName) ?? 'Blocked peer',
+          deviceName: _nonEmpty(deviceName) ?? 'BeChat device',
+          status: PeerStatus.blocked,
+          signalStrength: signalStrength,
+          firstSeen: now,
+          lastSeen: now,
+          isBlocked: true,
+          createdAt: now,
+          updatedAt: now,
+        );
+        await txn.insert('peers', blocked.toMap());
+        return;
+      }
+      await txn.update(
+        'peers',
+        {
+          'is_blocked': 1,
+          'status': PeerStatus.blocked.name,
+          'updated_at': now.toIso8601String(),
+        },
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+      );
+    });
+  }
+
+  String? _nonEmpty(String? value) {
+    final trimmed = value?.trim();
+    return trimmed == null || trimmed.isEmpty ? null : trimmed;
   }
 
   Future<void> unblockPeer(String peerId) async {

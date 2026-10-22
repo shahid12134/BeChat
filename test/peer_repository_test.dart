@@ -125,6 +125,25 @@ void main() {
     },
   );
 
+  test('blocking an unknown peer persists a safe blocked record', () async {
+    await repository.blockPeer(
+      'peer-unknown-009',
+      displayName: 'Unknown Device',
+      deviceName: 'Nearby Phone',
+      signalStrength: -72,
+    );
+
+    final peer = await repository.getPeerByPeerId('peer-unknown-009');
+    expect(peer, isNotNull);
+    expect(peer!.displayName, 'Unknown Device');
+    expect(peer.deviceName, 'Nearby Phone');
+    expect(peer.status, PeerStatus.blocked);
+    expect(peer.isBlocked, isTrue);
+    expect(peer.signalStrength, -72);
+    expect(peer.firstSeen, isNotNull);
+    expect(peer.lastSeen, isNotNull);
+  });
+
   test('foreign keys remain valid after peer operations', () async {
     await repository.upsertPeer(
       const Peer(

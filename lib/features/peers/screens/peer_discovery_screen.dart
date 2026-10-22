@@ -3,9 +3,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/core/widgets/empty_state.dart';
+import 'package:bechat/data/models/app_settings.dart';
 import 'package:bechat/data/models/ble_candidate.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/features/peers/widgets/peer_list_item.dart';
+import 'package:bechat/providers/app_settings_providers.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
@@ -24,6 +26,7 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
   late AnimationController _scanController;
   Object? _scanError;
   String? _connectingId;
+  bool _savingConnectionSetting = false;
 
   @override
   void initState() {
@@ -119,6 +122,25 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     if (mounted) context.push('/chat/${chat.chatId}');
   }
 
+  Future<void> _setAllowNewConnections(bool value) async {
+    if (_savingConnectionSetting) return;
+    setState(() => _savingConnectionSetting = true);
+    try {
+      await ref
+          .read(appSettingsProvider.notifier)
+          .setAllowNewConnections(value);
+      if (!value) {
+        await ref
+            .read(bleRuntimeProvider.notifier)
+            .declinePendingIncomingRequest();
+      }
+    } catch (error) {
+      _showError('Could not save the connection setting: $error');
+    } finally {
+      if (mounted) setState(() => _savingConnectionSetting = false);
+    }
+  }
+
   void _showError(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(
@@ -145,6 +167,7 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
         : bleState.status == BleRuntimeStatus.scanning;
     final discoveredPeers = ref.watch(discoveredPeersProvider);
     final allPeersAsync = ref.watch(peerListProvider);
+    final appSettingsAsync = ref.watch(appSettingsProvider);
 
     return Scaffold(
       appBar: AppBar(
@@ -182,6 +205,7 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
                 ),
               ),
             ),
+          if (!demoEnabled) _buildConnectionSettings(context, appSettingsAsync),
           if (!demoEnabled)
             ConstrainedBox(
               constraints: BoxConstraints(
@@ -225,6 +249,31 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
                 : _buildRealContent(context, bleState, allPeersAsync),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionSettings(
+    BuildContext context,
+    AsyncValue<AppSettings> settingsAsync,
+  ) {
+    final settings = settingsAsync.valueOrNull;
+    return Card(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      child: SwitchListTile(
+        secondary: const Icon(Icons.person_add_alt_1),
+        title: const Text('Allow New Connections'),
+        subtitle: Text(
+          settingsAsync.hasError
+              ? 'Could not load this setting. Restart BeChat and try again.'
+              : 'Allow unknown nearby devices to request a connection.',
+        ),
+        value:
+            settings?.allowNewConnections ??
+            AppConstants.defaultAllowNewConnections,
+        onChanged: settings == null || _savingConnectionSetting
+            ? null
+            : _setAllowNewConnections,
       ),
     );
   }
@@ -320,17 +369,6 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen>
     }
     if (bleState.status == BleRuntimeStatus.starting) {
       return const LinearProgressIndicator(minHeight: 2);
-    }
-    if (bleState.status == BleRuntimeStatus.idle) {
-      return _statusCard(
-        icon: Icons.bluetooth_searching,
-        title: 'Direct BLE messaging is off',
-        message:
-            'Tap Scan to advertise this phone and look for nearby BeChat '
-            'devices. Both phones must be open in the foreground.',
-        actionLabel: 'Scan for Peers',
-        onAction: _startScan,
-      );
     }
     return const SizedBox.shrink();
   }

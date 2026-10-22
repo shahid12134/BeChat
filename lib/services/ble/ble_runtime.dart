@@ -10,6 +10,7 @@ import 'package:bechat/data/models/ble_candidate.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
+import 'package:bechat/providers/app_settings_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
@@ -17,8 +18,11 @@ import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
 import 'package:bechat/services/ble/ble_outbox.dart';
 import 'package:bechat/services/ble/ble_status_probe.dart';
+import 'package:bechat/services/ble/incoming_connection_policy.dart';
+import 'package:bechat/services/ble/incoming_connection_request.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:uuid/uuid.dart';
 
 enum BleRuntimeStatus {
   idle,
@@ -71,6 +75,7 @@ class BleRuntimeState {
     this.error,
     this.canOpenSettings = false,
     this.isAdvertising = false,
+    this.incomingRequest,
   });
 
   final BleRuntimeStatus status;
@@ -81,6 +86,7 @@ class BleRuntimeState {
   final String? error;
   final bool canOpenSettings;
   final bool isAdvertising;
+  final IncomingConnectionRequest? incomingRequest;
 
   bool get isConnected =>
       status == BleRuntimeStatus.connected && activePeerId != null;
@@ -94,8 +100,10 @@ class BleRuntimeState {
     String? error,
     bool? canOpenSettings,
     bool? isAdvertising,
+    IncomingConnectionRequest? incomingRequest,
     bool clearActiveLink = false,
     bool clearError = false,
+    bool clearIncomingRequest = false,
   }) {
     return BleRuntimeState(
       status: status ?? this.status,
@@ -108,6 +116,9 @@ class BleRuntimeState {
       error: clearError ? null : error ?? this.error,
       canOpenSettings: canOpenSettings ?? this.canOpenSettings,
       isAdvertising: isAdvertising ?? this.isAdvertising,
+      incomingRequest: clearIncomingRequest
+          ? null
+          : incomingRequest ?? this.incomingRequest,
     );
   }
 }
@@ -161,6 +172,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final Map<String, List<Uint8List>> _pendingCentralWrites = {};
 
   Timer? _scanTimer;
+  Timer? _incomingRequestTimer;
+  BleLinkSession? _incomingRequestSession;
+  final Map<String, DateTime> _declinedUntil = {};
   Future<void>? _startFuture;
   bool _startAttempted = false;
   bool _permissionCheckInFlight = false;
@@ -412,6 +426,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   void _resetBleAfterLoss() {
     _scanTimer?.cancel();
     _scanTimer = null;
+    _clearIncomingRequest();
     _discovering = false;
     _advertising = false;
     _serviceAdded = false;
@@ -551,6 +566,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await ensureStarted();
     if (_disposed ||
         state.isConnected ||
+        _activeSession != null ||
+        _linkEstablishing ||
         state.status == BleRuntimeStatus.scanning ||
         state.status == BleRuntimeStatus.connecting) {
       return;
@@ -759,11 +776,49 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> _handleHello(BleHello hello) async {
+    final session = _activeSession;
+    if (session == null) {
+      throw const BleLinkException('The BLE link closed during the handshake');
+    }
     final peerRepository = _ref.read(peerRepositoryProvider);
     final existing = await peerRepository.getPeerByPeerId(hello.deviceId);
-    if (existing?.isBlocked == true) {
-      throw const BleLinkException('Peer is blocked');
+    final now = DateTime.now();
+    _declinedUntil.removeWhere((_, until) => !until.isAfter(now));
+    final allowNewConnections = await _ref
+        .read(appSettingsRepositoryProvider)
+        .getAllowNewConnections();
+    if (!identical(_activeSession, session)) {
+      throw const BleLinkException('The BLE link closed during the handshake');
     }
+
+    final decision = decideIncomingConnection(
+      locallyInitiated: _activeRole == BleLinkRole.central,
+      existingPeer: existing,
+      allowNewConnections: allowNewConnections,
+      now: now,
+      declinedUntil: _declinedUntil[hello.deviceId],
+    );
+    switch (decision) {
+      case IncomingConnectionDecision.approve:
+        await _approveHello(hello, existing, session);
+      case IncomingConnectionDecision.requestApproval:
+        await _beginIncomingRequest(hello, session);
+      case IncomingConnectionDecision.rejectBlocked:
+        throw const BleLinkException('Peer is blocked');
+      case IncomingConnectionDecision.rejectDisabled:
+        throw const BleLinkException('New connection requests are turned off');
+      case IncomingConnectionDecision.rejectCooldown:
+        throw const BleLinkException(
+          'This device recently declined a connection request',
+        );
+    }
+  }
+
+  Future<void> _approveHello(
+    BleHello hello,
+    Peer? existing,
+    BleLinkSession session,
+  ) async {
     final now = DateTime.now();
     final peer = Peer(
       peerId: hello.deviceId,
@@ -777,23 +832,65 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       createdAt: existing?.createdAt,
       updatedAt: now,
     );
-    await peerRepository.upsertPeer(peer);
+    await _ref.read(peerRepositoryProvider).upsertPeer(peer);
+    if (_disposed ||
+        !identical(_activeSession, session) ||
+        session.state == BleSessionState.closed) {
+      await _markPeerOffline(peer.peerId);
+      return;
+    }
     _activePeer = peer;
     _remoteDeviceName = peer.deviceName;
-    if (!_disposed) {
-      _setState(
-        activePeerId: peer.peerId,
-        activePeerName: peer.displayName,
-        activeRole: _activeRole,
-      );
-      unawaited(_refreshPeers());
-    }
+    _setState(
+      activePeerId: peer.peerId,
+      activePeerName: peer.displayName,
+      activeRole: _activeRole,
+      clearIncomingRequest: true,
+    );
+    unawaited(_refreshPeers());
+  }
+
+  Future<void> _beginIncomingRequest(
+    BleHello hello,
+    BleLinkSession session,
+  ) async {
+    final now = DateTime.now();
+    final request = IncomingConnectionRequest(
+      requestId: const Uuid().v4(),
+      peerId: hello.deviceId,
+      displayName: hello.displayName,
+      deviceName: _remoteDeviceName ?? 'BeChat device',
+      signalStrength: _remoteRssi,
+      requestedAt: now,
+      expiresAt: now.add(AppConstants.incomingRequestTimeout),
+    );
+    _incomingRequestSession = session;
+    _incomingRequestTimer?.cancel();
+    _incomingRequestTimer = Timer(AppConstants.incomingRequestTimeout, () {
+      final current = state.incomingRequest;
+      if (current?.requestId == request.requestId) {
+        unawaited(_declineRequest(current!, applyCooldown: false));
+      }
+    });
+    _setState(
+      status: BleRuntimeStatus.ready,
+      candidates: const [],
+      incomingRequest: request,
+      isAdvertising: false,
+      clearActiveLink: true,
+      clearError: true,
+    );
   }
 
   Future<BleAckResult> _handleIncoming(BleMessagePayload payload) async {
     final peer = _activePeer;
     final identity = _ref.read(identityProvider).valueOrNull;
     if (peer == null || identity == null) {
+      if (state.incomingRequest != null) {
+        throw const BleLinkException(
+          'The connection request is awaiting approval',
+        );
+      }
       throw const BleLinkException('The BLE link has no validated peer');
     }
     final handler = BleIncomingMessageHandler(
@@ -807,6 +904,157 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     );
     unawaited(_refreshIncoming(peer));
     return result;
+  }
+
+  Future<void> acceptIncomingRequest(String requestId) async {
+    final request = _currentIncomingRequest(requestId);
+    if (request == null) {
+      throw const BleLinkException(
+        'This connection request is no longer available',
+      );
+    }
+    final session = _activeSession;
+    if (session == null || !session.isReady) {
+      _clearIncomingRequest();
+      throw const BleLinkException('The BLE link is no longer active');
+    }
+
+    final peerRepository = _ref.read(peerRepositoryProvider);
+    final existing = await peerRepository.getPeerByPeerId(request.peerId);
+    if (existing?.isBlocked == true || existing?.status == PeerStatus.blocked) {
+      _clearIncomingRequest();
+      await _closeActiveLink();
+      throw const BleLinkException('Peer is blocked');
+    }
+
+    final now = DateTime.now();
+    final peer = Peer(
+      peerId: request.peerId,
+      displayName: request.displayName,
+      deviceName: request.deviceName,
+      status: PeerStatus.online,
+      signalStrength: request.signalStrength,
+      firstSeen: existing?.firstSeen ?? now,
+      lastSeen: now,
+      publicKey: existing?.publicKey,
+      createdAt: existing?.createdAt,
+      updatedAt: now,
+    );
+    await peerRepository.upsertPeer(peer);
+    if (_disposed || !identical(_activeSession, session) || !session.isReady) {
+      await _markPeerOffline(peer.peerId);
+      _clearIncomingRequest();
+      throw const BleLinkException('The BLE link closed before approval');
+    }
+
+    _activePeer = peer;
+    _remoteDeviceName = peer.deviceName;
+    _clearIncomingRequest();
+    _setState(
+      status: BleRuntimeStatus.connected,
+      candidates: const [],
+      activePeerId: peer.peerId,
+      activePeerName: peer.displayName,
+      activeRole: _activeRole,
+      isAdvertising: false,
+      clearError: true,
+      clearIncomingRequest: true,
+    );
+    try {
+      await _ref.read(chatRepositoryProvider).getOrCreateChatForPeer(peer);
+      await _ref.read(chatListProvider.notifier).refreshChats();
+    } catch (_) {}
+    unawaited(_refreshPeers());
+    unawaited(requestDelivery(peer.peerId));
+  }
+
+  Future<void> declineIncomingRequest(String requestId) async {
+    final request = _currentIncomingRequest(requestId);
+    if (request == null) {
+      throw const BleLinkException(
+        'This connection request is no longer available',
+      );
+    }
+    await _declineRequest(request, applyCooldown: true);
+  }
+
+  Future<void> declinePendingIncomingRequest() async {
+    final request = state.incomingRequest;
+    if (request == null) return;
+    try {
+      await declineIncomingRequest(request.requestId);
+    } catch (_) {}
+  }
+
+  Future<void> blockIncomingRequest(String requestId) async {
+    final request = _currentIncomingRequest(requestId);
+    if (request == null) {
+      throw const BleLinkException(
+        'This connection request is no longer available',
+      );
+    }
+    final session = _activeSession;
+    await _ref
+        .read(peerRepositoryProvider)
+        .blockPeer(
+          request.peerId,
+          displayName: request.displayName,
+          deviceName: request.deviceName,
+          signalStrength: request.signalStrength,
+        );
+    _clearIncomingRequest();
+    unawaited(_refreshPeers());
+    if (session != null && identical(_activeSession, session)) {
+      await _closeActiveLink();
+    }
+  }
+
+  IncomingConnectionRequest? _currentIncomingRequest(String requestId) {
+    final request = state.incomingRequest;
+    if (request == null || request.requestId != requestId) return null;
+    if (request.isExpired) {
+      unawaited(_declineRequest(request, applyCooldown: false));
+      return null;
+    }
+    final session = _activeSession;
+    if (session == null ||
+        !session.isReady ||
+        !identical(session, _incomingRequestSession)) {
+      _clearIncomingRequest();
+      return null;
+    }
+    return request;
+  }
+
+  Future<void> _declineRequest(
+    IncomingConnectionRequest request, {
+    required bool applyCooldown,
+  }) async {
+    if (applyCooldown) {
+      _declinedUntil[request.peerId] = DateTime.now().add(
+        AppConstants.declineCooldown,
+      );
+    }
+    _clearIncomingRequest();
+    await _closeActiveLink();
+  }
+
+  void _clearIncomingRequest() {
+    _incomingRequestTimer?.cancel();
+    _incomingRequestTimer = null;
+    _incomingRequestSession = null;
+    if (!_disposed && state.incomingRequest != null) {
+      _setState(clearIncomingRequest: true);
+    }
+  }
+
+  Future<void> _markPeerOffline(String peerId) async {
+    try {
+      await _ref
+          .read(peerRepositoryProvider)
+          .updatePeerStatus(peerId, PeerStatus.offline);
+      await _refreshPeers();
+    } catch (_) {}
   }
 
   Future<void> _refreshIncoming(Peer peer) async {
@@ -856,6 +1104,16 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       return;
     }
     await _stopAdvertisingForLink();
+    if (state.incomingRequest?.peerId == hello.deviceId) {
+      _setState(
+        status: BleRuntimeStatus.ready,
+        candidates: const [],
+        isAdvertising: false,
+        clearActiveLink: true,
+        clearError: true,
+      );
+      return;
+    }
     final role = _activeRole ?? BleLinkRole.central;
     _setState(
       status: BleRuntimeStatus.connected,
@@ -1016,10 +1274,16 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         await _peripheral.disconnect(event.central);
       } catch (_) {}
       if (!_disposed) {
+        final rejected = error is BleHelloRejectedException;
         _setState(
-          status: BleRuntimeStatus.error,
-          error: 'Incoming connection failed: ${_describeError(error)}',
+          status: rejected
+              ? (_foreground ? BleRuntimeStatus.ready : BleRuntimeStatus.idle)
+              : BleRuntimeStatus.error,
+          error: rejected
+              ? null
+              : 'Incoming connection failed: ${_describeError(error)}',
           clearActiveLink: true,
+          clearError: rejected,
         );
       }
     }
@@ -1031,6 +1295,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     final cleanup = Completer<void>();
     _linkCleanupCompleter = cleanup;
     try {
+      final closingPeerId = _activePeer?.peerId ?? state.activePeerId;
       _activeSession = null;
       _activePeer = null;
       _peripheralTransport = null;
@@ -1040,9 +1305,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       _activePeripheral = null;
       _activeCentral = null;
       _activeRole = null;
-      final closingPeerId = state.activePeerId;
       _remoteDeviceName = null;
       _remoteRssi = null;
+      _clearIncomingRequest();
 
       if (!_linkEstablishing &&
           !_disposed &&
@@ -1051,7 +1316,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
           status: _foreground ? BleRuntimeStatus.ready : BleRuntimeStatus.idle,
           candidates: const [],
           clearActiveLink: true,
-          clearError: error is BleLinkClosedException,
+          clearError:
+              error is BleLinkClosedException ||
+              error is BleHelloRejectedException,
         );
       }
 
@@ -1144,6 +1411,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
   Future<void> pauseForBackground() async {
     _foreground = false;
+    _clearIncomingRequest();
     await stopScan();
     await _closeActiveLink();
     if (_advertising) {
@@ -1268,8 +1536,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     String? error,
     bool? canOpenSettings,
     bool? isAdvertising,
+    IncomingConnectionRequest? incomingRequest,
     bool clearActiveLink = false,
     bool clearError = false,
+    bool clearIncomingRequest = false,
   }) {
     if (_disposed) return;
     state = state.copyWith(
@@ -1281,8 +1551,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       error: error,
       canOpenSettings: canOpenSettings,
       isAdvertising: isAdvertising,
+      incomingRequest: incomingRequest,
       clearActiveLink: clearActiveLink,
       clearError: clearError,
+      clearIncomingRequest: clearIncomingRequest,
     );
   }
 
@@ -1290,6 +1562,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   void dispose() {
     _disposed = true;
     _scanTimer?.cancel();
+    _incomingRequestTimer?.cancel();
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }

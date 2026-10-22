@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:bechat/features/chats/screens/chat_list_screen.dart';
 import 'package:bechat/features/peers/screens/peer_discovery_screen.dart';
+import 'package:bechat/features/peers/widgets/incoming_request_dialog.dart';
 import 'package:bechat/features/settings/screens/settings_screen.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
@@ -47,33 +48,35 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       const SettingsScreen(),
     ];
 
-    return Scaffold(
-      body: IndexedStack(index: _currentIndex, children: screens),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _currentIndex,
-        onDestinationSelected: (index) {
-          setState(() => _currentIndex = index);
-          if (index == 0) {
-            ref.read(chatListProvider.notifier).refreshChats();
-          }
-        },
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.chat_outlined),
-            selectedIcon: Icon(Icons.chat),
-            label: 'Chats',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.bluetooth_searching_outlined),
-            selectedIcon: Icon(Icons.bluetooth_searching),
-            label: 'Nearby',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings),
-            label: 'Settings',
-          ),
-        ],
+    return IncomingConnectionRequestHost(
+      child: Scaffold(
+        body: IndexedStack(index: _currentIndex, children: screens),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: _currentIndex,
+          onDestinationSelected: (index) {
+            setState(() => _currentIndex = index);
+            if (index == 0) {
+              ref.read(chatListProvider.notifier).refreshChats();
+            }
+          },
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.chat_outlined),
+              selectedIcon: Icon(Icons.chat),
+              label: 'Chats',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.bluetooth_searching_outlined),
+              selectedIcon: Icon(Icons.bluetooth_searching),
+              label: 'Nearby',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.settings_outlined),
+              selectedIcon: Icon(Icons.settings),
+              label: 'Settings',
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -17,6 +17,8 @@ class AppConstants {
   static const bool defaultMessagePreviewsEnabled = false;
 
   static const Duration scanTimeout = Duration(seconds: 15);
+  static const Duration incomingRequestTimeout = Duration(seconds: 30);
+  static const Duration declineCooldown = Duration(seconds: 60);
   static const Duration mockResponseDelay = Duration(milliseconds: 800);
   static const Duration messageTtlDefault = Duration(hours: 24);
 
