@@ -1,0 +1,7 @@
+[package]
+name = "bechat_crypto_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+snow = "=0.10.0"

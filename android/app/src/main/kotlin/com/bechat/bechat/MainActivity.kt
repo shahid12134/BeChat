@@ -43,6 +43,28 @@ class MainActivity : FlutterActivity() {
         }
         BackgroundBleBridge.attach(this, backgroundChannel)
         BackgroundBleBridge.handleLaunchIntent(intent)
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            NATIVE_CRYPTO_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "backendVersion" -> {
+                    try {
+                        result.success(NativeCryptoBridge.nativeBackendVersion())
+                    } catch (error: Throwable) {
+                        // Fixed, non-secret error: never forward native details.
+                        result.error(
+                            "NATIVE_CRYPTO_UNAVAILABLE",
+                            "Native crypto backend is unavailable.",
+                            null,
+                        )
+                    }
+                }
+
+                else -> result.notImplemented()
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -136,6 +158,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val BLE_STATUS_CHANNEL = "bechat/ble_status"
         private const val BACKGROUND_CHANNEL = "bechat/background"
+        private const val NATIVE_CRYPTO_CHANNEL = "bechat/native_crypto"
         const val ACTION_OPEN_CHAT = "com.bechat.bechat.OPEN_CHAT"
         const val EXTRA_CHAT_ID = "chatId"
     }

@@ -1,3 +1,9 @@
+analyzer:
+  exclude:
+    # Vendored third-party cargokit build tooling (has its own pubspec);
+    # matches the exclusion used by tooling/crypto_spike.
+    - native/rust_builder/cargokit/**
+
 # This file configures the analyzer, which statically analyzes Dart code to
 # check for errors, warnings, and lints.
 #

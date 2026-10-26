@@ -17,6 +17,8 @@ dependencies:
   intl: ^0.20.2
   go_router: ^14.8.1
   bluetooth_low_energy: 6.2.1
+  bechat_crypto:
+    path: native/rust_builder
 
 dev_dependencies:
   flutter_test:
@@ -25,6 +27,8 @@ dev_dependencies:
   sqflite_common_ffi: ^2.3.4+4
   mockito: ^5.4.5
   build_runner: ^2.4.15
+  integration_test:
+    sdk: flutter
 
 flutter:
   uses-material-design: true
