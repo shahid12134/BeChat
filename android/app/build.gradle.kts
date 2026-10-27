@@ -28,6 +28,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -37,6 +38,19 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+}
+
+dependencies {
+    // On-device tests for the native identity boundary (Keystore wrapping,
+    // envelope validation, identity lifecycle). They drive the production
+    // classes directly, so no test-only hooks exist in the app itself.
+    // Versions are pinned to the ones the Flutter `integration_test` plugin
+    // already puts on the app runtime classpath (androidx.test 1.2.0 /
+    // junit 4.12); newer androidx.test releases require junit 4.13, which
+    // conflicts with that consistent resolution.
+    androidTestImplementation("androidx.test:monitor:1.2.0")
+    androidTestImplementation("androidx.test:runner:1.2.0")
+    androidTestImplementation("junit:junit:4.12")
 }
 
 flutter {

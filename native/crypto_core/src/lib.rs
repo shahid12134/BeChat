@@ -1,15 +1,14 @@
 //! Shared cryptographic core for the production BeChat application.
 //!
 //! This crate is the single home for BeChat's production Noise primitives.
-//! Phase 1A only wires it into the build graph: the production JNI crate
-//! (`bechat_crypto`) depends on it and reports a fixed, non-secret version
-//! string through the Android smoke test.
+//! Phase 1A wired it into the build graph; Phase 1B adds the persistent
+//! Noise X25519 identity logic (`identity` module) that the production JNI
+//! crate (`bechat_crypto`) exposes through the Kotlin/JNI boundary.
 //!
 //! The validated feasibility spike under `tooling/crypto_spike` keeps its own
-//! tested copy of the identity logic as frozen regression evidence. Identity
-//! provisioning logic is consolidated into this crate in a later phase so only
-//! one implementation evolves; this phase deliberately adds no key generation,
-//! no persistence and no secret-bearing API.
+//! frozen copy as regression evidence. All new production identity logic goes
+//! here so only one implementation evolves: the spike is not modified and the
+//! production app never links against spike code.
 
 /// Noise handshake pattern used for BeChat's static identity work.
 /// Matches the spike's suite selection exactly; semantics must not change
@@ -21,6 +20,14 @@ pub const NOISE_IK_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
 /// Fixed, non-secret backend identifier. Contains no key material.
 pub const BACKEND_VERSION: &str = "bechat-crypto-core/0.1.0 snow/0.10.0";
+
+mod identity;
+
+pub use identity::{
+    clear_installed_identity, derive_identity_public_key, derive_identity_public_key_hex,
+    generate_identity_seed, install_identity, installed_public_key_hex, IDENTITY_PUBLIC_KEY_LENGTH,
+    IDENTITY_SEED_LENGTH,
+};
 
 /// Returns the non-secret backend identifier reported by the JNI smoke test.
 pub fn backend_version() -> &'static str {

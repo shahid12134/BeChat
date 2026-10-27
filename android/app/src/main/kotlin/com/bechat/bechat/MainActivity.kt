@@ -44,6 +44,15 @@ class MainActivity : FlutterActivity() {
         BackgroundBleBridge.attach(this, backgroundChannel)
         BackgroundBleBridge.handleLaunchIntent(intent)
 
+        // Identity lifecycle channel. `attach` only creates the on-device
+        // store: nothing is provisioned, restored or deleted until Dart asks,
+        // so application bootstrap stays free of identity provisioning.
+        NativeIdentityController.attach(applicationContext)
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            NativeIdentityController.CHANNEL,
+        ).setMethodCallHandler(NativeIdentityController)
+
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             NATIVE_CRYPTO_CHANNEL,
