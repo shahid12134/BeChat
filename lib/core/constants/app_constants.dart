@@ -2,7 +2,7 @@ class AppConstants {
   static const String appName = 'BeChat';
   static const String appVersion = '1.0.0';
   static const String databaseName = 'bechat.db';
-  static const int databaseVersion = 3;
+  static const int databaseVersion = 4;
 
   // Persistent application settings.
   static const String settingBleEnabled = 'ble_enabled';
@@ -30,6 +30,11 @@ class AppConstants {
 
   static const int maxMessageLength = 4096;
   static const int defaultPageSize = 50;
+
+  /// Noise suite used for the persistent cryptographic identity. Stored with
+  /// the public identity metadata so a future algorithm change is detectable;
+  /// it is not a secret.
+  static const String noiseKeyAlgorithm = 'noise-x25519-chachapoly-sha256';
 
   static const String defaultDeviceName = 'My BeChat Device';
   static const String defaultAvatarPath = '';

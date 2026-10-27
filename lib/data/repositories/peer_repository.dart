@@ -1,5 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
+import 'package:bechat/core/utils/key_format.dart';
+import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/data/database/database_helper.dart';
 
@@ -41,11 +43,15 @@ class PeerRepository {
           firstSeen: peer.firstSeen ?? now,
           lastSeen: peer.lastSeen ?? now,
         );
-        await txn.insert(
-          'peers',
-          insert.toMap(),
-          conflictAlgorithm: ConflictAlgorithm.abort,
-        );
+        await txn.insert('peers', {
+          ...insert.toMap(),
+          // Keep the invariant that a row holding key material is never
+          // recorded as having no key. Insertion still never means verified.
+          'verification_state': Peer.resolveKeyVerificationState(
+            insert.keyVerificationState.name,
+            insert.publicKey,
+          ).name,
+        }, conflictAlgorithm: ConflictAlgorithm.abort);
         return;
       }
 
@@ -53,6 +59,9 @@ class PeerRepository {
       final isBlocked =
           (current['is_blocked'] as int?) == 1 ||
           current['status'] == PeerStatus.blocked.name;
+      // An upsert only ever supplies or preserves a key; it never verifies one.
+      final effectivePublicKey =
+          peer.publicKey ?? current['public_key'] as String?;
       await txn.update(
         'peers',
         {
@@ -62,8 +71,13 @@ class PeerRepository {
           'status': isBlocked ? PeerStatus.blocked.name : peer.status.name,
           'signal_strength': peer.signalStrength,
           'last_seen': (peer.lastSeen ?? now).toIso8601String(),
-          'public_key': peer.publicKey ?? current['public_key'],
+          'public_key': effectivePublicKey,
           'updated_at': now.toIso8601String(),
+          ..._keyTransition(
+            storedKey: current['public_key'] as String?,
+            incomingKey: effectivePublicKey,
+            now: now,
+          ),
         },
         where: 'peer_id = ?',
         whereArgs: [peer.peerId],
@@ -89,24 +103,177 @@ class PeerRepository {
     return Peer.fromMap(maps.first);
   }
 
+  /// Full-row update of the non-key peer fields.
+  ///
+  /// Key metadata is not taken from the model: it is derived from the stored
+  /// key through [_keyTransition], so this method can never promote a peer to
+  /// [PeerKeyVerificationState.verified] and can never leave a verification
+  /// state attached to a key that changed or disappeared.
   Future<void> updatePeer(Peer peer) async {
     final db = await _db;
-    await db.update(
-      'peers',
-      {
-        'display_name': peer.displayName,
-        'device_name': peer.deviceName,
-        'avatar_path': peer.avatarPath,
-        'status': peer.status.name,
-        'signal_strength': peer.signalStrength,
-        'last_seen': peer.lastSeen?.toIso8601String(),
-        'public_key': peer.publicKey,
-        'is_blocked': peer.isBlocked ? 1 : 0,
-        'updated_at': DateTime.now().toIso8601String(),
-      },
-      where: 'peer_id = ?',
-      whereArgs: [peer.peerId],
-    );
+    await db.transaction((txn) async {
+      final existing = await txn.query(
+        'peers',
+        columns: ['public_key'],
+        where: 'peer_id = ?',
+        whereArgs: [peer.peerId],
+        limit: 1,
+      );
+      if (existing.isEmpty) {
+        return;
+      }
+
+      final now = DateTime.now();
+      await txn.update(
+        'peers',
+        {
+          'display_name': peer.displayName,
+          'device_name': peer.deviceName,
+          'avatar_path': peer.avatarPath,
+          'status': peer.status.name,
+          'signal_strength': peer.signalStrength,
+          'last_seen': peer.lastSeen?.toIso8601String(),
+          'public_key': peer.publicKey,
+          'is_blocked': peer.isBlocked ? 1 : 0,
+          'updated_at': now.toIso8601String(),
+          ..._keyTransition(
+            storedKey: existing.first['public_key'] as String?,
+            incomingKey: peer.publicKey,
+            now: now,
+          ),
+        },
+        where: 'peer_id = ?',
+        whereArgs: [peer.peerId],
+      );
+    });
+  }
+
+  /// Records a public key observed for [peerId] (discovery or a future
+  /// authenticated handshake).
+  ///
+  /// Security rules:
+  ///
+  /// * the key is always stored **unverified** — this method cannot mark a peer
+  ///   verified;
+  /// * when the peer already has a different key the state becomes
+  ///   [PeerKeyVerificationState.changed], any verification timestamp is
+  ///   cleared and `key_changed_at` is recorded;
+  /// * re-recording the same key changes nothing, so an existing verification
+  ///   survives a repeated handshake with the same key;
+  /// * [publicKeyHex] must be 32 bytes of lowercase hex, and [fingerprintHex]
+  ///   (when supplied) must come from the component that validated the key —
+  ///   normally the native identity layer. This repository never invents trust
+  ///   from a device identifier or display name.
+  ///
+  /// Returns the resulting verification state, or null when the peer is unknown
+  /// (nothing is written).
+  Future<PeerKeyVerificationState?> recordCandidatePublicKey(
+    String peerId, {
+    required String publicKeyHex,
+    String? fingerprintHex,
+  }) async {
+    if (!KeyFormat.isHex32(publicKeyHex)) {
+      throw ArgumentError.value(
+        publicKeyHex,
+        'publicKeyHex',
+        'must be a 32-byte public key in lowercase hex',
+      );
+    }
+    if (fingerprintHex != null && !KeyFormat.isHex32(fingerprintHex)) {
+      throw ArgumentError.value(
+        fingerprintHex,
+        'fingerprintHex',
+        'must be a 32-byte fingerprint in lowercase hex',
+      );
+    }
+
+    final db = await _db;
+    return db.transaction<PeerKeyVerificationState?>((txn) async {
+      final existing = await txn.query(
+        'peers',
+        columns: ['public_key', 'verification_state'],
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        limit: 1,
+      );
+      if (existing.isEmpty) {
+        return null;
+      }
+
+      final storedKey = existing.first['public_key'] as String?;
+      final now = DateTime.now();
+      final update = _keyTransition(
+        storedKey: storedKey,
+        incomingKey: publicKeyHex,
+        now: now,
+        fingerprintHex: fingerprintHex,
+      );
+      if (update.isEmpty) {
+        return Peer.resolveKeyVerificationState(
+          existing.first['verification_state'],
+          storedKey,
+        );
+      }
+
+      await txn.update(
+        'peers',
+        {...update, 'updated_at': now.toIso8601String()},
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+      );
+      return Peer.resolveKeyVerificationState(
+        update['verification_state'],
+        update['public_key'] as String?,
+      );
+    });
+  }
+
+  /// Key-metadata updates for an incoming public key value.
+  ///
+  /// Returns an empty map when the key is unchanged, so a repeat observation
+  /// keeps any existing verification. When the key appears, changes or is
+  /// removed, the previous verification is invalidated: `verified` is never
+  /// assigned here, and a stale verification timestamp is cleared.
+  ///
+  /// `key_verified_at`/`key_changed_at` use the canonical UTC form
+  /// ([TimestampUtils]); `updated_at` keeps the local form the existing rows
+  /// already use.
+  Map<String, Object?> _keyTransition({
+    required String? storedKey,
+    required String? incomingKey,
+    required DateTime now,
+    String? fingerprintHex,
+  }) {
+    final stored = storedKey?.trim();
+    final hasStored = stored != null && stored.isNotEmpty;
+    final incoming = incomingKey?.trim();
+    final hasIncoming = incoming != null && incoming.isNotEmpty;
+
+    if (!hasIncoming) {
+      if (!hasStored) {
+        return const <String, Object?>{};
+      }
+      return <String, Object?>{
+        'public_key': null,
+        'public_key_fingerprint': null,
+        'verification_state': PeerKeyVerificationState.none.name,
+        'key_verified_at': null,
+      };
+    }
+
+    if (hasStored && stored == incoming) {
+      return const <String, Object?>{};
+    }
+
+    return <String, Object?>{
+      'public_key': incoming,
+      'public_key_fingerprint': fingerprintHex,
+      'verification_state': hasStored
+          ? PeerKeyVerificationState.changed.name
+          : PeerKeyVerificationState.unverified.name,
+      'key_verified_at': null,
+      'key_changed_at': hasStored ? TimestampUtils.toUtcIso8601(now) : null,
+    };
   }
 
   Future<void> deletePeer(String peerId) async {

@@ -2,6 +2,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/core/utils/timestamp_utils.dart';
+import 'package:bechat/data/models/peer.dart';
 
 class DatabaseHelper {
   static Database? _database;
@@ -50,6 +51,9 @@ class DatabaseHelper {
     if (oldVersion < 3) {
       await migrateToVersion3(db);
     }
+    if (oldVersion < 4) {
+      await migrateToVersion4(db);
+    }
   }
 
   /// Adds the persistent application settings table without touching user data.
@@ -64,6 +68,88 @@ class DatabaseHelper {
         updated_at TEXT NOT NULL
       )
     ''');
+  }
+
+  /// Adds the cryptographic identity and peer-verification metadata columns
+  /// (database version 4).
+  ///
+  /// Purely additive and never destructive:
+  ///
+  /// * existing identity and peer rows keep their values;
+  /// * no key material is generated and no Noise identity is provisioned;
+  /// * no peer is promoted to `verified` because it already had a key;
+  /// * legacy peers that still hold a usable-looking key are marked
+  ///   `unverified`, and peers without a key stay `none`.
+  ///
+  /// sqflite runs `onUpgrade` inside a transaction, so this method must not
+  /// start a nested transaction. Each step is guarded, so running the
+  /// migration again (or against a database that already has the columns) is a
+  /// no-op instead of a "duplicate column" failure.
+  static Future<void> migrateToVersion4(Database db) async {
+    await _addColumnIfMissing(db, 'identity', 'public_key_fingerprint', 'TEXT');
+    await _addColumnIfMissing(db, 'identity', 'key_algorithm', 'TEXT');
+    await _addColumnIfMissing(db, 'identity', 'identity_created_at', 'TEXT');
+
+    await _addColumnIfMissing(db, 'peers', 'public_key_fingerprint', 'TEXT');
+    await _addColumnIfMissing(
+      db,
+      'peers',
+      'verification_state',
+      "TEXT NOT NULL DEFAULT '${PeerKeyVerificationState.none.name}'",
+    );
+    await _addColumnIfMissing(db, 'peers', 'key_verified_at', 'TEXT');
+    await _addColumnIfMissing(db, 'peers', 'key_changed_at', 'TEXT');
+
+    // An empty or whitespace-only key is not a key: normalize it away so it
+    // can never be mistaken for stored key material.
+    await db.execute(
+      "UPDATE peers SET public_key = NULL "
+      "WHERE public_key IS NOT NULL AND TRIM(public_key) = ''",
+    );
+
+    // A stored key is not a trusted key. Only a key that exists becomes
+    // `unverified`; `verified` and `changed` are never assigned here.
+    await db.execute(
+      "UPDATE peers SET verification_state = '${PeerKeyVerificationState.unverified.name}' "
+      "WHERE public_key IS NOT NULL "
+      "AND verification_state = '${PeerKeyVerificationState.none.name}'",
+    );
+  }
+
+  /// Adds [column] to [table] unless it already exists.
+  ///
+  /// Throws a non-secret [StateError] when [table] is missing entirely rather
+  /// than skipping silently, so an unexpected schema fails loudly instead of
+  /// leaving a half-migrated database.
+  static Future<void> _addColumnIfMissing(
+    Database db,
+    String table,
+    String column,
+    String definition,
+  ) async {
+    final existing = await _tableColumns(db, table);
+    if (existing == null) {
+      throw StateError(
+        'Cannot migrate database: required table "$table" is missing.',
+      );
+    }
+    if (existing.contains(column)) {
+      return;
+    }
+    await db.execute('ALTER TABLE $table ADD COLUMN $column $definition');
+  }
+
+  /// Column names of [table], or null when the table does not exist.
+  static Future<Set<String>?> _tableColumns(Database db, String table) async {
+    final tables = await db.rawQuery(
+      'SELECT name FROM sqlite_master WHERE type = ? AND name = ?',
+      ['table', table],
+    );
+    if (tables.isEmpty) {
+      return null;
+    }
+    final info = await db.rawQuery('PRAGMA table_info($table)');
+    return info.map((row) => row['name'] as String).toSet();
   }
 
   /// Rewrites legacy timestamp columns to the canonical UTC representation.
@@ -128,7 +214,10 @@ class DatabaseHelper {
         public_key TEXT,
         private_key_reference TEXT,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        public_key_fingerprint TEXT,
+        key_algorithm TEXT,
+        identity_created_at TEXT
       )
     ''');
 
@@ -146,7 +235,11 @@ class DatabaseHelper {
         public_key TEXT,
         is_blocked INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        public_key_fingerprint TEXT,
+        verification_state TEXT NOT NULL DEFAULT 'none',
+        key_verified_at TEXT,
+        key_changed_at TEXT
       )
     ''');
 
