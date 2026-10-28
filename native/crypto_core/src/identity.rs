@@ -36,12 +36,10 @@ pub const IDENTITY_PUBLIC_KEY_LENGTH: usize = 32;
 
 struct InstalledIdentity {
     // The installed seed is stored on purpose: installing an identity means
-    // holding the validated private material ready for the Noise sessions
-    // added in a later phase. Nothing reads it yet in Phase 1B, so silence
-    // the unused-field lint here instead of deleting the secret we just
-    // validated. `Zeroizing` clears it when the identity is replaced,
-    // cleared, or the process exits.
-    #[allow(dead_code)]
+    // holding the validated private material ready for the Noise session
+    // engine (`session` module), which reads it through the crate-internal
+    // `installed_identity_key_material` accessor. `Zeroizing` clears it when
+    // the identity is replaced, cleared, or the process exits.
     private_key: Zeroizing<Vec<u8>>,
     public_key: Vec<u8>,
 }
@@ -140,7 +138,29 @@ pub fn installed_public_key_hex() -> Result<Option<String>, String> {
         .map(|identity| hex::encode(&identity.public_key)))
 }
 
-fn decode_public_key(value: &str) -> Result<Vec<u8>, String> {
+/// Crate-internal accessor handing the installed seed to the session engine.
+///
+/// Returns a `Zeroizing` clone of the private seed alongside the public key.
+/// The clone is cleared on drop by the caller (the session module), and the
+/// original stays protected inside the installed identity. This function is
+/// deliberately `pub(crate)`: no JNI export, no public API and no path to
+/// Dart ever touches it. Fails when no identity is installed.
+pub(crate) fn installed_identity_key_material() -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), String> {
+    let guard = installed()
+        .lock()
+        .map_err(|_| "identity store unavailable")?;
+    let identity = guard.as_ref().ok_or("no identity is installed")?;
+    Ok((
+        Zeroizing::new(identity.private_key.to_vec()),
+        identity.public_key.clone(),
+    ))
+}
+
+/// Decodes a 32-byte lowercase-hex X25519 public key into raw bytes.
+///
+/// Shared by the identity installer and the session engine's pin validation;
+/// `pub(crate)` so only this module parses key encodings.
+pub(crate) fn decode_public_key(value: &str) -> Result<Vec<u8>, String> {
     let bytes = hex::decode(value).map_err(|_| "invalid identity public key")?;
     if bytes.len() != IDENTITY_PUBLIC_KEY_LENGTH {
         return Err("invalid identity public key length".into());

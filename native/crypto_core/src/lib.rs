@@ -3,7 +3,12 @@
 //! This crate is the single home for BeChat's production Noise primitives.
 //! Phase 1A wired it into the build graph; Phase 1B adds the persistent
 //! Noise X25519 identity logic (`identity` module) that the production JNI
-//! crate (`bechat_crypto`) exposes through the Kotlin/JNI boundary.
+//! crate (`bechat_crypto`) exposes through the Kotlin/JNI boundary. Phase 2B
+//! adds the Noise XX secure session engine (`session` module): handshake,
+//! authenticated identity payloads, explicit session confirmation and
+//! bidirectional transport over the installed identity. The session engine
+//! is not yet exposed through JNI; that integration is a later phase, and
+//! until it ships production BLE traffic is **not** encrypted.
 //!
 //! The validated feasibility spike under `tooling/crypto_spike` keeps its own
 //! frozen copy as regression evidence. All new production identity logic goes
@@ -22,11 +27,20 @@ pub const NOISE_IK_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 pub const BACKEND_VERSION: &str = "bechat-crypto-core/0.1.0 snow/0.10.0";
 
 mod identity;
+mod session;
 
 pub use identity::{
     clear_installed_identity, derive_identity_public_key, derive_identity_public_key_hex,
     generate_identity_seed, install_identity, installed_public_key_hex, IDENTITY_PUBLIC_KEY_LENGTH,
     IDENTITY_SEED_LENGTH,
+};
+pub use session::{
+    decode_identity_payload, encode_identity_payload, session_close, session_confirm_peer_identity,
+    session_create, session_decrypt, session_encrypt, session_process_handshake,
+    session_start_handshake, session_status, HandshakeOutput, RemoteIdentity, SessionError,
+    SessionStageName, SessionStatusReport, CAPABILITY_SECURE_TEXT, LOCAL_CAPABILITIES,
+    MAX_HANDSHAKE_MESSAGE_LENGTH, MAX_IDENTITY_PAYLOAD_LENGTH, MAX_SESSIONS,
+    MAX_TRANSPORT_MESSAGE_LENGTH, MAX_TRANSPORT_PLAINTEXT_LENGTH, SECURE_PROLOGUE,
 };
 
 /// Returns the non-secret backend identifier reported by the JNI smoke test.
