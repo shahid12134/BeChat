@@ -53,6 +53,15 @@ class MainActivity : FlutterActivity() {
             NativeIdentityController.CHANNEL,
         ).setMethodCallHandler(NativeIdentityController)
 
+        // Secure session channel. The controller runs native Noise session
+        // work on its own serial background executor; nothing here provisions
+        // or closes sessions until Dart asks. Sessions are created from the
+        // installed identity only.
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            SecureSessionController.CHANNEL,
+        ).setMethodCallHandler(SecureSessionController)
+
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             NATIVE_CRYPTO_CHANNEL,
@@ -96,6 +105,11 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         if (isFinishing) {
             BeChatForegroundService.stop(applicationContext)
+            // The UI (and its session owner) is genuinely going away: drop
+            // any half-open Noise sessions so their state cannot outlive the
+            // process UI. A routine activity recreation (`isFinishing` false)
+            // keeps sessions alive with their owner.
+            SecureSessionController.closeAllSessions()
         }
         BackgroundBleBridge.detach(this)
         super.onDestroy()
