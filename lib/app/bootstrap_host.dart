@@ -1,24 +1,21 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:bechat/app/app.dart';
 import 'package:bechat/app/theme/app_theme.dart';
-import 'package:bechat/core/constants/app_constants.dart';
-import 'package:bechat/data/database/database_helper.dart';
-import 'package:bechat/data/mock/mock_data.dart';
-import 'package:bechat/data/repositories/identity_repository.dart';
-import 'package:bechat/data/repositories/peer_repository.dart';
+import 'package:bechat/providers/identity_initialization_providers.dart';
 
-class BootstrapHost extends StatefulWidget {
+class BootstrapHost extends ConsumerStatefulWidget {
   final Future<void> Function()? bootstrap;
 
   const BootstrapHost({super.key, this.bootstrap});
 
   @override
-  State<BootstrapHost> createState() => _BootstrapHostState();
+  ConsumerState<BootstrapHost> createState() => _BootstrapHostState();
 }
 
-class _BootstrapHostState extends State<BootstrapHost> {
+class _BootstrapHostState extends ConsumerState<BootstrapHost> {
   late Future<void> _bootstrapFuture;
 
   @override
@@ -34,17 +31,16 @@ class _BootstrapHostState extends State<BootstrapHost> {
   }
 
   Future<void> _runBootstrap() async {
-    final callback = widget.bootstrap ?? _initializeApp;
-    await callback();
-  }
-
-  static Future<void> _initializeApp() async {
-    await DatabaseHelper.database;
-    final identity = await IdentityRepository().ensureIdentity();
-    await PeerRepository().resetTransientPresence();
-    if (AppConstants.demoDataEnabled) {
-      await MockData.seedDemoData(identity);
+    final callback = widget.bootstrap;
+    if (callback != null) {
+      await callback();
+      return;
     }
+
+    // Database, UUID identity and cryptographic identity run in one
+    // authoritative pipeline. Cryptographic failures are reported through
+    // identityInitializationProvider and do not fail the app startup.
+    await ref.read(appBootstrapProvider).run();
   }
 
   void _retry() {

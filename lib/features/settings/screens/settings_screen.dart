@@ -6,11 +6,13 @@ import 'package:bechat/data/models/app_settings.dart';
 import 'package:bechat/providers/app_settings_providers.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
+import 'package:bechat/providers/identity_initialization_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/services/ble/ble_runtime.dart';
+import 'package:bechat/services/crypto/identity_initialization_coordinator.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
@@ -33,6 +35,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final identityAsync = ref.watch(identityProvider);
+    final identityStatus = ref.watch(identityInitializationProvider);
     final dbInfoAsync = ref.watch(databaseInfoProvider);
     final runtime = ref.watch(bleRuntimeProvider);
     final settings = ref.watch(appSettingsProvider).valueOrNull;
@@ -43,6 +46,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         children: [
           // Profile section
           _buildProfileSection(context, identityAsync),
+          _buildCryptographicIdentitySection(context, identityStatus),
           const Divider(height: 1),
 
           _buildBackgroundSection(context, runtime, settings),
@@ -114,6 +118,53 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         title: const Text('Error loading profile'),
         subtitle: Text('$e'),
       ),
+    );
+  }
+
+  Widget _buildCryptographicIdentitySection(
+    BuildContext context,
+    IdentityInitializationStatus status,
+  ) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final showRetry =
+        status.isDegraded &&
+        status.state != IdentityInitializationState.unsupportedPlatform;
+
+    return ListTile(
+      leading: Icon(
+        status.isReady
+            ? Icons.verified_user_outlined
+            : Icons.gpp_maybe_outlined,
+        color: status.isReady
+            ? Colors.green
+            : status.state == IdentityInitializationState.initializing
+            ? colorScheme.onSurfaceVariant
+            : colorScheme.error,
+      ),
+      title: const Text('Cryptographic identity'),
+      subtitle: Text(status.message),
+      trailing: showRetry
+          ? TextButton(
+              onPressed: () async {
+                try {
+                  await ref
+                      .read(identityInitializationProvider.notifier)
+                      .initialize();
+                } catch (_) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Identity initialization could not start.',
+                        ),
+                      ),
+                    );
+                  }
+                }
+              },
+              child: const Text('Retry'),
+            )
+          : null,
     );
   }
 

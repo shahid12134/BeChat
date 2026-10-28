@@ -6,7 +6,29 @@ import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/database/database_helper.dart';
 
-class IdentityRepository {
+/// The SQLite identity surface used by application bootstrap and the
+/// cryptographic identity coordinator.
+///
+/// Declared separately so the coordinator can be tested with an in-memory or
+/// fault-injecting store while [IdentityRepository] remains the only
+/// production implementation that persists identity metadata.
+abstract interface class IdentityMetadataStore {
+  /// Returns the local identity row, creating the UUID row only when none
+  /// exists.
+  Future<Identity> ensureIdentity();
+
+  /// Persists validated, non-secret public identity metadata on the existing
+  /// identity row without creating, replacing or rotating an identity.
+  Future<Identity> savePublicIdentityMetadata({
+    required String publicKeyHex,
+    required String publicKeyFingerprint,
+    String? privateKeyReference,
+    String keyAlgorithm,
+    DateTime? identityCreatedAt,
+  });
+}
+
+class IdentityRepository implements IdentityMetadataStore {
   IdentityRepository({Future<Database> Function()? database})
     : _openDatabase = database ?? (() => DatabaseHelper.database);
 
@@ -14,6 +36,7 @@ class IdentityRepository {
 
   Future<Database> get _db => _openDatabase();
 
+  @override
   Future<Identity> ensureIdentity() async {
     final db = await _db;
     return db.transaction<Identity>((txn) async {
@@ -63,6 +86,9 @@ class IdentityRepository {
             : existing.displayName,
         publicKey: existing.publicKey,
         privateKeyReference: existing.privateKeyReference,
+        publicKeyFingerprint: existing.publicKeyFingerprint,
+        keyAlgorithm: existing.keyAlgorithm,
+        identityCreatedAt: existing.identityCreatedAt,
         createdAt: existing.createdAt ?? now,
         updatedAt: now,
       );
@@ -159,6 +185,7 @@ class IdentityRepository {
   /// that brings an identity into existence.
   ///
   /// New timestamps use the canonical UTC form ([TimestampUtils]).
+  @override
   Future<Identity> savePublicIdentityMetadata({
     required String publicKeyHex,
     required String publicKeyFingerprint,

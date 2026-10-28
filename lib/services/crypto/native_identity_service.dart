@@ -111,6 +111,20 @@ class NativeIdentityStatus {
   String toString() => 'NativeIdentityStatus(${state.name})';
 }
 
+/// The narrow native identity surface the initialization coordinator depends
+/// on.
+///
+/// Declared separately so coordinator tests can supply a fake without a
+/// MethodChannel. It deliberately has no seed-, blob- or byte-level members.
+abstract interface class NativeIdentityGateway {
+  /// Provisions a first identity when none exists, otherwise restores the
+  /// established identity. Never replaces an existing identity.
+  Future<NativeIdentityStatus> initialize();
+
+  /// Reports the current non-secret state without provisioning anything.
+  Future<NativeIdentityStatus> status();
+}
+
 /// Flutter-facing identity service.
 ///
 /// Exposes only: initialize/restore, status, public identity and fingerprint
@@ -119,9 +133,10 @@ class NativeIdentityStatus {
 /// Keystore wrapping — are unreachable from Dart by design; calling this
 /// service never creates or modifies the application database.
 ///
-/// Application bootstrap does not call this in the current phase: provisioning
-/// happens only when application code asks for it.
-class NativeIdentityService {
+/// Application bootstrap reaches this only through
+/// `IdentityInitializationCoordinator`, which decides between provisioning and
+/// restoring from the persisted SQLite identity state.
+class NativeIdentityService implements NativeIdentityGateway {
   NativeIdentityService({MethodChannel? channel})
     : _channel = channel ?? const MethodChannel(channelName);
 
@@ -135,9 +150,11 @@ class NativeIdentityService {
 
   /// Provisions a first identity when none exists, otherwise restores the
   /// established identity. Never replaces an existing identity.
+  @override
   Future<NativeIdentityStatus> initialize() => _invoke(initializeMethod);
 
   /// Reports the current non-secret state without provisioning anything.
+  @override
   Future<NativeIdentityStatus> status() => _invoke(statusMethod);
 
   /// Destructively resets the cryptographic identity.
@@ -165,20 +182,20 @@ class NativeIdentityService {
       if (result is! Map) {
         throw const NativeCryptoBackendException(
           'The native identity service returned an unusable response. Rebuild '
-              'and reinstall the app, then retry.',
+          'and reinstall the app, then retry.',
         );
       }
       return NativeIdentityStatus.fromMap(result);
     } on MissingPluginException {
       throw const NativeCryptoBackendException(
         'The native identity service is unavailable on this platform. Rebuild '
-            'and reinstall the app, then retry.',
+        'and reinstall the app, then retry.',
       );
     } on PlatformException {
       // Fixed, non-secret: native detail is never forwarded to callers.
       throw const NativeCryptoBackendException(
         'The native identity service could not complete the request. Rebuild '
-            'and reinstall the app, then retry.',
+        'and reinstall the app, then retry.',
       );
     }
   }
