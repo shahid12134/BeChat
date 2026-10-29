@@ -3,9 +3,11 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
+import 'package:bechat/services/crypto/native_secure_session_service.dart';
 
 enum BleSessionState { idle, handshaking, ready, closed }
 
@@ -49,6 +51,107 @@ class BleHelloRejectedException implements Exception {
   String toString() => 'BleHelloRejectedException: $message';
 }
 
+/// The Noise XX role a secure link session plays.
+///
+/// The BLE transport role maps onto the Noise role as follows:
+///
+/// * BLE peripheral -> [initiator] (the accepting side that starts Noise).
+/// * BLE central    -> [responder] (the connecting side that awaits Noise
+///   message 1).
+///
+/// The pattern is always `Noise_XX_25519_ChaChaPoly_SHA256`; it is never
+/// negotiated from an unauthenticated HELLO.
+enum BleSecureRole { initiator, responder }
+
+/// The secure half of the link state machine (opt-in secure mode only).
+///
+/// A raw transport connection, an exchanged HELLO, and a finished Noise
+/// handshake are each insufficient for [secureReady]: only an authenticated
+/// handshake followed by explicit [BleLinkSession.confirmSecurePeerIdentity]
+/// reaches it. Legacy (non-secure) sessions never leave [idle] here.
+enum BleSecureLinkState {
+  /// Constructed; no HELLO exchanged.
+  idle,
+
+  /// Transport connected and HELLO exchanged; awaiting the owning
+  /// application's explicit [BleLinkSession.startSecureHandshake]
+  /// authorization.
+  awaitingAuthorization,
+
+  /// Noise XX handshake in progress over protocol-v2 frames.
+  handshaking,
+
+  /// Handshake finished and the authenticated remote identity is exposed;
+  /// awaiting explicit peer-identity confirmation.
+  awaitingConfirmation,
+
+  /// Authenticated, confirmed, encrypted session (still no application
+  /// messaging until the secure message path lands in a later phase).
+  secureReady,
+
+  /// Terminal fail-closed state (timeout, malformed input, identity
+  /// mismatch, cryptographic failure). Never falls back to plaintext.
+  failed,
+
+  /// The link was closed.
+  closed,
+}
+
+class BleSecureHandshakeTimeoutException implements Exception {
+  const BleSecureHandshakeTimeoutException();
+
+  @override
+  String toString() =>
+      'BleSecureHandshakeTimeoutException: the secure handshake timed out';
+}
+
+/// Opt-in configuration that puts a [BleLinkSession] into secure mode.
+///
+/// Supplying this activates protocol-v2 framing for the Noise handshake and
+/// the secure state machine; omitting it keeps the session byte-for-byte on
+/// the legacy v1 path (the current production runtime always omits it).
+///
+/// The gateway is the existing Dart secure-session gateway; this class adds
+/// no cryptography of its own.
+class BleSecureSessionConfig {
+  const BleSecureSessionConfig({
+    required this.gateway,
+    required this.role,
+    this.pinnedRemotePublicKey,
+    this.expectedPeerDeviceId,
+    this.requireHelloBinding = false,
+    this.onRemoteIdentity,
+  });
+
+  /// The Dart secure-session gateway owning the native Noise sessions.
+  final SecureSessionGateway gateway;
+
+  /// The Noise role for this side of the link.
+  final BleSecureRole role;
+
+  /// Optional pinned remote static public key (exactly 32 raw bytes).
+  ///
+  /// When set, the engine rejects any handshake whose authenticated remote
+  /// static key differs, and this session fails closed. A mismatch never
+  /// overwrites the pin and never falls back to plaintext.
+  final Uint8List? pinnedRemotePublicKey;
+
+  /// Optional expected peer device ID checked against the **authenticated**
+  /// remote identity (in addition to the engine's own check).
+  final String? expectedPeerDeviceId;
+
+  /// When true, the authenticated remote device ID must equal the device ID
+  /// from the plaintext pre-secure HELLO. The HELLO is an unauthenticated
+  /// hint; it is only ever compared against, never trusted as proof and
+  /// never allowed to override authenticated fields.
+  final bool requireHelloBinding;
+
+  /// Surfaces the authenticated remote identity when the handshake finishes,
+  /// for the owning application's authorization UI. Invoked on the
+  /// [awaitingConfirmation] transition; performs no persistence.
+  final void Function(RemoteAuthenticatedIdentity identity)? onRemoteIdentity;
+}
+
 class BleAckPolicy {
   const BleAckPolicy({
     this.baseTimeout = const Duration(seconds: 10),
@@ -75,6 +178,7 @@ class BleLinkSession {
     this.onClosed,
     this.ackPolicy = const BleAckPolicy(),
     this.handshakeTimeout = const Duration(seconds: 15),
+    this.secure,
     int Function()? transferIdFactory,
   }) : _transferIdFactory =
            transferIdFactory ?? (() => 1 + Random.secure().nextInt(0xffff));
@@ -86,9 +190,16 @@ class BleLinkSession {
   final void Function(Object? error)? onClosed;
   final BleAckPolicy ackPolicy;
   final Duration handshakeTimeout;
+
+  /// Opt-in secure-mode configuration. `null` (the production default) keeps
+  /// this session entirely on the legacy v1 plaintext path.
+  final BleSecureSessionConfig? secure;
+
   final int Function() _transferIdFactory;
 
   final BleTransferAssembler _assembler = BleTransferAssembler();
+  final BleSecureTransferAssembler _secureAssembler =
+      BleSecureTransferAssembler();
   final Map<String, Completer<BleAck>> _pendingAcks = {};
   final Completer<BleHello> _helloCompleter = Completer<BleHello>();
 
@@ -100,9 +211,28 @@ class BleLinkSession {
   Object? _closeError;
   bool _closed = false;
 
+  // Secure-mode state. All fields are inert when [secure] is null.
+  BleSecureLinkState _secureState = BleSecureLinkState.idle;
+  SecureSessionHandle? _secureHandle;
+  RemoteAuthenticatedIdentity? _secureRemoteIdentity;
+  Timer? _secureHandshakeTimer;
+
   BleSessionState get state => _state;
   BleHello? get linkInfo => _hello;
   bool get isReady => _state == BleSessionState.ready;
+
+  /// The secure state machine's state, or null for legacy v1 sessions.
+  BleSecureLinkState? get secureState => secure == null ? null : _secureState;
+
+  /// Whether the Noise handshake finished and the peer identity was
+  /// explicitly confirmed. Always false for legacy v1 sessions.
+  bool get isSecureReady => _secureState == BleSecureLinkState.secureReady;
+
+  /// The authenticated remote identity surfaced by the finished handshake,
+  /// before or after confirmation. Null for legacy sessions and until the
+  /// handshake authenticates the peer.
+  RemoteAuthenticatedIdentity? get secureRemoteIdentity =>
+      _secureRemoteIdentity;
 
   Future<BleHello> start() async {
     if (_state != BleSessionState.idle) {
@@ -129,7 +259,14 @@ class BleLinkSession {
       });
       final remote = await _helloCompleter.future.timeout(handshakeTimeout);
       _hello = remote;
-      _state = BleSessionState.ready;
+      if (secure != null) {
+        // Secure mode: an exchanged HELLO is only the pre-secure context,
+        // never readiness. The link awaits explicit authorization to begin
+        // the Noise handshake.
+        _secureState = BleSecureLinkState.awaitingAuthorization;
+      } else {
+        _state = BleSessionState.ready;
+      }
       return remote;
     } catch (error) {
       await close(error);
@@ -141,6 +278,14 @@ class BleLinkSession {
     Message message, {
     Future<void> Function()? onTransmitted,
   }) async {
+    if (secure != null) {
+      // The encrypted application-message path lands in a later phase. A
+      // secure-mode session must never silently use the v1 plaintext
+      // encoder, so it fails closed in every secure state, ready or not.
+      throw const BleLinkException(
+        'Secure message delivery is not yet integrated on this link',
+      );
+    }
     if (!isReady) {
       throw const BleLinkClosedException('BLE link is not ready');
     }
@@ -214,7 +359,19 @@ class BleLinkSession {
     if (_closed) return;
     _closed = true;
     _state = BleSessionState.closed;
+    if (secure != null) {
+      if (_secureState != BleSecureLinkState.failed) {
+        // A failure keeps its terminal state for observability; a clean or
+        // transport-driven close moves to closed. Either way there is no
+        // plaintext fallback path from here.
+        _secureState = BleSecureLinkState.closed;
+      }
+      _secureHandshakeTimer?.cancel();
+      _secureHandshakeTimer = null;
+    }
     _closeError = error;
+    final secureHandle = _secureHandle;
+    _secureHandle = null;
     await _subscription?.cancel();
     _subscription = null;
     if (!_helloCompleter.isCompleted) {
@@ -230,6 +387,16 @@ class BleLinkSession {
       }
     }
     _pendingAcks.clear();
+    if (secureHandle != null) {
+      // Close the native Noise session and invalidate the handle. The
+      // gateway is idempotent; a native close failure must not keep the
+      // link half-open, so it is swallowed like the transport close below.
+      try {
+        await secure?.gateway.closeSession(secureHandle);
+      } catch (_) {
+        // The native session may already be gone.
+      }
+    }
     try {
       await transport.close();
     } catch (_) {
@@ -238,22 +405,282 @@ class BleLinkSession {
     onClosed?.call(_closeError);
   }
 
+  /// Explicitly authorizes and starts the Noise XX handshake (application
+  /// approval seam).
+  ///
+  /// Call this only after the owning application has approved the connection;
+  /// [startSecureHandshake] is the single authorization point — nothing else
+  /// in the session begins a handshake on its own. Requires the pre-secure
+  /// HELLO exchange to have completed ([BleSecureLinkState]
+  /// .awaitingAuthorization).
+  ///
+  /// The BLE peripheral maps to the Noise initiator and starts the exchange;
+  /// the BLE central maps to the Noise responder and waits for message 1.
+  Future<void> startSecureHandshake() async {
+    final config = secure;
+    if (config == null) {
+      throw const BleLinkException('Secure mode is not enabled on this link');
+    }
+    if (_closed || _secureState == BleSecureLinkState.closed) {
+      throw const BleLinkClosedException('BLE link closed');
+    }
+    if (_secureState != BleSecureLinkState.awaitingAuthorization) {
+      throw const BleLinkException(
+        'The secure handshake cannot start in the current state',
+      );
+    }
+    _secureState = BleSecureLinkState.handshaking;
+    _armSecureHandshakeTimeout();
+    try {
+      final handle = await config.gateway.createSession(
+        initiator: config.role == BleSecureRole.initiator,
+        deviceId: identity.deviceId,
+        displayName: identity.displayName,
+        pinnedRemotePublicKey: config.pinnedRemotePublicKey,
+        expectedRemoteDeviceId: config.expectedPeerDeviceId,
+      );
+      if (_closed) {
+        try {
+          await config.gateway.closeSession(handle);
+        } catch (_) {
+          // The link is already gone; nothing further to clean up.
+        }
+        return;
+      }
+      _secureHandle = handle;
+      if (config.role == BleSecureRole.initiator) {
+        final step = await config.gateway.startHandshake(handle);
+        if (_closed || !identical(_secureHandle, handle)) {
+          // Closed or replaced while the native call was in flight.
+          return;
+        }
+        await _applyHandshakeStep(config, handle, step);
+      }
+      // The responder waits for the initiator's message 1 over the link.
+    } catch (error) {
+      if (!_closed && _secureState != BleSecureLinkState.failed) {
+        await _failSecure(error);
+      }
+      rethrow;
+    }
+  }
+
+  /// Explicitly accepts the authenticated remote identity surfaced by a
+  /// finished handshake, moving the link to secure-ready.
+  ///
+  /// This is the application's identity-confirmation decision; the session
+  /// never confirms on its own and never writes any peer state.
+  Future<void> confirmSecurePeerIdentity() async {
+    final config = secure;
+    final handle = _secureHandle;
+    if (config == null) {
+      throw const BleLinkException('Secure mode is not enabled on this link');
+    }
+    if (handle == null ||
+        _secureState != BleSecureLinkState.awaitingConfirmation) {
+      throw const BleLinkException(
+        'There is no authenticated peer identity awaiting confirmation',
+      );
+    }
+    try {
+      await config.gateway.confirmPeerIdentity(handle);
+    } catch (error) {
+      if (!_closed && _secureState != BleSecureLinkState.failed) {
+        await _failSecure(error);
+      }
+      rethrow;
+    }
+    if (_closed || !identical(_secureHandle, handle)) {
+      // Closed or replaced while confirmation was in flight.
+      return;
+    }
+    _secureHandshakeTimer?.cancel();
+    _secureHandshakeTimer = null;
+    _secureState = BleSecureLinkState.secureReady;
+    _state = BleSessionState.ready;
+  }
+
+  /// Applies one native handshake step: transmits any outbound handshake
+  /// message over protocol-v2 framing and, when the handshake finished,
+  /// validates the authenticated identity before exposing it.
+  Future<void> _applyHandshakeStep(
+    BleSecureSessionConfig config,
+    SecureSessionHandle handle,
+    HandshakeStepResult step,
+  ) async {
+    if (step.outgoing.isNotEmpty) {
+      final outgoing = step.outgoing;
+      await _enqueue(() async {
+        await _writeSecureHandshake(outgoing);
+      });
+    }
+    if (!step.finished) return;
+
+    _secureHandshakeTimer?.cancel();
+    _secureHandshakeTimer = null;
+
+    final remote = step.remoteIdentity;
+    if (remote == null) {
+      await _failSecure(
+        const BleLinkException(
+          'The secure handshake finished without an authenticated identity',
+        ),
+      );
+      return;
+    }
+    final expected = config.expectedPeerDeviceId;
+    if (expected != null && remote.deviceId != expected) {
+      // Fail closed on an authenticated identity that is not the expected
+      // peer. Nothing is persisted and no saved peer is overwritten.
+      await _failSecure(
+        const BleLinkException(
+          'The authenticated peer does not match the expected peer',
+        ),
+      );
+      return;
+    }
+    final hello = _hello;
+    if (config.requireHelloBinding &&
+        (hello == null || remote.deviceId != hello.deviceId)) {
+      // The plaintext HELLO is an unauthenticated hint; when binding is
+      // required, disagreement with the authenticated identity fails
+      // closed. The authenticated fields are never rewritten from HELLO.
+      await _failSecure(
+        const BleLinkException(
+          'The authenticated peer does not match the exchanged HELLO',
+        ),
+      );
+      return;
+    }
+    if (_closed || !identical(_secureHandle, handle)) {
+      return;
+    }
+    _secureRemoteIdentity = remote;
+    _secureState = BleSecureLinkState.awaitingConfirmation;
+    config.onRemoteIdentity?.call(remote);
+  }
+
+  /// Sends one opaque Noise handshake message over protocol-v2 framing
+  /// through the existing write serialization path.
+  Future<void> _writeSecureHandshake(Uint8List payload) async {
+    final frames = BleSecureTransferCodec.fragment(
+      kind: BleSecureTransferKind.secureHandshake,
+      payload: payload,
+      maxWriteLength: transport.maximumWriteLength,
+      transferId: _nextTransferId(),
+    );
+    for (final frame in frames) {
+      await transport.write(frame);
+    }
+  }
+
+  void _armSecureHandshakeTimeout() {
+    _secureHandshakeTimer?.cancel();
+    _secureHandshakeTimer = Timer(handshakeTimeout, () {
+      if (_closed || _secureState != BleSecureLinkState.handshaking) return;
+      unawaited(_failSecure(const BleSecureHandshakeTimeoutException()));
+    });
+  }
+
+  /// Fails the secure session closed: marks it failed, tears down the native
+  /// session, and closes the link. Never falls back to plaintext.
+  Future<void> _failSecure(Object error) async {
+    _secureState = BleSecureLinkState.failed;
+    _secureHandshakeTimer?.cancel();
+    _secureHandshakeTimer = null;
+    if (!_closed) {
+      await close(error);
+    }
+  }
+
   void _queueIncoming(Uint8List bytes) {
     _rxTail = _rxTail.then((_) async {
       if (_closed) return;
       try {
+        if (secure != null && _isSecureVersionFrame(bytes)) {
+          final frame = BleSecureFrame.decode(bytes);
+          final transfer = _secureAssembler.add(frame);
+          if (transfer != null) {
+            await _handleSecureTransfer(transfer);
+          }
+          return;
+        }
         final frame = BleFrame.decode(bytes);
         final transfer = _assembler.add(frame);
         if (transfer != null) {
           await _handleTransfer(transfer);
         }
       } catch (error) {
-        await close(error);
+        if (secure != null &&
+            _secureState != BleSecureLinkState.failed &&
+            _secureState != BleSecureLinkState.closed) {
+          // Secure-mode protocol or gateway failures are terminal: mark the
+          // secure session failed (which tears down the native session and
+          // closes the link). Never a plaintext fallback.
+          await _failSecure(error);
+        } else {
+          await close(error);
+        }
       }
     });
   }
 
+  /// Phase-aware dispatch: only a secure-mode session routes protocol-v2
+  /// frames to the secure decoder, and only the version byte decides. A
+  /// legacy session never consults the secure decoder at all, and a v1
+  /// frame never reaches it either. Frames with any other version fall
+  /// through to the v1 decoder, which rejects them.
+  bool _isSecureVersionFrame(Uint8List bytes) =>
+      bytes.length >= 2 && bytes[1] == BleSecureProtocol.version;
+
+  Future<void> _handleSecureTransfer(BleSecureTransfer transfer) async {
+    // Enforce the per-kind size bounds on receive, before any native call
+    // allocates for the payload. The engine has its own limits; this keeps
+    // the BLE framing layer from forwarding an oversized handshake.
+    BleSecureTransferCodec.validatePayload(transfer.kind, transfer.payload);
+    switch (transfer.kind) {
+      case BleSecureTransferKind.secureHandshake:
+        await _handleSecureHandshake(transfer.payload);
+      case BleSecureTransferKind.secureMessage:
+      case BleSecureTransferKind.secureAck:
+        // The encrypted application-message and ACK path lands in a later
+        // phase. Until then a secure link must never accept or emit
+        // application traffic, so it fails closed with fixed text.
+        throw const BleLinkException(
+          'Secure message delivery is not yet integrated on this link',
+        );
+    }
+  }
+
+  Future<void> _handleSecureHandshake(Uint8List payload) async {
+    final config = secure;
+    final handle = _secureHandle;
+    if (config == null ||
+        handle == null ||
+        _secureState != BleSecureLinkState.handshaking) {
+      // Handshake messages are only valid while this session's own Noise
+      // handshake is running; anything else fails closed.
+      throw const BleLinkException('Unexpected secure handshake message');
+    }
+    final step = await config.gateway.processHandshake(handle, payload);
+    if (_closed || !identical(_secureHandle, handle)) {
+      // The link was closed or the session replaced while the native call
+      // was in flight; this late result must not change any state.
+      return;
+    }
+    await _applyHandshakeStep(config, handle, step);
+  }
+
   Future<void> _handleTransfer(BleTransfer transfer) async {
+    if (secure != null &&
+        (transfer.kind == BleTransferKind.message ||
+            transfer.kind == BleTransferKind.acknowledgement)) {
+      // A secure-mode link never accepts plaintext application messages or
+      // ACKs, in any state. There is no downgrade path.
+      throw const BleLinkException(
+        'Plaintext application traffic is not accepted on a secure link',
+      );
+    }
     switch (transfer.kind) {
       case BleTransferKind.hello:
         await _handleHello(transfer.payload);
