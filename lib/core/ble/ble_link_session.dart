@@ -85,8 +85,9 @@ enum BleSecureLinkState {
   /// awaiting explicit peer-identity confirmation.
   awaitingConfirmation,
 
-  /// Authenticated, confirmed, encrypted session (still no application
-  /// messaging until the secure message path lands in a later phase).
+  /// Authenticated, confirmed, encrypted session. Application messages and
+  /// acknowledgements travel exclusively as Noise-encrypted secureMessage /
+  /// secureAck payloads; there is never a plaintext fallback.
   secureReady,
 
   /// Terminal fail-closed state (timeout, malformed input, identity
@@ -279,12 +280,7 @@ class BleLinkSession {
     Future<void> Function()? onTransmitted,
   }) async {
     if (secure != null) {
-      // The encrypted application-message path lands in a later phase. A
-      // secure-mode session must never silently use the v1 plaintext
-      // encoder, so it fails closed in every secure state, ready or not.
-      throw const BleLinkException(
-        'Secure message delivery is not yet integrated on this link',
-      );
+      return _sendSecureMessage(message, onTransmitted: onTransmitted);
     }
     if (!isReady) {
       throw const BleLinkClosedException('BLE link is not ready');
@@ -304,23 +300,7 @@ class BleLinkSession {
       );
     }
 
-    final contentBytes = _utf8Length(message.content);
-    if (contentBytes > BleProtocol.maxMessageContentBytes) {
-      throw const BleLinkException('Message content is too large');
-    }
-    final payload = BleMessagePayload(
-      metadata: BleMessageMetadata(
-        messageId: message.messageId,
-        senderId: message.senderId,
-        receiverId: message.receiverId,
-        messageType: message.messageType.name,
-        timestamp: message.timestamp,
-        ttl: message.ttl,
-        contentLength: contentBytes,
-        isEncrypted: message.isEncrypted,
-      ),
-      content: message.content,
-    ).encode();
+    final payload = _encodeOutboundMessage(message);
 
     final frames = BleTransferCodec.fragment(
       kind: BleTransferKind.message,
@@ -349,6 +329,151 @@ class BleLinkSession {
       }
       return ack.result;
     } on TimeoutException {
+      throw BleAckTimeoutException(message.messageId, timeout);
+    } finally {
+      _pendingAcks.remove(message.messageId);
+    }
+  }
+
+  /// Encodes an outbound application message with the existing v1 application
+  /// codec.
+  ///
+  /// Shared by the legacy plaintext path and the secure path so both produce
+  /// byte-identical inner payloads; the secure path only adds Noise encryption
+  /// around the result. Validation order matches the legacy sender exactly.
+  Uint8List _encodeOutboundMessage(Message message) {
+    final contentBytes = _utf8Length(message.content);
+    if (contentBytes > BleProtocol.maxMessageContentBytes) {
+      throw const BleLinkException('Message content is too large');
+    }
+    return BleMessagePayload(
+      metadata: BleMessageMetadata(
+        messageId: message.messageId,
+        senderId: message.senderId,
+        receiverId: message.receiverId,
+        messageType: message.messageType.name,
+        timestamp: message.timestamp,
+        ttl: message.ttl,
+        contentLength: contentBytes,
+        isEncrypted: message.isEncrypted,
+      ),
+      content: message.content,
+    ).encode();
+  }
+
+  /// Secure-mode outbound application message: encode once with the existing
+  /// codec, encrypt through the Noise gateway, wrap the opaque ciphertext in a
+  /// v2 `secureMessage`, write it on the serialized TX path, and complete only
+  /// on the matching authenticated `secureAck`.
+  ///
+  /// Counter safety: a Noise transport message consumes a send counter at
+  /// encryption time, so encryption happens *inside* the TX queue (encrypt
+  /// order == wire order) and is never repeated on this session. A failed
+  /// encrypt/write or an ACK timeout therefore fails the send **and** closes
+  /// the secure session; recovery is a fresh connection plus a fresh
+  /// handshake, where a higher layer may retry the message. There is no
+  /// plaintext fallback and no counter reset, ever.
+  Future<BleAckResult> _sendSecureMessage(
+    Message message, {
+    Future<void> Function()? onTransmitted,
+  }) async {
+    if (_closed || _state == BleSessionState.closed) {
+      throw const BleLinkClosedException('BLE link is not ready');
+    }
+    if (_secureState != BleSecureLinkState.secureReady) {
+      throw const BleLinkException(
+        'The secure session is not ready for messaging',
+      );
+    }
+    final remote = _secureRemoteIdentity;
+    if (remote == null || message.receiverId != remote.deviceId) {
+      // Bound to the *authenticated* remote identity, never to the
+      // unauthenticated pre-secure HELLO.
+      throw const BleLinkException('Message receiver does not match the link');
+    }
+    if (message.isEncrypted) {
+      throw const BleLinkException(
+        'Encrypted messages are not supported in Phase 2',
+      );
+    }
+    if (_pendingAcks.containsKey(message.messageId)) {
+      throw BleLinkException(
+        'Message ${message.messageId} is already awaiting acknowledgement',
+      );
+    }
+
+    final plaintext = _encodeOutboundMessage(message);
+    if (plaintext.length > BleSecureProtocol.maxTransportPlaintextBytes) {
+      // Reject oversized plaintext before any large allocation or native
+      // encryption call (the Rust engine enforces the same bound).
+      throw const BleLinkException('Message content is too large');
+    }
+
+    final completer = Completer<BleAck>();
+    _pendingAcks[message.messageId] = completer;
+    // Never leave the pending completer's error unhandled if the link closes
+    // while this send is still queued or waiting for its acknowledgement.
+    unawaited(completer.future.then<void>((_) {}, onError: (_) {}));
+
+    var ciphertextBytes = 0;
+    var frameCount = 0;
+    try {
+      await _enqueue(() async {
+        final config = secure;
+        final handle = _secureHandle;
+        if (config == null ||
+            handle == null ||
+            _closed ||
+            _secureState != BleSecureLinkState.secureReady) {
+          throw const BleLinkClosedException('Secure session is not ready');
+        }
+        // Encrypt and write inside the serialized TX path so the Noise send
+        // counter advances in exactly the order frames hit the wire.
+        final sealed = await config.gateway.encrypt(handle, plaintext);
+        final frames = BleSecureTransferCodec.fragment(
+          kind: BleSecureTransferKind.secureMessage,
+          payload: sealed,
+          maxWriteLength: transport.maximumWriteLength,
+          transferId: _nextTransferId(),
+        );
+        ciphertextBytes = sealed.length;
+        frameCount = frames.length;
+        for (final frame in frames) {
+          await transport.write(frame);
+        }
+      });
+    } catch (error) {
+      // A failed encrypt or write makes transport-counter synchronization
+      // uncertain: fail this send and tear the secure session down so a
+      // later attempt runs on a freshly handshaked session.
+      _pendingAcks.remove(message.messageId);
+      if (!_closed && _secureState != BleSecureLinkState.failed) {
+        await _failSecure(error);
+      }
+      rethrow;
+    }
+
+    final timeout = ackPolicy.timeoutFor(
+      bytes: ciphertextBytes,
+      frameCount: frameCount,
+    );
+    try {
+      await onTransmitted?.call();
+      final ack = await completer.future.timeout(timeout);
+      if (ack.result == BleAckResult.rejected &&
+          ack.reason?.contains(BleProtocol.approvalPendingReason) == true) {
+        throw BleApprovalPendingException(message.messageId);
+      }
+      return ack.result;
+    } on TimeoutException {
+      // Counter safety: an unacknowledged ciphertext may already be on the
+      // peer's wire, so this session can never be reused for a re-encrypt.
+      // Drop the pending entry first (so close() cannot error an abandoned
+      // completer), then invalidate the session.
+      _pendingAcks.remove(message.messageId);
+      if (!_closed && _secureState != BleSecureLinkState.failed) {
+        await _failSecure(BleAckTimeoutException(message.messageId, timeout));
+      }
       throw BleAckTimeoutException(message.messageId, timeout);
     } finally {
       _pendingAcks.remove(message.messageId);
@@ -511,7 +636,10 @@ class BleLinkSession {
     if (step.outgoing.isNotEmpty) {
       final outgoing = step.outgoing;
       await _enqueue(() async {
-        await _writeSecureHandshake(outgoing);
+        await _writeSecureTransfer(
+          BleSecureTransferKind.secureHandshake,
+          outgoing,
+        );
       });
     }
     if (!step.finished) return;
@@ -560,11 +688,15 @@ class BleLinkSession {
     config.onRemoteIdentity?.call(remote);
   }
 
-  /// Sends one opaque Noise handshake message over protocol-v2 framing
-  /// through the existing write serialization path.
-  Future<void> _writeSecureHandshake(Uint8List payload) async {
+  /// Sends one opaque Noise payload (handshake message, encrypted application
+  /// message, or encrypted acknowledgement) over protocol-v2 framing through
+  /// the existing write serialization path.
+  Future<void> _writeSecureTransfer(
+    BleSecureTransferKind kind,
+    Uint8List payload,
+  ) async {
     final frames = BleSecureTransferCodec.fragment(
-      kind: BleSecureTransferKind.secureHandshake,
+      kind: kind,
       payload: payload,
       maxWriteLength: transport.maximumWriteLength,
       transferId: _nextTransferId(),
@@ -636,20 +768,117 @@ class BleLinkSession {
   Future<void> _handleSecureTransfer(BleSecureTransfer transfer) async {
     // Enforce the per-kind size bounds on receive, before any native call
     // allocates for the payload. The engine has its own limits; this keeps
-    // the BLE framing layer from forwarding an oversized handshake.
+    // the BLE framing layer from forwarding an oversized handshake or
+    // transport payload.
     BleSecureTransferCodec.validatePayload(transfer.kind, transfer.payload);
     switch (transfer.kind) {
       case BleSecureTransferKind.secureHandshake:
         await _handleSecureHandshake(transfer.payload);
       case BleSecureTransferKind.secureMessage:
+        await _handleSecureMessage(transfer.payload);
       case BleSecureTransferKind.secureAck:
-        // The encrypted application-message and ACK path lands in a later
-        // phase. Until then a secure link must never accept or emit
-        // application traffic, so it fails closed with fixed text.
-        throw const BleLinkException(
-          'Secure message delivery is not yet integrated on this link',
-        );
+        await _handleSecureAck(transfer.payload);
     }
+  }
+
+  /// The confirmed Noise session used for application transport.
+  ///
+  /// Application traffic is acceptable only on this session's own confirmed,
+  /// ready transport; anything else fails closed (never a plaintext path).
+  (BleSecureSessionConfig, SecureSessionHandle) _requireSecureTransport(
+    String what,
+  ) {
+    final config = secure;
+    final handle = _secureHandle;
+    if (config == null ||
+        handle == null ||
+        _closed ||
+        _secureState != BleSecureLinkState.secureReady) {
+      throw BleLinkException('Unexpected secure $what');
+    }
+    return (config, handle);
+  }
+
+  /// Secure-mode inbound application message: reassemble, decrypt exactly once
+  /// through the Noise gateway, decode with the existing application codec,
+  /// reuse the existing [onMessage] callback (validation, persistence, dedup)
+  /// and its [BleAckResult], then encrypt that ACK and send it as a v2
+  /// `secureAck`.
+  ///
+  /// Nothing is stored before authenticated decryption and decoding succeed,
+  /// and a decrypt/decode failure propagates to [_queueIncoming], which fails
+  /// the session closed rather than falling back to the legacy handler.
+  Future<void> _handleSecureMessage(Uint8List payload) async {
+    final (config, handle) = _requireSecureTransport('message');
+    final plaintext = await config.gateway.decrypt(handle, payload);
+    if (_closed || !identical(_secureHandle, handle)) {
+      // The link was closed or the session replaced while the native call was
+      // in flight; this late plaintext must not change any state.
+      return;
+    }
+    // Authenticated plaintext, decoded once. Any malformed payload throws and
+    // tears the session down; it is never retried as a legacy message.
+    final message = BleMessagePayload.decode(plaintext);
+
+    final remote = _secureRemoteIdentity;
+    if (remote == null) {
+      throw const BleLinkException('Secure session has no authenticated peer');
+    }
+
+    BleAckResult result;
+    String? reason;
+    try {
+      if (message.metadata.receiverId != identity.deviceId ||
+          message.metadata.senderId != remote.deviceId) {
+        // Transport-level binding to this session's authenticated peer, on
+        // top of the application callback's own linked-peer validation.
+        throw const BleLinkException(
+          'Secure message does not match the authenticated link',
+        );
+      }
+      result = await onMessage(message);
+    } catch (error) {
+      // Existing application-level rejection semantics: the reason travels
+      // only inside the encrypted acknowledgement, never as plaintext.
+      result = BleAckResult.rejected;
+      reason = error.toString();
+    }
+
+    final ack = BleAck(
+      messageId: message.metadata.messageId,
+      result: result,
+      reason: reason,
+    );
+    final ackBytes = ack.encode();
+    await _enqueue(() async {
+      final (config, handle) = _requireSecureTransport('acknowledgement');
+      // Encrypt inside the serialized TX path so the send counter advances
+      // in wire order, exactly like outbound messages.
+      final sealed = await config.gateway.encrypt(handle, ackBytes);
+      await _writeSecureTransfer(BleSecureTransferKind.secureAck, sealed);
+    });
+  }
+
+  /// Secure-mode inbound acknowledgement: decrypt exactly once, decode the
+  /// existing ACK representation, and complete only the pending operation
+  /// whose message ID matches.
+  ///
+  /// A valid but unmatched ACK is consumed (so the receive counter stays in
+  /// sync) and then ignored; a malformed ACK fails the session closed. The
+  /// decrypt always happens before the correlation decision, and only on this
+  /// session's own confirmed transport.
+  Future<void> _handleSecureAck(Uint8List payload) async {
+    final (config, handle) = _requireSecureTransport('acknowledgement');
+    final plaintext = await config.gateway.decrypt(handle, payload);
+    if (_closed || !identical(_secureHandle, handle)) {
+      // A late ACK from a closed or replaced session completes nothing.
+      return;
+    }
+    final ack = BleAck.decode(plaintext);
+    final completer = _pendingAcks[ack.messageId];
+    if (completer == null || completer.isCompleted) return;
+    _pendingAcks.remove(ack.messageId);
+    completer.complete(ack);
   }
 
   Future<void> _handleSecureHandshake(Uint8List payload) async {

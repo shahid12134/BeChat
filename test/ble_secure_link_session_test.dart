@@ -1,14 +1,14 @@
-import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
-import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/services/crypto/native_secure_session_service.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'helpers/ble_secure_fixtures.dart';
 
 // The fake gateway in this file simulates the *call contract* of the native
 // Noise engine (message ordering, finishing steps, pin enforcement points).
@@ -32,7 +32,7 @@ void main() {
         expect(pair.sessionB.isSecureReady, isFalse);
         expect(pair.sessionA.isReady, isTrue);
 
-        final result = await pair.sessionA.sendMessage(_message());
+        final result = await pair.sessionA.sendMessage(testMessage());
         expect(result, BleAckResult.stored);
         expect(pair.receivedOnB, hasLength(1));
       },
@@ -40,7 +40,7 @@ void main() {
 
     test('secure mode is opt-in: no native session exists before '
         'startSecureHandshake', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
 
       expect(
@@ -64,7 +64,7 @@ void main() {
   group('handshake sequence and role mapping', () {
     test('peripheral/initiator and central/responder complete Noise XX in '
         'order and reach secure-ready only after confirmation', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
 
       await pair.authorize();
@@ -97,7 +97,7 @@ void main() {
 
     test('the initiator drives createSession/startHandshake then processes '
         'one message; the responder only processes inbound messages', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -119,12 +119,12 @@ void main() {
 
     test('every handshake byte travels as protocol-v2 frames; the only v1 '
         'transfer ever written is the pre-secure HELLO', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.ready();
 
       // v1 traffic: exactly one HELLO transfer per side, nothing else.
-      expect(_v1KindsWritten(pair.transportA), [BleTransferKind.hello]);
-      expect(_v1KindsWritten(pair.transportB), [BleTransferKind.hello]);
+      expect(v1KindsWritten(pair.transportA), [BleTransferKind.hello]);
+      expect(v1KindsWritten(pair.transportB), [BleTransferKind.hello]);
 
       // The initiator wrote protocol-v2 handshake frames after the HELLO.
       final secureFrames = pair.transportA.writes
@@ -137,7 +137,7 @@ void main() {
       'authorization is required twice over: no readiness at HELLO, none '
       'at handshake end, secure-ready only after explicit confirmation',
       () async {
-        final pair = _SecurePair();
+        final pair = SecurePair();
         await pair.start();
         // HELLO exchanged, but awaiting authorization:
         expect(pair.sessionA.isReady, isFalse);
@@ -157,7 +157,7 @@ void main() {
   group('authorization and approval boundaries', () {
     test('a rejected HELLO keeps the link out of secure mode entirely and '
         'creates no native session', () async {
-      final pair = _SecurePair(rejectHelloOnB: true);
+      final pair = SecurePair(rejectHelloOnB: true);
 
       await expectLater(pair.start(), throwsA(anything));
       expect(pair.sessionA.isSecureReady, isFalse);
@@ -169,7 +169,7 @@ void main() {
     });
 
     test('startSecureHandshake cannot run before HELLO or twice', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
 
       await pair.sessionA.startSecureHandshake();
@@ -188,7 +188,7 @@ void main() {
     test(
       'confirmSecurePeerIdentity is rejected before the handshake finishes',
       () async {
-        final pair = _SecurePair();
+        final pair = SecurePair();
         await pair.start();
         await pair.sessionB.startSecureHandshake();
         // B is handshaking (no messages exchanged yet).
@@ -230,7 +230,7 @@ void main() {
     test('the authenticated identity is surfaced and never overwritten by '
         'the plaintext HELLO', () async {
       RemoteAuthenticatedIdentity? surfaced;
-      final pair = _SecurePair(onIdentityA: (identity) => surfaced = identity);
+      final pair = SecurePair(onIdentityA: (identity) => surfaced = identity);
       await pair.start();
       expect(
         pair.sessionA.linkInfo?.deviceId,
@@ -245,7 +245,7 @@ void main() {
       expect(remote, isNotNull);
       expect(remote!.deviceId, 'device-b');
       expect(remote.displayName, 'Bob');
-      expect(remote.publicKeyHex, _hex(_deviceB.staticKey));
+      expect(remote.publicKeyHex, hexOf(deviceB.staticKey));
       expect(
         surfaced,
         same(remote),
@@ -257,7 +257,7 @@ void main() {
 
     test('an authenticated device ID that mismatches the expected peer fails '
         'closed and persists nothing', () async {
-      final pair = _SecurePair(expectedPeerDeviceIdA: 'device-x');
+      final pair = SecurePair(expectedPeerDeviceIdA: 'device-x');
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -275,13 +275,13 @@ void main() {
       );
       // The native session was torn down; no plaintext fallback was written.
       expect(pair.gateway.closedHandles, contains(pair.sessionAHandle));
-      expect(_v1KindsWritten(pair.transportA), [BleTransferKind.hello]);
+      expect(v1KindsWritten(pair.transportA), [BleTransferKind.hello]);
     });
 
     test('a wrong pinned key fails closed; the pin is forwarded to the '
         'engine and never overwritten', () async {
       final wrongPin = Uint8List.fromList(List.filled(32, 0x09));
-      final pair = _SecurePair(pinA: wrongPin);
+      final pair = SecurePair(pinA: wrongPin);
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -293,14 +293,14 @@ void main() {
       expect(pair.gateway.closedHandles, contains(pair.sessionAHandle));
       expect(pair.gateway.pinForwardedA, wrongPin);
       expect(
-        _v1KindsWritten(pair.transportA),
+        v1KindsWritten(pair.transportA),
         [BleTransferKind.hello],
         reason: 'no plaintext application traffic after the failure',
       );
     });
 
     test('the correct pinned key lets the handshake finish', () async {
-      final pair = _SecurePair(pinA: _deviceB.staticKey);
+      final pair = SecurePair(pinA: deviceB.staticKey);
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -316,7 +316,7 @@ void main() {
         'passes when the identities agree', () async {
       // Mismatch: the authenticated identity says device-evil while the
       // plaintext HELLO said device-b.
-      final mismatch = _SecurePair(
+      final mismatch = SecurePair(
         requireHelloBindingA: true,
         remoteIdentityForA: const RemoteAuthenticatedIdentity(
           publicKeyHex: 'aa',
@@ -341,7 +341,7 @@ void main() {
       );
 
       // Control: binding required but identities agree -> completes.
-      final match = _SecurePair(requireHelloBindingA: true);
+      final match = SecurePair(requireHelloBindingA: true);
       await match.start();
       await match.authorize();
       await match.pump();
@@ -354,12 +354,12 @@ void main() {
 
   group('invalid input and unexpected traffic fail closed', () {
     test('a handshake message in the wrong state is rejected', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       // B is only awaiting authorization; deliver a v2 handshake transfer.
       for (final frame in BleSecureTransferCodec.fragment(
         kind: BleSecureTransferKind.secureHandshake,
-        payload: _msg1,
+        payload: secureMsg1,
         maxWriteLength: pair.transportB.maximumWriteLength,
         transferId: 42,
       )) {
@@ -380,7 +380,7 @@ void main() {
     });
 
     test('a truncated secure frame fails the link', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -393,7 +393,7 @@ void main() {
     });
 
     test('an unsupported protocol version fails the link', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -407,7 +407,7 @@ void main() {
     });
 
     test('an invalid fragment sequence fails the link', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -419,8 +419,8 @@ void main() {
           sequence: 0,
           payload: BleSecureStartPayload(
             kind: BleSecureTransferKind.secureHandshake,
-            totalLength: _msg1.length,
-            checksum: BleSecureTransferCodec.checksum(_msg1),
+            totalLength: secureMsg1.length,
+            checksum: BleSecureTransferCodec.checksum(secureMsg1),
           ).encode(),
         ).encode(),
       );
@@ -429,7 +429,7 @@ void main() {
           type: BleFrameType.data,
           transferId: 9,
           sequence: 5, // must be 1
-          payload: _msg1,
+          payload: secureMsg1,
         ).encode(),
       );
       await pair.pump();
@@ -438,7 +438,7 @@ void main() {
     });
 
     test('an oversized handshake transfer is rejected on receive', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       await pair.authorize();
       await pair.pump();
@@ -473,7 +473,7 @@ void main() {
 
     test('a plaintext v1 message frame on a secure link is rejected and never '
         'reaches onMessage', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.ready();
 
       final payload = BleMessagePayload(
@@ -515,7 +515,7 @@ void main() {
     test(
       'a plaintext v1 acknowledgement on a secure link is rejected',
       () async {
-        final pair = _SecurePair();
+        final pair = SecurePair();
         await pair.ready();
 
         final ack = BleAck(
@@ -544,11 +544,14 @@ void main() {
       },
     );
 
-    test('a v2 secureMessage frame is rejected until the secure messaging '
-        'path exists', () async {
-      final pair = _SecurePair();
+    test('an unauthenticated secureMessage payload fails the link closed and '
+        'never reaches the application decoder', () async {
+      final pair = SecurePair();
       await pair.ready();
 
+      // Forged bytes that are not a valid transport payload for the engine:
+      // the decrypt must reject them before any application decoding, and the
+      // session must not survive the failed authentication.
       for (final frame in BleSecureTransferCodec.fragment(
         kind: BleSecureTransferKind.secureMessage,
         payload: Uint8List.fromList(List.filled(32, 0x77)),
@@ -560,48 +563,52 @@ void main() {
       await pair.pump();
 
       expect(pair.sessionA.state, BleSessionState.closed);
+      expect(pair.sessionA.secureState, BleSecureLinkState.failed);
       expect(pair.receivedOnA, isEmpty);
       expect(
         pair.closedErrorsA.single,
-        isA<BleLinkException>().having(
+        isA<SecureSessionNativeFailure>().having(
           (e) => e.message,
           'message',
-          contains('not yet integrated'),
+          contains('authentication'),
         ),
+      );
+      expect(
+        pair.gateway.decryptHandles,
+        [pair.sessionAHandle],
+        reason: 'exactly one decrypt ran and it failed authentication',
+      );
+      expect(
+        v1KindsWritten(pair.transportA),
+        [BleTransferKind.hello],
+        reason: 'a failed secure decrypt never falls back to plaintext',
       );
     });
   });
 
   group('application message boundary', () {
-    test('sendMessage fails closed in every secure state and never emits a '
-        'plaintext message frame', () async {
-      final pair = _SecurePair();
+    test('sendMessage is refused in every non-ready secure state and never '
+        'emits a plaintext message frame', () async {
+      final pair = SecurePair();
       await pair.start();
       await expectLater(
-        pair.sessionA.sendMessage(_message()),
+        pair.sessionA.sendMessage(testMessage()),
         throwsA(isA<BleLinkException>()),
       );
 
       await pair.authorize();
       await pair.pump();
       await expectLater(
-        pair.sessionA.sendMessage(_message()),
+        pair.sessionA.sendMessage(testMessage()),
         throwsA(isA<BleLinkException>()),
       );
 
-      await pair.confirmBoth();
-      await expectLater(
-        pair.sessionA.sendMessage(_message()),
-        throwsA(
-          isA<BleLinkException>().having(
-            (e) => e.message,
-            'message',
-            contains('not yet integrated'),
-          ),
-        ),
-      );
-
-      expect(_v1KindsWritten(pair.transportA), [BleTransferKind.hello]);
+      // Secure-ready messaging is covered by the secure message/ACK suite:
+      // there the same send is encoded once, encrypted, and written only as a
+      // v2 secureMessage. Here the point is that refusal never leaks a
+      // plaintext message frame or a transport crypto call.
+      expect(pair.sessionA.isSecureReady, isFalse);
+      expect(v1KindsWritten(pair.transportA), [BleTransferKind.hello]);
       expect(
         pair.gateway.applicationCryptoCalls,
         isEmpty,
@@ -613,7 +620,7 @@ void main() {
   group('timeouts, disconnects and teardown', () {
     test('a handshake timeout fails the link closed and closes the native '
         'session', () async {
-      final pair = _SecurePair(
+      final pair = SecurePair(
         handshakeTimeout: const Duration(milliseconds: 60),
       );
       await pair.start();
@@ -635,7 +642,7 @@ void main() {
     test(
       'a disconnect during the handshake closes the native session',
       () async {
-        final pair = _SecurePair();
+        final pair = SecurePair();
         await pair.start();
         await pair.authorize();
         await pair.pump(2);
@@ -651,7 +658,7 @@ void main() {
     );
 
     test('a late handshake result for a closed session is ignored', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.start();
       pair.gateway.parkProcessHandshakeFor = 'device-b';
       await pair.sessionB.startSecureHandshake();
@@ -659,7 +666,7 @@ void main() {
       // Deliver message 1 to B; its native call parks in flight.
       for (final frame in BleSecureTransferCodec.fragment(
         kind: BleSecureTransferKind.secureHandshake,
-        payload: _msg1,
+        payload: secureMsg1,
         maxWriteLength: pair.transportB.maximumWriteLength,
         transferId: 21,
       )) {
@@ -678,7 +685,7 @@ void main() {
       // The stale call now resolves with a finished step.
       pair.gateway.releaseParked!(
         HandshakeStepResult(
-          outgoing: _empty,
+          outgoing: emptyBytes,
           finished: true,
           confirmationRequired: true,
           remoteIdentity: _remoteA,
@@ -697,7 +704,7 @@ void main() {
     });
 
     test('close is idempotent: one native close, one onClosed', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.ready();
 
       await pair.sessionA.close();
@@ -715,7 +722,7 @@ void main() {
     test(
       'a gateway failure during authorization fails the link closed',
       () async {
-        final pair = _SecurePair();
+        final pair = SecurePair();
         await pair.start();
         pair.gateway.failCreateSession = const SecureSessionNativeFailure(
           'the secure session service is unavailable',
@@ -735,7 +742,7 @@ void main() {
   group('no persistence or verification side effects', () {
     test('the link session performs only gateway coordination: no extra '
         'native operations, no crypto, no verification labelling', () async {
-      final pair = _SecurePair();
+      final pair = SecurePair();
       await pair.ready();
       await pair.sessionA.close();
       await pair.sessionB.close();
@@ -760,11 +767,6 @@ void main() {
 
 // ---------------------------------------------------------------- fixtures
 
-final Uint8List _empty = Uint8List(0);
-final Uint8List _msg1 = Uint8List.fromList([0x11, 0x11, 0x11]);
-final Uint8List _msg2 = Uint8List.fromList([0x22, 0x22]);
-final Uint8List _msg3 = Uint8List.fromList([0x33, 0x33, 0x33, 0x33]);
-
 const RemoteAuthenticatedIdentity _remoteA = RemoteAuthenticatedIdentity(
   publicKeyHex: 'aa',
   deviceId: 'device-a',
@@ -772,312 +774,6 @@ const RemoteAuthenticatedIdentity _remoteA = RemoteAuthenticatedIdentity(
   protocolVersion: 1,
   capabilities: 1,
 );
-
-class _FakeDevice {
-  const _FakeDevice(this.deviceId, this.displayName, this.staticKey);
-
-  final String deviceId;
-  final String displayName;
-  final Uint8List staticKey;
-
-  RemoteAuthenticatedIdentity get identity => RemoteAuthenticatedIdentity(
-    publicKeyHex: _hex(staticKey),
-    deviceId: deviceId,
-    displayName: displayName,
-    protocolVersion: 1,
-    capabilities: 1,
-  );
-}
-
-final _deviceA = _FakeDevice(
-  'device-a',
-  'Alice',
-  Uint8List.fromList(List.filled(32, 0xaa)),
-);
-
-final _deviceB = _FakeDevice(
-  'device-b',
-  'Bob',
-  Uint8List.fromList(List.filled(32, 0xbb)),
-);
-
-String _hex(Uint8List bytes) {
-  const digits = '0123456789abcdef';
-  final out = StringBuffer();
-  for (final byte in bytes) {
-    out.write(digits[byte >> 4]);
-    out.write(digits[byte & 0x0f]);
-  }
-  return out.toString();
-}
-
-class _FakeSession {
-  _FakeSession({
-    required this.handle,
-    required this.initiator,
-    required this.localDeviceId,
-    required this.pinned,
-    required this.expectedRemoteDeviceId,
-  });
-
-  final SecureSessionHandle handle;
-  final bool initiator;
-  final String localDeviceId;
-  final Uint8List? pinned;
-  final String? expectedRemoteDeviceId;
-
-  /// 0: nothing exchanged. Initiator: 1 after msg1. Responder: 1 after msg2.
-  int step = 0;
-  bool finished = false;
-}
-
-/// Simulates the native Noise engine's *call contract*: XX message ordering,
-/// finishing steps that carry the authenticated identity, pin enforcement at
-/// completion, and explicit confirmation. It performs no cryptography.
-class _FakeSecureGateway implements SecureSessionGateway {
-  _FakeSecureGateway({
-    required List<_FakeDevice> devices,
-    this.remoteIdentityOverride,
-  }) : _devices = {for (final d in devices) d.deviceId: d};
-
-  final Map<String, _FakeDevice> _devices;
-
-  /// Local deviceId -> identity to present as that session's remote peer.
-  /// Used to script authenticated-identity mismatches.
-  final RemoteAuthenticatedIdentity? Function(String localDeviceId)?
-  remoteIdentityOverride;
-
-  final List<String> calls = [];
-  final List<SecureSessionHandle> createdHandles = [];
-  final List<SecureSessionHandle> closedHandles = [];
-  final List<Uint8List> applicationCryptoCalls = [];
-
-  Uint8List? pinForwardedA;
-
-  SecureSessionException? failCreateSession;
-  String? parkProcessHandshakeFor;
-  Completer<HandshakeStepResult>? _parked;
-  void Function(HandshakeStepResult step)? releaseParked;
-
-  final Map<SecureSessionHandle, _FakeSession> _sessions = {};
-  int _nextHandleValue = 100;
-
-  List<String> callsFor(String deviceId) => calls
-      .where((c) => c.contains('($deviceId,') || c.contains('($deviceId)'))
-      .toList();
-
-  _FakeDevice _remoteOf(String localDeviceId) =>
-      _devices.values.firstWhere((d) => d.deviceId != localDeviceId);
-
-  @override
-  Future<SecureSessionHandle> createSession({
-    required bool initiator,
-    required String deviceId,
-    required String displayName,
-    Uint8List? pinnedRemotePublicKey,
-    String? expectedRemoteDeviceId,
-  }) async {
-    calls.add('createSession($deviceId, initiator=$initiator)');
-    if (failCreateSession != null) throw failCreateSession!;
-    if (deviceId == 'device-a') pinForwardedA = pinnedRemotePublicKey;
-    final handle = SecureSessionHandle.forTesting(_nextHandleValue++);
-    createdHandles.add(handle);
-    _sessions[handle] = _FakeSession(
-      handle: handle,
-      initiator: initiator,
-      localDeviceId: deviceId,
-      pinned: pinnedRemotePublicKey,
-      expectedRemoteDeviceId: expectedRemoteDeviceId,
-    );
-    return handle;
-  }
-
-  @override
-  Future<HandshakeStepResult> startHandshake(
-    SecureSessionHandle session,
-  ) async {
-    final s = _require(session);
-    calls.add('startHandshake(${s.localDeviceId})');
-    if (!s.initiator) {
-      throw const SecureSessionNativeFailure('only the initiator starts');
-    }
-    if (s.step != 0 || s.finished) {
-      throw const SecureSessionNativeFailure('handshake already started');
-    }
-    s.step = 1;
-    return HandshakeStepResult(
-      outgoing: _msg1,
-      finished: false,
-      confirmationRequired: false,
-    );
-  }
-
-  @override
-  Future<HandshakeStepResult> processHandshake(
-    SecureSessionHandle session,
-    Uint8List incoming,
-  ) async {
-    final s = _require(session);
-    calls.add('processHandshake(${s.localDeviceId})');
-    if (s.finished) {
-      throw const SecureSessionNativeFailure('handshake already finished');
-    }
-    if (s.localDeviceId == parkProcessHandshakeFor && _parked == null) {
-      _parked = Completer<HandshakeStepResult>();
-      releaseParked = (step) => _parked!.complete(step);
-      return _parked!.future;
-    }
-    if (s.initiator) {
-      if (s.step != 1 || !_bytesEqual(incoming, _msg2)) {
-        throw const SecureSessionNativeFailure('unexpected handshake message');
-      }
-      s.step = 2;
-      _finish(s);
-      return HandshakeStepResult(
-        outgoing: _msg3,
-        finished: true,
-        confirmationRequired: true,
-        remoteIdentity: _identityFor(s),
-      );
-    }
-    if (s.step == 0 && _bytesEqual(incoming, _msg1)) {
-      s.step = 1;
-      return HandshakeStepResult(
-        outgoing: _msg2,
-        finished: false,
-        confirmationRequired: false,
-      );
-    }
-    if (s.step == 1 && _bytesEqual(incoming, _msg3)) {
-      s.step = 2;
-      _finish(s);
-      return HandshakeStepResult(
-        outgoing: _empty,
-        finished: true,
-        confirmationRequired: true,
-        remoteIdentity: _identityFor(s),
-      );
-    }
-    throw const SecureSessionNativeFailure('unexpected handshake message');
-  }
-
-  @override
-  Future<SecureSessionStatus> getSessionStatus(
-    SecureSessionHandle session,
-  ) async {
-    _require(session);
-    throw UnimplementedError('the link session never queries status');
-  }
-
-  @override
-  Future<void> confirmPeerIdentity(SecureSessionHandle session) async {
-    final s = _require(session);
-    calls.add('confirmPeerIdentity(${s.localDeviceId})');
-    if (!s.finished) {
-      throw const SecureSessionNativeFailure('handshake not finished');
-    }
-  }
-
-  @override
-  Future<Uint8List> encrypt(SecureSessionHandle session, Uint8List plaintext) {
-    _require(session);
-    applicationCryptoCalls.add(plaintext);
-    throw UnimplementedError('secure messaging is not integrated yet');
-  }
-
-  @override
-  Future<Uint8List> decrypt(SecureSessionHandle session, Uint8List ciphertext) {
-    _require(session);
-    applicationCryptoCalls.add(ciphertext);
-    throw UnimplementedError('secure messaging is not integrated yet');
-  }
-
-  @override
-  Future<void> closeSession(SecureSessionHandle session) async {
-    calls.add('closeSession(${_sessions[session]?.localDeviceId ?? '?'})');
-    closedHandles.add(session);
-    _sessions.remove(session);
-  }
-
-  _FakeSession _require(SecureSessionHandle session) {
-    final s = _sessions[session];
-    if (s == null) {
-      throw const SecureSessionClosed('the session is closed');
-    }
-    return s;
-  }
-
-  /// Enforces the pin at completion exactly where the real engine does.
-  void _finish(_FakeSession s) {
-    final remote = _remoteOf(s.localDeviceId);
-    final pin = s.pinned;
-    if (pin != null && !_bytesEqual(pin, remote.staticKey)) {
-      throw const SecureSessionNativeFailure(
-        'remote static key does not match the pinned key',
-      );
-    }
-    s.finished = true;
-  }
-
-  RemoteAuthenticatedIdentity _identityFor(_FakeSession s) =>
-      remoteIdentityOverride?.call(s.localDeviceId) ??
-      _remoteOf(s.localDeviceId).identity;
-}
-
-class _FakeTransport implements BleTransport {
-  _FakeTransport(this.maximumWriteLength);
-
-  @override
-  final int maximumWriteLength;
-
-  final StreamController<Uint8List> _incoming = StreamController<Uint8List>();
-  final List<Uint8List> writes = [];
-  _FakeTransport? peer;
-  bool _closed = false;
-
-  @override
-  Stream<Uint8List> get incoming => _incoming.stream;
-
-  /// Simulates the peer delivering raw bytes to this side.
-  void deliver(Uint8List value) {
-    if (!_closed) _incoming.add(Uint8List.fromList(value));
-  }
-
-  @override
-  Future<void> write(Uint8List value) async {
-    if (_closed || peer == null || peer!._closed) {
-      throw const BleLinkException('Transport is closed');
-    }
-    final copy = Uint8List.fromList(value);
-    writes.add(copy);
-    await Future<void>.delayed(Duration.zero);
-    peer!.deliver(copy);
-  }
-
-  @override
-  Future<void> close() async {
-    if (_closed) return;
-    _closed = true;
-    await _incoming.close();
-  }
-}
-
-/// Reassembles every v1 frame a side wrote and returns the transfer kinds,
-/// letting tests prove no plaintext message/ACK was ever emitted.
-List<BleTransferKind> _v1KindsWritten(_FakeTransport transport) {
-  final assembler = BleTransferAssembler();
-  final kinds = <BleTransferKind>[];
-  for (final frame in transport.writes) {
-    if (frame.length >= 2 && frame[1] == BleSecureProtocol.version) continue;
-    try {
-      final transfer = assembler.add(BleFrame.decode(frame));
-      if (transfer != null) kinds.add(transfer.kind);
-    } catch (_) {
-      // Not a complete v1 frame; ignore for this classification.
-    }
-  }
-  return kinds;
-}
 
 List<Uint8List> _craftOversizedHandshake(
   int totalLength, {
@@ -1117,56 +813,30 @@ List<Uint8List> _craftOversizedHandshake(
       type: BleFrameType.end,
       transferId: transferId,
       sequence: sequence,
-      payload: _empty,
+      payload: emptyBytes,
     ).encode(),
   );
   return frames;
 }
 
-bool _bytesEqual(List<int> a, List<int> b) {
-  if (a.length != b.length) return false;
-  for (var i = 0; i < a.length; i++) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
-}
-
-Message _message() {
-  final now = DateTime.utc(2026, 2, 3, 4, 5, 6);
-  return Message(
-    messageId: 'msg-1',
-    chatId: 'chat-1',
-    senderId: 'device-a',
-    receiverId: 'device-b',
-    content: 'Hello from A',
-    timestamp: now,
-    ttl: 3600,
-    createdAt: now,
-    updatedAt: now,
-  );
-}
-
-Identity _identity(String id, String name) =>
-    Identity(deviceId: id, displayName: name);
-
 /// A legacy v1 pair wired exactly like BleRuntimeController wires sessions.
 class _LegacyPair {
   _LegacyPair() {
-    transportA = _FakeTransport(64);
-    transportB = _FakeTransport(48);
+    transportA = FakeTransport(64);
+    transportB = FakeTransport(48);
     transportA.peer = transportB;
     transportB.peer = transportA;
 
     sessionA = BleLinkSession(
       transport: transportA,
-      identity: _identity('device-a', 'Alice'),
+      identity: testIdentity('device-a', 'Alice'),
       onHello: (hello) async {},
       onMessage: (payload) async => BleAckResult.stored,
       transferIdFactory: () => 1,
     );
     sessionB = BleLinkSession(
       transport: transportB,
-      identity: _identity('device-b', 'Bob'),
+      identity: testIdentity('device-b', 'Bob'),
       onHello: (hello) async {},
       onMessage: (payload) async {
         receivedOnB.add(payload);
@@ -1176,8 +846,8 @@ class _LegacyPair {
     );
   }
 
-  late final _FakeTransport transportA;
-  late final _FakeTransport transportB;
+  late final FakeTransport transportA;
+  late final FakeTransport transportB;
   late final BleLinkSession sessionA;
   late final BleLinkSession sessionB;
   final List<BleMessagePayload> receivedOnB = [];
@@ -1187,8 +857,8 @@ class _LegacyPair {
 
 /// A secure pair: A is the BLE peripheral (Noise initiator), B the BLE
 /// central (Noise responder), sharing one fake native engine.
-class _SecurePair {
-  _SecurePair({
+class SecurePair {
+  SecurePair({
     Uint8List? pinA,
     String? expectedPeerDeviceIdA,
     bool requireHelloBindingA = false,
@@ -1197,21 +867,21 @@ class _SecurePair {
     Duration handshakeTimeout = const Duration(seconds: 2),
     bool rejectHelloOnB = false,
   }) {
-    gateway = _FakeSecureGateway(
-      devices: [_deviceA, _deviceB],
+    gateway = FakeSecureGateway(
+      devices: [deviceA, deviceB],
       remoteIdentityOverride: remoteIdentityForA == null
           ? null
           : (localDeviceId) =>
                 localDeviceId == 'device-a' ? remoteIdentityForA : null,
     );
-    transportA = _FakeTransport(64);
-    transportB = _FakeTransport(48);
+    transportA = FakeTransport(64);
+    transportB = FakeTransport(48);
     transportA.peer = transportB;
     transportB.peer = transportA;
 
     sessionA = BleLinkSession(
       transport: transportA,
-      identity: _identity('device-a', 'Alice'),
+      identity: testIdentity('device-a', 'Alice'),
       onHello: (hello) async {},
       onMessage: (payload) async {
         receivedOnA.add(payload);
@@ -1231,7 +901,7 @@ class _SecurePair {
     );
     sessionB = BleLinkSession(
       transport: transportB,
-      identity: _identity('device-b', 'Bob'),
+      identity: testIdentity('device-b', 'Bob'),
       onHello: (hello) async {
         if (rejectHelloOnB) {
           throw const BleLinkException('Peer is blocked');
@@ -1250,9 +920,9 @@ class _SecurePair {
     );
   }
 
-  late final _FakeSecureGateway gateway;
-  late final _FakeTransport transportA;
-  late final _FakeTransport transportB;
+  late final FakeSecureGateway gateway;
+  late final FakeTransport transportA;
+  late final FakeTransport transportB;
   late final BleLinkSession sessionA;
   late final BleLinkSession sessionB;
   final List<Object?> closedErrorsA = [];
