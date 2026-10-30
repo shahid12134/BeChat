@@ -168,7 +168,14 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             const SizedBox(height: 24),
             _buildInfoSection(context, peer, signalStrength),
             const SizedBox(height: 24),
-            _buildSecuritySection(context, peer),
+            _buildSecuritySection(
+              context,
+              peer,
+              isSecureLinkActive:
+                  isBleConnected &&
+                  bleState.isSecureReady &&
+                  bleState.activePeerId == peer.peerId,
+            ),
             const SizedBox(height: 24),
             _buildActions(context, peer, isBleConnected),
           ],
@@ -219,7 +226,31 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
     );
   }
 
-  Widget _buildSecuritySection(BuildContext context, Peer peer) {
+  Widget _buildSecuritySection(
+    BuildContext context,
+    Peer peer, {
+    required bool isSecureLinkActive,
+  }) {
+    // Honest key-state labels: `unverified` means the key arrived over the
+    // encrypted link and was pinned, never that a human confirmed it.
+    final (
+      String keyLabel,
+      Color keyColor,
+    ) = switch (peer.keyVerificationState) {
+      PeerKeyVerificationState.none => ('Not exchanged', Colors.orange),
+      PeerKeyVerificationState.unverified => (
+        'Pinned from the encrypted link. Not verified in person.',
+        Colors.orange,
+      ),
+      PeerKeyVerificationState.verified => (
+        'Verified in person.',
+        Colors.green,
+      ),
+      PeerKeyVerificationState.changed => (
+        'Changed since it was pinned. Connections are blocked for safety.',
+        Colors.red,
+      ),
+    };
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -238,20 +269,25 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             _infoRow(
               context,
               'Public Key',
-              peer.publicKey ?? 'Not exchanged',
-              valueColor: peer.publicKey != null ? Colors.green : Colors.orange,
+              peer.publicKey ?? keyLabel,
+              valueColor: peer.publicKey != null ? keyColor : Colors.orange,
             ),
+            if (peer.publicKey != null)
+              _infoRow(context, 'Key Status', keyLabel, valueColor: keyColor),
             _infoRow(
               context,
               'BLE Identity',
-              'Application ID exchanged; not verified out-of-band',
+              'Authenticated inside the encrypted link; not verified '
+                  'out-of-band',
               valueColor: Colors.orange,
             ),
             _infoRow(
               context,
               'Encryption',
-              'Not enabled in direct BLE mode',
-              valueColor: Colors.red,
+              isSecureLinkActive
+                  ? 'End-to-end encrypted in transit over BLE'
+                  : 'No active encrypted link with this peer',
+              valueColor: isSecureLinkActive ? Colors.green : Colors.orange,
             ),
             _infoRow(
               context,

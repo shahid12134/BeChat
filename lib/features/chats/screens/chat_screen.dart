@@ -141,9 +141,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       background = theme.colorScheme.secondaryContainer;
       foreground = theme.colorScheme.onSecondaryContainer;
     } else if (bleState.isConnected && bleState.activePeerId == peerId) {
-      message =
-          'BLE link active. App identity was exchanged, but this link is not '
-          'cryptographically authenticated.';
+      message = bleState.isSecureReady
+          ? 'Secure BLE link active with this peer. Messages are encrypted '
+                'end-to-end while in transit over BLE.'
+          : 'BLE link active with this peer, but secure messaging is not '
+                'established on this link. Messages stay queued.';
       background = theme.colorScheme.primaryContainer;
       foreground = theme.colorScheme.onPrimaryContainer;
     } else if (bleState.isConnected) {

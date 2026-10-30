@@ -228,6 +228,64 @@ class PeerRepository {
     });
   }
 
+  /// Records that a peer with an *already pinned* key presented a different
+  /// key during an authenticated handshake, without ever replacing the pin.
+  ///
+  /// Deliberately separate from [recordCandidatePublicKey], whose job is to
+  /// adopt an incoming key: calling it for a conflicting candidate would
+  /// overwrite `public_key` with untrusted material. This method touches only
+  /// the conflict bookkeeping:
+  ///
+  /// * `public_key` and `public_key_fingerprint` are left exactly as stored;
+  /// * the state becomes [PeerKeyVerificationState.changed] (or stays
+  ///   `changed`, keeping its first `key_changed_at` stamp);
+  /// * `verified` is never assigned and no timestamp claims verification;
+  /// * a peer without a stored key writes nothing (there is no pin to keep,
+  ///   so there is no conflict to record).
+  ///
+  /// Recovery from `changed` requires an explicit, reviewed workflow; nothing
+  /// in the runtime silently returns such a peer to service.
+  ///
+  /// Returns true when the peer row now carries the `changed` state.
+  Future<bool> recordKeyConflict(String peerId, {DateTime? at}) async {
+    final db = await _db;
+    return db.transaction<bool>((txn) async {
+      final existing = await txn.query(
+        'peers',
+        columns: ['public_key', 'verification_state'],
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        limit: 1,
+      );
+      if (existing.isEmpty) return false;
+      final storedKey = (existing.first['public_key'] as String?)?.trim();
+      if (storedKey == null || storedKey.isEmpty) return false;
+
+      final state = Peer.resolveKeyVerificationState(
+        existing.first['verification_state'],
+        storedKey,
+      );
+      if (state == PeerKeyVerificationState.changed) {
+        // Already recorded: keep the original conflict timestamp.
+        return true;
+      }
+
+      final now = at ?? DateTime.now();
+      await txn.update(
+        'peers',
+        {
+          'verification_state': PeerKeyVerificationState.changed.name,
+          'key_verified_at': null,
+          'key_changed_at': TimestampUtils.toUtcIso8601(now),
+          'updated_at': now.toIso8601String(),
+        },
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+      );
+      return true;
+    });
+  }
+
   /// Key-metadata updates for an incoming public key value.
   ///
   /// Returns an empty map when the key is unchanged, so a repeat observation

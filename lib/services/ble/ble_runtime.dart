@@ -4,20 +4,26 @@ import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
 import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/core/utils/key_format.dart';
 import 'package:bechat/data/models/ble_candidate.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/providers/app_settings_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
+import 'package:bechat/providers/identity_initialization_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
+import 'package:bechat/providers/secure_session_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/providers/background_service_provider.dart';
 import 'package:bechat/services/background/background_ble_service.dart';
+import 'package:bechat/services/crypto/identity_initialization_coordinator.dart';
+import 'package:bechat/services/crypto/native_secure_session_service.dart';
 import 'package:bechat/services/ble/ble_gatt_operation_gate.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
 import 'package:bechat/services/ble/ble_outbox.dart';
@@ -110,6 +116,7 @@ class BleRuntimeState {
     this.backgroundError,
     this.availabilityEnabled = true,
     this.activeSignalStrength,
+    this.isSecureReady = false,
   });
 
   final BleRuntimeStatus status;
@@ -126,6 +133,15 @@ class BleRuntimeState {
   final String? backgroundError;
   final bool availabilityEnabled;
   final int? activeSignalStrength;
+
+  /// True only when the active link's Noise session finished its handshake,
+  /// passed the peer-key policy and was explicitly confirmed by the native
+  /// engine — the single condition under which the peer may be shown as a
+  /// secure connection, marked online, or served from the outbox. Always
+  /// false while an approval request, handshake or reconnect is outstanding,
+  /// and cleared whenever the active link is torn down. Legacy v1 links never
+  /// set it.
+  final bool isSecureReady;
 
   bool get isConnected =>
       status == BleRuntimeStatus.connected && activePeerId != null;
@@ -160,6 +176,7 @@ class BleRuntimeState {
     String? backgroundError,
     bool? availabilityEnabled,
     int? activeSignalStrength,
+    bool? isSecureReady,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
@@ -189,6 +206,12 @@ class BleRuntimeState {
       activeSignalStrength: clearActiveLink || clearActiveSignal
           ? null
           : activeSignalStrength ?? this.activeSignalStrength,
+      // Tearing the link down always drops secure readiness with it, so a
+      // replacement connection can never inherit a previous session's
+      // secure-ready publication.
+      isSecureReady: clearActiveLink
+          ? false
+          : isSecureReady ?? this.isSecureReady,
     );
   }
 }
@@ -206,6 +229,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     Duration candidateCleanupInterval = AppConstants.candidateCleanupInterval,
     DateTime Function()? clock,
     BackgroundBleService? backgroundBleService,
+    Duration linkHandshakeTimeout = const Duration(seconds: 15),
   }) : _centralOverride = centralManager,
        _peripheralOverride = peripheralManager,
        _statusProbe = statusProbe ?? MethodChannelBleStatusProbe(),
@@ -216,6 +240,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
        _candidateExpiration = candidateExpiration,
        _candidateCleanupInterval = candidateCleanupInterval,
        _clock = clock ?? DateTime.now,
+       _linkHandshakeTimeout = linkHandshakeTimeout,
        super(BleRuntimeState(availabilityEnabled: availabilityEnabled)) {
     _outbox = BleOutbox(
       repository: _ref.read(messageRepositoryProvider),
@@ -232,6 +257,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final PeripheralManager? _peripheralOverride;
   final BleStatusProbe _statusProbe;
   final Duration _permissionTimeout;
+
+  /// Upper bound on the whole secure handshake started by this runtime.
+  ///
+  /// The link session arms its own internal handshake timer; this deadline is
+  /// the runtime-level backstop that also covers the approval-to-handshake
+  /// window on the accepting side. Short values are injected by tests instead
+  /// of waiting production intervals.
+  final Duration _linkHandshakeTimeout;
   final bool? _isAndroidOverride;
   final Duration _candidateExpiration;
   final Duration _candidateCleanupInterval;
@@ -309,7 +342,25 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
   bool _isLinkUsable() {
     final session = _activeSession;
-    return session != null && session.isReady;
+    if (session == null || !session.isReady) return false;
+    // A secure session only carries application traffic once the link was
+    // published as secure-ready (handshake + authenticated identity + key
+    // policy + explicit confirmation). Legacy sessions keep the old rule.
+    if (session.secure != null && !state.isSecureReady) return false;
+    return true;
+  }
+
+  /// Whether [session] may still take part in the incoming-approval flow.
+  ///
+  /// A secure session sits at [BleSecureLinkState.awaitingAuthorization]
+  /// between the HELLO exchange and the Noise handshake, while a legacy
+  /// session is simply [BleLinkSession.isReady]. Approval must remain
+  /// possible in exactly those two states — never once a link has failed or
+  /// closed.
+  bool _isSessionUsableForApproval(BleLinkSession session) {
+    if (session.isReady) return true;
+    return session.secure != null &&
+        session.secureState == BleSecureLinkState.awaitingAuthorization;
   }
 
   Future<BleAckResult> _sendOverLink(
@@ -1213,7 +1264,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         throw const BleLinkException('BeChat was turned off');
       }
       _linkEstablishing = false;
-      await _onLinkReady(session, hello);
+      await _beginSecureLink(session, hello);
       return hello.deviceId;
     } catch (error) {
       _connectionWaiters.remove(peripheral.uuid.toString());
@@ -1281,17 +1332,340 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     throw const BleLinkException('The peer did not expose the BeChat service');
   }
 
+  /// Creates the runtime's link session in secure mode.
+  ///
+  /// Every production session requires the Noise capability: once secure
+  /// messaging is selected there is no plaintext application path. The
+  /// session reference is captured by the callbacks so late events (close,
+  /// remote identity, key conflict) are always attributable to one specific
+  /// session instance and a replaced session can never publish state.
   BleLinkSession _createSession(BleTransport transport, BleLinkRole role) {
-    return BleLinkSession(
+    final identity = _requireSecureIdentity();
+    late final BleLinkSession session;
+    session = BleLinkSession(
       transport: transport,
-      identity: _requireIdentity(),
+      identity: identity,
       onHello: _handleHello,
       onMessage: _handleIncoming,
       onClosed: (error) {
-        unawaited(_onSessionClosed(role, error));
+        unawaited(_onSessionClosed(session, role, error));
       },
+      // The runtime deadline doubles as the session's internal secure
+      // handshake budget, so injected short timeouts cover both layers.
+      handshakeTimeout: _linkHandshakeTimeout,
+      secure: _buildSecureSessionConfig(
+        role,
+        onRemoteIdentity: (remote) =>
+            _handleSecureRemoteIdentity(session, remote),
+        onPinnedKeyMismatch: () => _recordActivePeerKeyConflict(session),
+      ),
+    );
+    return session;
+  }
+
+  /// Validates that the local UUID identity and the synchronized native
+  /// public identity are present, consistent and usable for secure mode.
+  ///
+  /// Fails closed with a user-visible "secure messaging unavailable" error
+  /// instead of ever falling back to plaintext, using an unvalidated key, or
+  /// provisioning a second identity.
+  Identity _requireSecureIdentity() {
+    final identity = _ref.read(identityProvider).valueOrNull;
+    if (identity == null) {
+      throw const BleLinkException(
+        'Secure messaging is unavailable: the local identity is not ready.',
+      );
+    }
+    final status = _ref.read(identityInitializationProvider);
+    if (status.state != IdentityInitializationState.ready) {
+      throw const BleLinkException(
+        'Secure messaging is unavailable: the cryptographic identity has '
+        'not finished initializing.',
+      );
+    }
+    if (status.deviceId == null || status.deviceId != identity.deviceId) {
+      throw const BleLinkException(
+        'Secure messaging is unavailable: the native identity does not '
+        'belong to this device.',
+      );
+    }
+    final nativeKey = status.publicKeyHex;
+    final syncedKey = identity.publicKey;
+    if (nativeKey == null ||
+        syncedKey == null ||
+        !KeyFormat.isHex32(nativeKey) ||
+        !KeyFormat.isHex32(syncedKey) ||
+        nativeKey != syncedKey) {
+      throw const BleLinkException(
+        'Secure messaging is unavailable: the native identity key is '
+        'missing or does not match the stored identity.',
+      );
+    }
+    return identity;
+  }
+
+  /// Builds the secure-mode configuration for a session of [role].
+  ///
+  /// BLE peripheral maps to the Noise initiator, BLE central to the Noise
+  /// responder. The plaintext HELLO stays an untrusted hint: the session
+  /// binds the authenticated identity against it, and the runtime revalidates
+  /// the authenticated identity in [_handleSecureRemoteIdentity].
+  BleSecureSessionConfig _buildSecureSessionConfig(
+    BleLinkRole role, {
+    required FutureOr<void> Function(RemoteAuthenticatedIdentity remote)
+    onRemoteIdentity,
+    required FutureOr<void> Function() onPinnedKeyMismatch,
+  }) {
+    return BleSecureSessionConfig(
+      gateway: _ref.read(secureSessionGatewayProvider),
+      role: role == BleLinkRole.peripheral
+          ? BleSecureRole.initiator
+          : BleSecureRole.responder,
+      requireHelloBinding: true,
+      onRemoteIdentity: onRemoteIdentity,
+      onPinnedKeyMismatch: onPinnedKeyMismatch,
     );
   }
+
+  /// Records that a pinned peer presented a different authenticated key,
+  /// preserving the original pin and fingerprint (see
+  /// [PeerRepository.recordKeyConflict]).
+  Future<void> _recordActivePeerKeyConflict(BleLinkSession session) async {
+    if (_disposed || !identical(_activeSession, session)) return;
+    final peerId = _activePeer?.peerId ?? state.activePeerId;
+    if (peerId == null) return;
+    try {
+      await _ref.read(peerRepositoryProvider).recordKeyConflict(peerId);
+      await _refreshPeers();
+    } catch (_) {
+      // The link still fails closed below; bookkeeping must not mask it.
+    }
+  }
+
+  /// Validates the authenticated remote identity, applies the peer-key
+  /// policy, explicitly confirms the Noise session, and publishes the link.
+  ///
+  /// Invoked inside the session's inbound-frame queue before any later frame
+  /// is processed, so no application payload can precede this decision. Every
+  /// check fails closed; nothing unauthenticated is persisted, existing peer
+  /// metadata is never overwritten, and `verified` is never assigned here.
+  Future<void> _handleSecureRemoteIdentity(
+    BleLinkSession session,
+    RemoteAuthenticatedIdentity remote,
+  ) async {
+    if (_disposed || !identical(_activeSession, session)) {
+      throw const BleLinkException(
+        'The BLE link closed during the secure handshake',
+      );
+    }
+    final knownPeer = _activePeer;
+    if (knownPeer == null) {
+      throw const BleLinkException(
+        'The BLE link has no approved peer for this secure session',
+      );
+    }
+    if (remote.protocolVersion != BleSecureProtocol.identityFormatVersion) {
+      throw const BleLinkException(
+        'The peer is using an unsupported secure protocol version. Ask them '
+        'to update BeChat.',
+      );
+    }
+    if (!remote.supportsCapability(BleSecureProtocol.capabilitySecureText)) {
+      throw const BleLinkException(
+        'The peer does not support secure messaging.',
+      );
+    }
+    if (!KeyFormat.isHex32(remote.publicKeyHex) ||
+        !_uuidPattern.hasMatch(remote.deviceId)) {
+      throw const BleLinkException('The peer presented an invalid identity.');
+    }
+    final hello = session.linkInfo;
+    if (hello == null ||
+        remote.deviceId != hello.deviceId ||
+        remote.deviceId != knownPeer.peerId) {
+      // The HELLO is an unauthenticated hint and the approved peer is the
+      // bound context: disagreement with the authenticated identity fails
+      // closed with nothing persisted.
+      throw const BleLinkException(
+        'The authenticated peer does not match the approved connection.',
+      );
+    }
+
+    final peerRepository = _ref.read(peerRepositoryProvider);
+    final existing = await peerRepository.getPeerByPeerId(remote.deviceId);
+    if (existing != null &&
+        (existing.isBlocked || existing.status == PeerStatus.blocked)) {
+      throw const BleLinkException('Peer is blocked');
+    }
+    final pinnedKey = knownPeer.publicKey?.trim();
+    final hasPinnedKey = pinnedKey != null && pinnedKey.isNotEmpty;
+    if (hasPinnedKey && pinnedKey != remote.publicKeyHex) {
+      // A different authenticated static key for a pinned peer: keep the
+      // pin, mark the conflict, and fail closed. The new key never lands in
+      // the database and the session never becomes usable.
+      await peerRepository.recordKeyConflict(remote.deviceId);
+      unawaited(_refreshPeers());
+      throw const BleLinkException(
+        'The identity of this peer has changed. For your safety this '
+        'connection was blocked.',
+      );
+    }
+
+    // First contact (no pin yet): re-read the row so a key recorded since
+    // the approval decision is treated as a pin before anything is written.
+    var needsPinPersist = !hasPinnedKey;
+    if (needsPinPersist && existing != null) {
+      final rowKey = existing.publicKey?.trim();
+      if (rowKey != null && rowKey.isNotEmpty) {
+        needsPinPersist = false;
+        if (rowKey != remote.publicKeyHex) {
+          await peerRepository.recordKeyConflict(remote.deviceId);
+          unawaited(_refreshPeers());
+          throw const BleLinkException(
+            'The identity of this peer has changed. For your safety this '
+            'connection was blocked.',
+          );
+        }
+      }
+    }
+
+    // Explicit native confirmation comes before any persistence, so a failed
+    // confirmation leaves no partially trusted peer metadata behind.
+    await session.confirmSecurePeerIdentity();
+    if (_disposed || !identical(_activeSession, session)) {
+      throw const BleLinkException(
+        'The BLE link closed during the secure handshake',
+      );
+    }
+
+    if (needsPinPersist) {
+      // First contact: the peer row exists only when approval already created
+      // it from the untrusted HELLO hint (accept path), and does not exist
+      // yet when the link was auto-approved (reconnect). Either way the
+      // authenticated identity is authoritative for the name, so persist it
+      // before the pin. The upsert preserves any stored key and can never
+      // promote the peer to `verified`.
+      await peerRepository.upsertPeer(
+        knownPeer.copyWith(displayName: remote.displayName),
+      );
+      final recorded = await peerRepository.recordCandidatePublicKey(
+        remote.deviceId,
+        publicKeyHex: remote.publicKeyHex,
+      );
+      if (recorded != PeerKeyVerificationState.unverified) {
+        throw const BleLinkException(
+          'The peer key could not be recorded safely.',
+        );
+      }
+      unawaited(_refreshPeers());
+    }
+
+    await _publishSecureLink(session, remote);
+  }
+
+  /// Publishes a confirmed, secure link: connected state, secure-ready flag,
+  /// peer online status, chat creation, presence monitoring and outbox
+  /// draining — all of which stay dark until this point.
+  Future<void> _publishSecureLink(
+    BleLinkSession session,
+    RemoteAuthenticatedIdentity remote,
+  ) async {
+    if (_disposed || !identical(_activeSession, session)) return;
+    final peer = _activePeer;
+    if (peer == null || peer.peerId != remote.deviceId) return;
+    final role = _activeRole ?? BleLinkRole.central;
+    final published = peer.copyWith(
+      // The authenticated identity is authoritative for the display name.
+      displayName: remote.displayName,
+      status: PeerStatus.online,
+      signalStrength: peer.signalStrength ?? _remoteRssi,
+    );
+    _activePeer = published;
+    _setState(
+      status: BleRuntimeStatus.connected,
+      candidates: const [],
+      activePeerId: published.peerId,
+      activePeerName: remote.displayName,
+      activeRole: role,
+      isAdvertising: false,
+      isSecureReady: true,
+      clearError: true,
+    );
+    await _markPeerOnline(published.peerId, signalStrength: _remoteRssi);
+    if (_disposed ||
+        !identical(_activeSession, session) ||
+        !session.isSecureReady) {
+      await _markPeerOffline(published.peerId);
+      return;
+    }
+    try {
+      await _ref.read(chatRepositoryProvider).getOrCreateChatForPeer(published);
+      await _ref.read(chatListProvider.notifier).refreshChats();
+    } catch (_) {}
+    if (role == BleLinkRole.central) {
+      _startPresenceMonitor(published.peerId);
+    }
+    unawaited(requestDelivery(published.peerId));
+  }
+
+  /// Resolves the pinned remote key for [peer] from the bound peer context.
+  ///
+  /// Returns null for a peer that has no key yet (first contact), which the
+  /// engine treats as "no pin" — the policy layer then records the
+  /// authenticated key as unverified before anything is published.
+  Uint8List? _resolvePinnedPeerKey(Peer peer) {
+    final stored = peer.publicKey?.trim();
+    if (stored == null || stored.isEmpty) return null;
+    if (!KeyFormat.isHex32(stored)) {
+      throw const BleLinkException(
+        'Secure messaging is unavailable: the stored key for this peer is '
+        'invalid.',
+      );
+    }
+    return KeyFormat.hex32ToBytes(stored);
+  }
+
+  /// Authorizes and starts the Noise handshake for an approved link.
+  ///
+  /// Binds the peer-specific context (pinned key + expected device ID) after
+  /// the HELLO exchange and before the handshake, then waits for local
+  /// setup within the runtime deadline. Readiness is *not* published here:
+  /// [_publishSecureLink] runs only after the handshake authenticates the
+  /// peer and the native session is explicitly confirmed.
+  Future<void> _startSecureHandshake(BleLinkSession session) async {
+    if (_disposed || !identical(_activeSession, session)) return;
+    final peer = _activePeer;
+    if (peer == null) return;
+    if (session.secureState != BleSecureLinkState.awaitingAuthorization) {
+      return;
+    }
+    _setState(
+      status: BleRuntimeStatus.connecting,
+      candidates: const [],
+      clearError: true,
+    );
+    try {
+      session.bindSecurePeerContext(
+        pinnedRemotePublicKey: _resolvePinnedPeerKey(peer),
+        expectedPeerDeviceId: peer.peerId,
+      );
+      await session.startSecureHandshake().timeout(_linkHandshakeTimeout);
+    } catch (error) {
+      // Ensure every local handshake failure tears the link down; a session
+      // that already failed closed is left alone. There is no plaintext
+      // fallback from here.
+      if (session.state != BleSessionState.closed) {
+        await session.close(error);
+      }
+      rethrow;
+    }
+  }
+
+  /// Device IDs of authenticated identities must be UUIDs — the format the
+  /// local identity and every peer identity are created with.
+  static final RegExp _uuidPattern = RegExp(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+  );
 
   Future<void> _handleHello(BleHello hello) async {
     final session = _activeSession;
@@ -1338,23 +1712,32 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     BleLinkSession session,
   ) async {
     final now = DateTime.now();
-    final peer = Peer(
-      peerId: hello.deviceId,
-      displayName: hello.displayName,
-      deviceName: _remoteDeviceName ?? existing?.deviceName ?? 'BeChat device',
-      status: PeerStatus.offline,
-      signalStrength: _remoteRssi,
-      firstSeen: existing?.firstSeen ?? now,
-      lastSeen: now,
-      publicKey: existing?.publicKey,
-      createdAt: existing?.createdAt,
-      updatedAt: now,
-    );
-    await _ref.read(peerRepositoryProvider).upsertPeer(peer);
+    // The HELLO is an untrusted hint: a stored peer keeps its stored name,
+    // UUID and key untouched, and a first-contact peer exists only in memory
+    // until the authenticated handshake confirms it — approval alone never
+    // writes peer metadata, so a failed handshake leaves nothing behind.
+    final Peer peer;
+    if (existing != null) {
+      peer = existing.copyWith(
+        signalStrength: _remoteRssi ?? existing.signalStrength,
+        lastSeen: now,
+      );
+    } else {
+      peer = Peer(
+        peerId: hello.deviceId,
+        displayName: hello.displayName,
+        deviceName: _remoteDeviceName ?? 'BeChat device',
+        status: PeerStatus.offline,
+        signalStrength: _remoteRssi,
+        firstSeen: now,
+        lastSeen: now,
+        createdAt: now,
+        updatedAt: now,
+      );
+    }
     if (_disposed ||
         !identical(_activeSession, session) ||
         session.state == BleSessionState.closed) {
-      await _markPeerOffline(peer.peerId);
       return;
     }
     _activePeer = peer;
@@ -1443,7 +1826,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       );
     }
     final session = _activeSession;
-    if (session == null || !session.isReady) {
+    if (session == null || !_isSessionUsableForApproval(session)) {
       _clearIncomingRequest();
       throw const BleLinkException('The BLE link is no longer active');
     }
@@ -1470,7 +1853,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       updatedAt: now,
     );
     await peerRepository.upsertPeer(peer);
-    if (_disposed || !identical(_activeSession, session) || !session.isReady) {
+    if (_disposed ||
+        !identical(_activeSession, session) ||
+        !_isSessionUsableForApproval(session)) {
       await _markPeerOffline(peer.peerId);
       _clearIncomingRequest();
       throw const BleLinkException('The BLE link closed before approval');
@@ -1480,6 +1865,20 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _remoteDeviceName = peer.deviceName;
     _clearIncomingRequest();
     _resetCandidateTracking(updateState: false);
+    if (session.secure != null) {
+      // Approval only authorizes the Noise handshake. Connected state, peer
+      // presence, the secure-ready flag and outbox draining all follow the
+      // confirmed handshake via _publishSecureLink — never here.
+      try {
+        await _startSecureHandshake(session);
+      } catch (error) {
+        if (identical(_activeSession, session)) {
+          await _closeActiveLink();
+        }
+        throw BleLinkException(_describeError(error));
+      }
+      return;
+    }
     _setState(
       status: BleRuntimeStatus.connected,
       candidates: const [],
@@ -1553,7 +1952,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
     final session = _activeSession;
     if (session == null ||
-        !session.isReady ||
+        !_isSessionUsableForApproval(session) ||
         !identical(session, _incomingRequestSession)) {
       _clearIncomingRequest();
       return null;
@@ -1640,7 +2039,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await _ref.read(chatListProvider.notifier).refreshChats();
   }
 
-  Future<void> _onLinkReady(BleLinkSession session, BleHello hello) async {
+  /// Completes link establishment in secure mode.
+  ///
+  /// This replaces the legacy "link is ready" publication: nothing here marks
+  /// the link connected. When an approval request is pending, the Noise
+  /// handshake waits for the user's decision; otherwise the authorized
+  /// handshake starts and readiness is published later by
+  /// [_publishSecureLink] after authentication and explicit confirmation.
+  Future<void> _beginSecureLink(BleLinkSession session, BleHello hello) async {
     if (_disposed || _activeSession != session) return;
     _linkEstablishing = false;
     if (!_canContinueBle) {
@@ -1650,6 +2056,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await _stopAdvertisingForLink();
     _resetCandidateTracking(updateState: false);
     if (state.incomingRequest?.peerId == hello.deviceId) {
+      // Approval pending: no handshake, no connected state, no presence
+      // monitoring and no outbox drain until the user accepts.
       _setState(
         status: BleRuntimeStatus.ready,
         candidates: const [],
@@ -1659,25 +2067,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       );
       return;
     }
-    final role = _activeRole ?? BleLinkRole.central;
-    _setState(
-      status: BleRuntimeStatus.connected,
-      candidates: const [],
-      activePeerId: hello.deviceId,
-      activePeerName: hello.displayName,
-      activeRole: role,
-      isAdvertising: false,
-      clearError: true,
-    );
-    await _markPeerOnline(hello.deviceId, signalStrength: _remoteRssi);
-    if (_disposed || !identical(_activeSession, session) || !session.isReady) {
-      await _markPeerOffline(hello.deviceId);
+    final peer = _activePeer;
+    if (peer == null || peer.peerId != hello.deviceId) {
+      // No approved peer context for this link: fail closed instead of
+      // starting a handshake against an unapproved peer.
+      await _closeActiveLink();
       return;
     }
-    if (role == BleLinkRole.central) {
-      _startPresenceMonitor(hello.deviceId);
-    }
-    unawaited(requestDelivery(hello.deviceId));
+    await _startSecureHandshake(session);
   }
 
   Future<void> _stopAdvertisingForLink() async {
@@ -1820,7 +2217,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
       final hello = await session.start();
       _linkEstablishing = false;
-      await _onLinkReady(session, hello);
+      await _beginSecureLink(session, hello);
     } catch (error) {
       _linkEstablishing = false;
       await _closeActiveLink();
@@ -1845,7 +2242,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
-  Future<void> _onSessionClosed(BleLinkRole role, Object? error) async {
+  Future<void> _onSessionClosed(
+    BleLinkSession session,
+    BleLinkRole role,
+    Object? error,
+  ) async {
+    // A late callback from a session that was already replaced (or whose
+    // cleanup already ran) must never tear down the current link's state,
+    // presence monitoring or peer status.
+    if (!identical(_activeSession, session)) return;
     if (_cleaningLink) return;
     _cleaningLink = true;
     final cleanup = Completer<void>();
@@ -1868,6 +2273,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       _clearIncomingRequest();
       _resetCandidateTracking(updateState: false);
 
+      // A secure session that stopped for any reason other than a clean
+      // close or a policy rejection surfaces an explicit failure — the user
+      // must never mistake a torn-down secure link for a usable one.
+      final secureFailure =
+          session.secure != null &&
+          error != null &&
+          error is! BleLinkClosedException &&
+          error is! BleHelloRejectedException;
       if (!_linkEstablishing &&
           !_disposed &&
           !_isTerminalStatus(state.status)) {
@@ -1877,9 +2290,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
               : BleRuntimeStatus.idle,
           candidates: const [],
           clearActiveLink: true,
+          error: secureFailure
+              ? 'Secure connection failed: ${_describeError(error)}'
+              : null,
           clearError:
-              error is BleLinkClosedException ||
-              error is BleHelloRejectedException,
+              !secureFailure &&
+              (error is BleLinkClosedException ||
+                  error is BleHelloRejectedException),
         );
       }
 
@@ -1898,6 +2315,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
       if (_canContinueBle && _initialized && !_disposed) {
         await _recoverAdvertising();
+        // Advertising recovery clears the error field; a secure failure
+        // must stay visible, so republish it after recovery finished.
+        if (secureFailure && !_disposed) {
+          _setState(
+            error: 'Secure connection failed: ${_describeError(error)}',
+          );
+        }
       }
     } finally {
       _cleaningLink = false;
@@ -2212,14 +2636,6 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await reconcileBackgroundBle();
   }
 
-  Identity _requireIdentity() {
-    final identity = _ref.read(identityProvider).valueOrNull;
-    if (identity == null) {
-      throw const BleLinkException('Local identity is not available');
-    }
-    return identity;
-  }
-
   bool _isTerminalStatus(BleRuntimeStatus status) =>
       status == BleRuntimeStatus.unsupported ||
       status == BleRuntimeStatus.unauthorized ||
@@ -2228,6 +2644,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   String _describeError(Object error) {
     if (error is TimeoutException) {
       return 'The operation timed out.';
+    }
+    if (error is BleSecureHandshakeTimeoutException) {
+      return 'A secure connection could not be established in time.';
+    }
+    if (error is BleAckTimeoutException) {
+      return 'The peer stopped acknowledging messages.';
     }
     if (error is BleProtocolException) return error.message;
     if (error is BleLinkException) return error.message;
@@ -2488,6 +2910,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     String? backgroundError,
     bool? availabilityEnabled,
     int? activeSignalStrength,
+    bool? isSecureReady,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
@@ -2510,6 +2933,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       backgroundError: backgroundError,
       availabilityEnabled: availabilityEnabled,
       activeSignalStrength: activeSignalStrength,
+      isSecureReady: isSecureReady,
       clearActiveLink: clearActiveLink,
       clearError: clearError,
       clearIncomingRequest: clearIncomingRequest,

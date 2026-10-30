@@ -168,6 +168,15 @@ class _FakeSession {
   /// Mirrors the engine: transport calls are refused until the peer identity
   /// is explicitly confirmed.
   bool confirmed = false;
+
+  /// Authenticated remote static key recorded at handshake completion —
+  /// set *before* the pin check, exactly like the engine, so a pinned-key
+  /// conflict still exposes the authenticated key through a status snapshot.
+  String? remoteKeyHex;
+
+  /// Set when the pin check rejected the authenticated remote key. The
+  /// session then reports the `failed` stage forever.
+  bool pinFailed = false;
 }
 
 class FakeSecureGateway implements SecureSessionGateway {
@@ -198,6 +207,11 @@ class FakeSecureGateway implements SecureSessionGateway {
   final List<SecureSessionHandle> decryptHandles = [];
 
   Uint8List? pinForwardedA;
+
+  /// Every pin forwarded to [createSession], keyed by the session's local
+  /// device ID. Tests with UUID device IDs (the real runtime identity is a
+  /// UUID) assert pin forwarding through this map.
+  final Map<String, Uint8List?> pinsForwarded = {};
 
   SecureSessionException? failCreateSession;
   bool failEncrypt = false;
@@ -230,6 +244,7 @@ class FakeSecureGateway implements SecureSessionGateway {
   }) async {
     calls.add('createSession($deviceId, initiator=$initiator)');
     if (failCreateSession != null) throw failCreateSession!;
+    pinsForwarded[deviceId] = pinnedRemotePublicKey;
     if (deviceId == 'device-a') pinForwardedA = pinnedRemotePublicKey;
     final handle = SecureSessionHandle.forTesting(_nextHandleValue++);
     createdHandles.add(handle);
@@ -275,7 +290,22 @@ class FakeSecureGateway implements SecureSessionGateway {
     }
     if (s.localDeviceId == parkProcessHandshakeFor && _parked == null) {
       _parked = Completer<HandshakeStepResult>();
-      releaseParked = (step) => _parked!.complete(step);
+      releaseParked = (step) {
+        // Apply the same session bookkeeping the real branch would have,
+        // so a later handshake message still matches the step counter.
+        try {
+          if (s.step == 0 && bytesEqual(incoming, secureMsg1)) {
+            s.step = 1;
+          }
+          if (step.finished) {
+            s.step = 2;
+            _finish(s);
+          }
+          _parked!.complete(step);
+        } catch (error) {
+          _parked!.completeError(error);
+        }
+      };
       return _parked!.future;
     }
     if (s.initiator) {
@@ -316,8 +346,25 @@ class FakeSecureGateway implements SecureSessionGateway {
   Future<SecureSessionStatus> getSessionStatus(
     SecureSessionHandle session,
   ) async {
-    _require(session);
-    throw UnimplementedError('the link session never queries status');
+    final s = _require(session);
+    calls.add('getSessionStatus(${s.localDeviceId})');
+    // A realistic engine snapshot: never `ready` before the handshake
+    // finished AND the peer identity was explicitly confirmed, `failed`
+    // once a pin check rejected the remote key, and the authenticated
+    // remote identity (key included) only at or after completion.
+    final stage = s.pinFailed
+        ? SecureSessionStage.failed
+        : s.confirmed
+        ? SecureSessionStage.ready
+        : s.finished
+        ? SecureSessionStage.awaitingConfirmation
+        : SecureSessionStage.handshaking;
+    final identityAvailable = s.finished || s.pinFailed;
+    return SecureSessionStatus(
+      stage: stage,
+      remoteIdentityAvailable: identityAvailable,
+      remotePublicKeyHex: identityAvailable ? s.remoteKeyHex : null,
+    );
   }
 
   @override
@@ -394,10 +441,17 @@ class FakeSecureGateway implements SecureSessionGateway {
   }
 
   /// Enforces the pin at completion exactly where the real engine does.
+  ///
+  /// The authenticated remote key is recorded first: the engine populates
+  /// `remote_identity` before the pinned-key comparison, so a pin conflict
+  /// remains observable through [getSessionStatus] (`failed` stage plus the
+  /// key that mismatched).
   void _finish(_FakeSession s) {
     final remote = _remoteOf(s.localDeviceId);
+    s.remoteKeyHex = hexOf(remote.staticKey);
     final pin = s.pinned;
     if (pin != null && !bytesEqual(pin, remote.staticKey)) {
+      s.pinFailed = true;
       throw const SecureSessionNativeFailure(
         'remote static key does not match the pinned key',
       );
@@ -460,12 +514,12 @@ class FakeTransport implements BleTransport {
   }
 }
 
-/// Reassembles every v1 frame a side wrote and returns the transfer kinds,
+/// Reassembles every v1 frame in [frames] and returns the transfer kinds,
 /// letting tests prove no plaintext message/ACK was ever emitted.
-List<BleTransferKind> v1KindsWritten(FakeTransport transport) {
+List<BleTransferKind> v1KindsOf(Iterable<Uint8List> frames) {
   final assembler = BleTransferAssembler();
   final kinds = <BleTransferKind>[];
-  for (final frame in transport.writes) {
+  for (final frame in frames) {
     if (frame.length >= 2 && frame[1] == BleSecureProtocol.version) continue;
     try {
       final transfer = assembler.add(BleFrame.decode(frame));
@@ -477,19 +531,27 @@ List<BleTransferKind> v1KindsWritten(FakeTransport transport) {
   return kinds;
 }
 
-/// Reassembles every protocol-v2 transfer a side wrote, letting tests inspect
+/// [v1KindsOf] for a paired fake transport's recorded writes.
+List<BleTransferKind> v1KindsWritten(FakeTransport transport) =>
+    v1KindsOf(transport.writes);
+
+/// Reassembles every protocol-v2 transfer in [frames], letting tests inspect
 /// the opaque payloads and prove that no application field exists outside the
 /// ciphertext.
-List<BleSecureTransfer> secureTransfersWritten(FakeTransport transport) {
+List<BleSecureTransfer> secureTransfersOf(Iterable<Uint8List> frames) {
   final assembler = BleSecureTransferAssembler();
   final transfers = <BleSecureTransfer>[];
-  for (final frame in transport.writes) {
+  for (final frame in frames) {
     if (frame.length < 2 || frame[1] != BleSecureProtocol.version) continue;
     final transfer = assembler.add(BleSecureFrame.decode(frame));
     if (transfer != null) transfers.add(transfer);
   }
   return transfers;
 }
+
+/// [secureTransfersOf] for a paired fake transport's recorded writes.
+List<BleSecureTransfer> secureTransfersWritten(FakeTransport transport) =>
+    secureTransfersOf(transport.writes);
 
 Message testMessage({
   String messageId = 'msg-1',

@@ -28,6 +28,17 @@ class BleProtocol {
   static const String capabilityText = 'text';
   static const String capabilityAck = 'ack';
   static const String capabilityBleForeground = 'ble-foreground';
+
+  /// Secure-capability hint advertised in the plaintext HELLO by peers that
+  /// speak the Noise-based secure protocol (protocol v2 frames).
+  ///
+  /// The HELLO itself is **unauthenticated**: this identifier only says the
+  /// peer is able to start a Noise handshake, never who the peer is. Old
+  /// decoders tolerate unknown capability strings, so adding it keeps the
+  /// transition backward compatible; a HELLO without it means the peer cannot
+  /// do secure messaging and must be told to update.
+  static const String capabilitySecureNoise = 'noise-v1';
+
   static const List<String> capabilities = [
     capabilityText,
     capabilityAck,

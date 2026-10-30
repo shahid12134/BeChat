@@ -102,6 +102,19 @@ class BleSecureProtocol {
   /// The smallest a fragmenting writer may negotiate: room for the frame
   /// header plus the start descriptor.
   static const int minWriteLength = frameHeaderLength + startPayloadLength;
+
+  /// Mirrors the Rust engine's `IDENTITY_PAYLOAD_FORMAT_VERSION` (1): the
+  /// version of the AEAD-protected remote identity payload carried inside the
+  /// handshake. A remote payload with any other version is not understood and
+  /// must fail closed before the link is used.
+  static const int identityFormatVersion = 1;
+
+  /// Mirrors the Rust engine's `CAPABILITY_SECURE_TEXT` (0b0000_0001): the
+  /// authenticated-capability bit that says the peer can carry application
+  /// text over the secure transport. The plaintext HELLO capability strings
+  /// and this authenticated bit are separate signals; only this one is bound
+  /// to the peer's static key.
+  static const int capabilitySecureText = 0x01;
 }
 
 /// Transfer kinds carried by secure protocol v2 frames.

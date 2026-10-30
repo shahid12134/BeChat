@@ -51,6 +51,23 @@ class BleHelloRejectedException implements Exception {
   String toString() => 'BleHelloRejectedException: $message';
 }
 
+/// A secure-mode link met a peer whose plaintext HELLO did not advertise the
+/// secure (Noise) capability.
+///
+/// Deliberately **not** a [BleHelloRejectedException]: rejecting a HELLO is a
+/// silent policy refusal, while an unsupported peer must surface a clear,
+/// user-visible "update required" error. The link fails closed — no handshake
+/// is attempted, no plaintext application message or ACK is ever written, and
+/// there is no fallback to the legacy v1 message path.
+class BleSecurePeerUnsupportedException extends BleLinkException {
+  const BleSecurePeerUnsupportedException([
+    super.message =
+        'This peer is running an older version of BeChat that does not '
+        'support secure messaging. Ask them to update BeChat to '
+        'continue.',
+  ]);
+}
+
 /// The Noise XX role a secure link session plays.
 ///
 /// The BLE transport role maps onto the Noise role as follows:
@@ -122,6 +139,7 @@ class BleSecureSessionConfig {
     this.expectedPeerDeviceId,
     this.requireHelloBinding = false,
     this.onRemoteIdentity,
+    this.onPinnedKeyMismatch,
   });
 
   /// The Dart secure-session gateway owning the native Noise sessions.
@@ -150,7 +168,23 @@ class BleSecureSessionConfig {
   /// Surfaces the authenticated remote identity when the handshake finishes,
   /// for the owning application's authorization UI. Invoked on the
   /// [awaitingConfirmation] transition; performs no persistence.
-  final void Function(RemoteAuthenticatedIdentity identity)? onRemoteIdentity;
+  ///
+  /// The session **awaits** a returned future before the secure state machine
+  /// proceeds, so the application can validate the identity, apply its
+  /// peer-key policy and explicitly confirm the peer in one ordered step. A
+  /// throw fails the link closed; a non-future return keeps the historical
+  /// fire-and-forget contract.
+  final FutureOr<void> Function(RemoteAuthenticatedIdentity identity)?
+  onRemoteIdentity;
+
+  /// Invoked when the native engine rejects the handshake because the
+  /// authenticated remote static key differs from [pinnedRemotePublicKey].
+  ///
+  /// Detection is structural (the engine's own status snapshot reports the
+  /// authenticated remote key), never string matching on an error message.
+  /// The conflicting key is deliberately *not* passed on: the application may
+  /// only record that a conflict occurred while preserving the original pin.
+  final FutureOr<void> Function()? onPinnedKeyMismatch;
 }
 
 class BleAckPolicy {
@@ -218,6 +252,13 @@ class BleLinkSession {
   RemoteAuthenticatedIdentity? _secureRemoteIdentity;
   Timer? _secureHandshakeTimer;
 
+  // Peer-specific secure context bound at runtime after the HELLO exchange;
+  // see [bindSecurePeerContext]. Inert unless bound.
+  static const int _pinnedKeyLength = 32;
+  Uint8List? _boundPinnedRemotePublicKey;
+  String? _boundExpectedPeerDeviceId;
+  bool _secureContextBound = false;
+
   BleSessionState get state => _state;
   BleHello? get linkInfo => _hello;
   bool get isReady => _state == BleSessionState.ready;
@@ -254,6 +295,14 @@ class BleLinkSession {
       final hello = BleHello(
         deviceId: identity.deviceId,
         displayName: identity.displayName,
+        // Secure sessions advertise the Noise capability in the plaintext
+        // HELLO so the peer can tell an updated BeChat from a legacy one.
+        // The hint is unauthenticated context only — readiness still requires
+        // the full handshake — and a legacy (secure == null) session keeps
+        // byte-identical v1 HELLOs by advertising nothing new.
+        capabilities: secure == null
+            ? BleProtocol.capabilities
+            : [...BleProtocol.capabilities, BleProtocol.capabilitySecureNoise],
       );
       await _enqueue(() async {
         await _writeTransfer(BleTransferKind.hello, hello.encode());
@@ -530,6 +579,56 @@ class BleLinkSession {
     onClosed?.call(_closeError);
   }
 
+  /// Binds the peer-specific secure context — the pinned remote key and the
+  /// expected peer device ID — that the owning application resolves from its
+  /// peer store *after* the plaintext HELLO exchange.
+  ///
+  /// A BLE link does not know the peer's BeChat device ID before the HELLO
+  /// (a GATT peripheral address is not the peer identity), so the pin cannot
+  /// be known when the session is constructed. This seam must be called while
+  /// the link is [BleSecureLinkState.awaitingAuthorization] — after approval
+  /// and before [startSecureHandshake] — and it never re-binds a running or
+  /// finished handshake. When never called, the constructor-provided values
+  /// apply unchanged.
+  void bindSecurePeerContext({
+    Uint8List? pinnedRemotePublicKey,
+    String? expectedPeerDeviceId,
+  }) {
+    if (secure == null) {
+      throw const BleLinkException('Secure mode is not enabled on this link');
+    }
+    if (_closed || _secureState != BleSecureLinkState.awaitingAuthorization) {
+      throw const BleLinkException(
+        'The secure peer context can only be bound before the handshake starts',
+      );
+    }
+    if (pinnedRemotePublicKey != null &&
+        pinnedRemotePublicKey.length != _pinnedKeyLength) {
+      throw ArgumentError.value(
+        pinnedRemotePublicKey,
+        'pinnedRemotePublicKey',
+        'must be a 32-byte public key',
+      );
+    }
+    _boundPinnedRemotePublicKey = pinnedRemotePublicKey == null
+        ? null
+        : Uint8List.fromList(pinnedRemotePublicKey);
+    _boundExpectedPeerDeviceId = expectedPeerDeviceId;
+    _secureContextBound = true;
+  }
+
+  /// The pin the native engine must enforce: a bound value (runtime path)
+  /// otherwise the constructor value (direct-construction path).
+  Uint8List? get _effectivePinnedRemotePublicKey => _secureContextBound
+      ? _boundPinnedRemotePublicKey
+      : secure?.pinnedRemotePublicKey;
+
+  /// The device ID the native engine must authenticate: same precedence as
+  /// [_effectivePinnedRemotePublicKey].
+  String? get _effectiveExpectedPeerDeviceId => _secureContextBound
+      ? _boundExpectedPeerDeviceId
+      : secure?.expectedPeerDeviceId;
+
   /// Explicitly authorizes and starts the Noise XX handshake (application
   /// approval seam).
   ///
@@ -561,8 +660,8 @@ class BleLinkSession {
         initiator: config.role == BleSecureRole.initiator,
         deviceId: identity.deviceId,
         displayName: identity.displayName,
-        pinnedRemotePublicKey: config.pinnedRemotePublicKey,
-        expectedRemoteDeviceId: config.expectedPeerDeviceId,
+        pinnedRemotePublicKey: _effectivePinnedRemotePublicKey,
+        expectedRemoteDeviceId: _effectiveExpectedPeerDeviceId,
       );
       if (_closed) {
         try {
@@ -656,7 +755,7 @@ class BleLinkSession {
       );
       return;
     }
-    final expected = config.expectedPeerDeviceId;
+    final expected = _effectiveExpectedPeerDeviceId;
     if (expected != null && remote.deviceId != expected) {
       // Fail closed on an authenticated identity that is not the expected
       // peer. Nothing is persisted and no saved peer is overwritten.
@@ -685,7 +784,12 @@ class BleLinkSession {
     }
     _secureRemoteIdentity = remote;
     _secureState = BleSecureLinkState.awaitingConfirmation;
-    config.onRemoteIdentity?.call(remote);
+    // The application's validation/confirmation step runs here, in the
+    // inbound-frame queue: awaiting it means the next frame cannot be
+    // processed until this side has confirmed (or failed), so an early
+    // secure message from a peer that finished first can never race ahead of
+    // local confirmation. A thrown validation fails the link closed.
+    await config.onRemoteIdentity?.call(remote);
   }
 
   /// Sends one opaque Noise payload (handshake message, encrypted application
@@ -891,13 +995,61 @@ class BleLinkSession {
       // handshake is running; anything else fails closed.
       throw const BleLinkException('Unexpected secure handshake message');
     }
-    final step = await config.gateway.processHandshake(handle, payload);
+    final HandshakeStepResult step;
+    try {
+      step = await config.gateway.processHandshake(handle, payload);
+    } catch (error) {
+      // A poisoned handshake step may be the engine refusing a remote key
+      // that differs from the pin. Ask the engine's status snapshot — never
+      // its message text — whether an authenticated remote key arrived, and
+      // tell the application so it can record the conflict while keeping the
+      // original pin. Nothing is swallowed: the original failure still fails
+      // the link closed below.
+      await _notifyPinnedKeyConflict(config, handle);
+      rethrow;
+    }
     if (_closed || !identical(_secureHandle, handle)) {
       // The link was closed or the session replaced while the native call
       // was in flight; this late result must not change any state.
       return;
     }
     await _applyHandshakeStep(config, handle, step);
+  }
+
+  /// Reports a pinned-key conflict to the application after a failed native
+  /// handshake step, but only when the engine's own snapshot proves the peer
+  /// presented a *different* authenticated key. Any uncertainty — no remote
+  /// key reported, snapshot unavailable, or an identical key — reports
+  /// nothing: a timeout or malformed message must never be mistaken for an
+  /// identity change. The link fails closed either way.
+  Future<void> _notifyPinnedKeyConflict(
+    BleSecureSessionConfig config,
+    SecureSessionHandle handle,
+  ) async {
+    final callback = config.onPinnedKeyMismatch;
+    final pin = _effectivePinnedRemotePublicKey;
+    if (callback == null || pin == null) return;
+    String? remoteKeyHex;
+    try {
+      final status = await config.gateway.getSessionStatus(handle);
+      remoteKeyHex = status.remotePublicKeyHex;
+    } catch (_) {
+      // The session could not report a snapshot: no evidence of a conflict.
+      return;
+    }
+    if (remoteKeyHex == null || _hexOf(pin) == remoteKeyHex) return;
+    await callback();
+  }
+
+  /// Lowercase-hex encoding used to compare non-secret public key material.
+  static String _hexOf(List<int> bytes) {
+    const digits = '0123456789abcdef';
+    final out = StringBuffer();
+    for (final byte in bytes) {
+      out.write(digits[byte >> 4]);
+      out.write(digits[byte & 0x0f]);
+    }
+    return out.toString();
   }
 
   Future<void> _handleTransfer(BleTransfer transfer) async {
@@ -929,6 +1081,21 @@ class BleLinkSession {
     }
     final hello = BleHello.decode(bytes);
     hello.validate(localDeviceId: identity.deviceId);
+    if (secure != null &&
+        !hello.capabilities.contains(BleProtocol.capabilitySecureNoise)) {
+      // Secure mode with a peer that cannot do secure messaging: fail before
+      // any approval workflow runs, before any handshake starts, and without
+      // writing a single plaintext application byte. This throw propagates to
+      // the incoming queue, which fails the secure session closed (never a
+      // plaintext fallback), and it also fails the pending HELLO exchange, so
+      // the owning application sees one clear "peer update required" failure
+      // instead of an approval request it would have to decline by hand.
+      final error = const BleSecurePeerUnsupportedException();
+      if (!_helloCompleter.isCompleted) {
+        _helloCompleter.completeError(error);
+      }
+      throw error;
+    }
     try {
       await onHello(hello);
     } catch (error) {

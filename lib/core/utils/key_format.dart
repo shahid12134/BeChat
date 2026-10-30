@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// Encoding validation for the non-secret key metadata BeChat persists.
 ///
 /// These helpers check *shape* only. A well-formed public key is not a trusted
@@ -32,4 +34,25 @@ class KeyFormat {
   /// reference must never be a key.
   static bool isOpaqueReference(String value) =>
       !isHex32(value) && opaqueReference.hasMatch(value);
+
+  /// Decodes a [hex32]-shaped value into its 32 raw bytes.
+  ///
+  /// Throws [ArgumentError] on anything that is not exactly 32 bytes of
+  /// lowercase hex: a malformed stored key must fail loudly rather than being
+  /// normalized, truncated or padded into something that could be mistaken
+  /// for a pinned public key.
+  static Uint8List hex32ToBytes(String value) {
+    if (!hex32.hasMatch(value)) {
+      throw ArgumentError.value(
+        value,
+        'value',
+        'must be a 32-byte key in lowercase hex',
+      );
+    }
+    final out = Uint8List(32);
+    for (var i = 0; i < 32; i++) {
+      out[i] = int.parse(value.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return out;
+  }
 }
