@@ -431,9 +431,13 @@ class SecureSessionControllerTest {
 
     @Test
     fun closingASessionReleasesItsRegistrySlot() {
-        // Fill the engine's four-slot session registry.
-        val sessions = (0 until 4).map { createSession(initiator = it % 2 == 0) }
-        assertEquals(4, SecureSessionController.trackedSessionCount())
+        // Fill the engine's session registry to its capacity. Mirrors
+        // `MAX_SESSIONS` in native/crypto_core/src/session.rs, which the
+        // multi-connection runtime aligns with its Dart link limit
+        // (`bleMaxLinkCount`). Raised 4 -> 8 together with that constant.
+        val capacity = 8
+        val sessions = (0 until capacity).map { createSession(initiator = it % 2 == 0) }
+        assertEquals(capacity, SecureSessionController.trackedSessionCount())
 
         val overflow = callError(
             "createSession",
@@ -447,13 +451,63 @@ class SecureSessionControllerTest {
         )
         assertEquals(SecureSessionController.ERROR_NATIVE, overflow.errorCode)
         assertEquals("too many active sessions", overflow.errorMessage)
-        assertEquals(4, SecureSessionController.trackedSessionCount())
+        assertEquals(capacity, SecureSessionController.trackedSessionCount())
 
-        // Closing one session frees exactly one slot for a replacement.
+        // Closing one session frees exactly one slot for a replacement, so a
+        // peer that disconnects never blocks another peer from connecting.
         assertTrue(close(sessions[1]))
         val replacement = createSession(initiator = false)
         assertTrue("replacement session must be creatable", replacement > 0)
-        assertEquals(4, SecureSessionController.trackedSessionCount())
+        assertEquals(capacity, SecureSessionController.trackedSessionCount())
+    }
+
+    @Test
+    fun aBurstOfOperationsAcrossManySessionsIsNotRejectedAsBusy() {
+        // Multi-connection load: several links each encrypt and decrypt at the
+        // same time. The executor stays single-threaded, so every call is
+        // serialized, but all of them must be *queued* rather than rejected
+        // with SESSION_BUSY. With the old 32-slot queue, enough simultaneous
+        // links could exhaust the queue and fail healthy peers.
+        val sessions = (0 until 6).map { createSession(initiator = it % 2 == 0) }
+        val plaintext = "multi link payload".toByteArray()
+
+        val pending = mutableListOf<CapturingResult>()
+        // 8 rounds across 6 sessions = 48 queued crypto operations, more than
+        // the old queue depth, submitted without waiting in between.
+        repeat(8) { round ->
+            for (handle in sessions) {
+                val result = CapturingResult()
+                SecureSessionController.onMethodCall(
+                    MethodCall(
+                        "encrypt",
+                        mapOf("handle" to handle, "plaintext" to plaintext),
+                    ),
+                    result,
+                )
+                pending += result
+            }
+        }
+
+        for ((index, result) in pending.withIndex()) {
+            assertTrue(
+                "operation $index timed out",
+                result.latch.await(30, TimeUnit.SECONDS),
+            )
+            assertNull(
+                "operation $index failed: ${result.errorCode}: ${result.errorMessage}",
+                result.errorCode,
+            )
+            @Suppress("UNCHECKED_CAST")
+            val response = result.value as? Map<String, Any?>
+            assertTrue(
+                "operation $index must produce ciphertext",
+                response?.get("ciphertext") is ByteArray,
+            )
+        }
+
+        for (handle in sessions) {
+            assertTrue(close(handle))
+        }
     }
 
     @Test

@@ -37,8 +37,17 @@ class PeerListItem extends ConsumerWidget {
     final bleState = ref.watch(bleRuntimeProvider);
     final presence = resolvePeerPresence(peer, bleState.presenceContext);
     final isOnline = isPeerPresenceConnected(presence);
+    // This peer's own link carries its signal strength. When no per-link
+    // snapshot exists (legacy single-link view), fall back to the active-peer
+    // signal — but only for that active peer, so one peer's RSSI never leaks
+    // into another peer's row.
+    final peerLink = bleState.linkFor(peer.peerId);
     final signalStrength = isOnline
-        ? bleState.activeSignalStrength ?? peer.signalStrength
+        ? peerLink?.signalStrength ??
+              (bleState.activePeerId == peer.peerId
+                  ? bleState.activeSignalStrength
+                  : null) ??
+              peer.signalStrength
         : peer.signalStrength;
 
     return ListTile(

@@ -246,6 +246,21 @@ class BleLinkSession {
   Object? _closeError;
   bool _closed = false;
 
+  /// Per-start replacement for [onHello]; see [start]. Null keeps the
+  /// constructor-provided handler.
+  Future<void> Function(BleHello hello)? _onHelloOverride;
+
+  /// Per-start replacement for [onMessage]; see [start]. Null keeps the
+  /// constructor-provided handler.
+  Future<BleAckResult> Function(BleMessagePayload message)? _onMessageOverride;
+
+  /// The effective inbound-message handler: the per-start override when the
+  /// owning runtime bound one, otherwise the constructor handler.
+  Future<BleAckResult> _dispatchMessage(BleMessagePayload message) {
+    final handler = _onMessageOverride ?? onMessage;
+    return handler(message);
+  }
+
   // Secure-mode state. All fields are inert when [secure] is null.
   BleSecureLinkState _secureState = BleSecureLinkState.idle;
   SecureSessionHandle? _secureHandle;
@@ -276,7 +291,22 @@ class BleLinkSession {
   RemoteAuthenticatedIdentity? get secureRemoteIdentity =>
       _secureRemoteIdentity;
 
-  Future<BleHello> start() async {
+  /// Starts the HELLO exchange.
+  ///
+  /// [onHello] and [onMessage], when given, replace this session's
+  /// constructor-provided handlers for this session only. The
+  /// multi-connection runtime uses them to bind inbound frames to the owning
+  /// link context: with several simultaneous sessions the constructor
+  /// callbacks alone cannot tell which link a HELLO or message arrived on,
+  /// while these overrides run with the exact session that received the
+  /// frame. Throwing from either rejects or fails exactly like the
+  /// constructor handler.
+  Future<BleHello> start({
+    Future<void> Function(BleHello hello)? onHello,
+    Future<BleAckResult> Function(BleMessagePayload message)? onMessage,
+  }) async {
+    _onHelloOverride = onHello;
+    _onMessageOverride = onMessage;
     if (_state != BleSessionState.idle) {
       throw const BleLinkException('BLE session has already been started');
     }
@@ -940,7 +970,7 @@ class BleLinkSession {
           'Secure message does not match the authenticated link',
         );
       }
-      result = await onMessage(message);
+      result = await _dispatchMessage(message);
     } catch (error) {
       // Existing application-level rejection semantics: the reason travels
       // only inside the encrypted acknowledgement, never as plaintext.
@@ -1097,7 +1127,11 @@ class BleLinkSession {
       throw error;
     }
     try {
-      await onHello(hello);
+      // The per-start override (multi-link binding) takes precedence over the
+      // constructor handler; both run with identical reject-on-throw
+      // semantics, so no HELLO is ever accepted by a handler that throws.
+      final handler = _onHelloOverride ?? onHello;
+      await handler(hello);
     } catch (error) {
       await _sendError('hello_rejected', error.toString());
       throw BleHelloRejectedException(error.toString());
@@ -1123,7 +1157,7 @@ class BleLinkSession {
     BleAckResult result;
     String? reason;
     try {
-      result = await onMessage(message);
+      result = await _dispatchMessage(message);
     } catch (error) {
       result = BleAckResult.rejected;
       reason = error.toString();

@@ -10,8 +10,8 @@ void main() {
     final repository = _FakeMessageRepository([_message()]);
     final outbox = BleOutbox(
       repository: repository,
-      send: (message, {onTransmitted}) async => BleAckResult.stored,
-      isLinkUsable: () => false,
+      send: (peerId, message, {onTransmitted}) async => BleAckResult.stored,
+      isLinkUsable: (_) => false,
       onChanged: (message) async {},
     );
 
@@ -27,12 +27,12 @@ void main() {
     var sent = 0;
     final outbox = BleOutbox(
       repository: repository,
-      send: (message, {onTransmitted}) async {
+      send: (peerId, message, {onTransmitted}) async {
         sent++;
         await onTransmitted?.call();
         return BleAckResult.stored;
       },
-      isLinkUsable: () => true,
+      isLinkUsable: (_) => true,
       onChanged: (message) async => statuses.add(message.status),
     );
 
@@ -55,13 +55,13 @@ void main() {
     var attempts = 0;
     final outbox = BleOutbox(
       repository: repository,
-      send: (message, {onTransmitted}) async {
+      send: (peerId, message, {onTransmitted}) async {
         attempts++;
         if (attempts == 1) throw StateError('link dropped');
         await onTransmitted?.call();
         return BleAckResult.stored;
       },
-      isLinkUsable: () => true,
+      isLinkUsable: (_) => true,
       onChanged: (message) async {},
       retryDelay: (_) => Duration.zero,
     );
@@ -80,12 +80,12 @@ void main() {
       var attempts = 0;
       final outbox = BleOutbox(
         repository: repository,
-        send: (message, {onTransmitted}) async {
+        send: (peerId, message, {onTransmitted}) async {
           attempts++;
           usable = false;
           throw StateError('disconnected');
         },
-        isLinkUsable: () => usable,
+        isLinkUsable: (_) => usable,
         onChanged: (message) async {},
         retryDelay: (_) => Duration.zero,
       );
@@ -102,7 +102,7 @@ void main() {
     var attempts = 0;
     final outbox = BleOutbox(
       repository: repository,
-      send: (message, {onTransmitted}) async {
+      send: (peerId, message, {onTransmitted}) async {
         attempts++;
         await onTransmitted?.call();
         if (attempts == 1) {
@@ -110,7 +110,7 @@ void main() {
         }
         return BleAckResult.stored;
       },
-      isLinkUsable: () => true,
+      isLinkUsable: (_) => true,
       onChanged: (message) async {},
       approvalRetryDelay: Duration.zero,
     );
@@ -127,11 +127,11 @@ void main() {
       final repository = _FakeMessageRepository([_message()]);
       final outbox = BleOutbox(
         repository: repository,
-        send: (message, {onTransmitted}) async {
+        send: (peerId, message, {onTransmitted}) async {
           await onTransmitted?.call();
           throw const BleApprovalPendingException('msg-1');
         },
-        isLinkUsable: () => true,
+        isLinkUsable: (_) => true,
         onChanged: (message) async {},
         approvalRetryWindow: Duration.zero,
         approvalRetryDelay: Duration.zero,
@@ -147,11 +147,11 @@ void main() {
     final repository = _FakeMessageRepository([_message()]);
     final outbox = BleOutbox(
       repository: repository,
-      send: (message, {onTransmitted}) async {
+      send: (peerId, message, {onTransmitted}) async {
         await onTransmitted?.call();
         return BleAckResult.rejected;
       },
-      isLinkUsable: () => true,
+      isLinkUsable: (_) => true,
       onChanged: (message) async {},
     );
 
@@ -164,11 +164,11 @@ void main() {
     final repository = _FakeMessageRepository([_message()]);
     final outbox = BleOutbox(
       repository: repository,
-      send: (message, {onTransmitted}) async {
+      send: (peerId, message, {onTransmitted}) async {
         await onTransmitted?.call();
         return BleAckResult.duplicate;
       },
-      isLinkUsable: () => true,
+      isLinkUsable: (_) => true,
       onChanged: (message) async {},
     );
 
@@ -176,15 +176,147 @@ void main() {
 
     expect(repository.statusOf('msg-1'), MessageStatus.delivered);
   });
+
+  group('multi-destination draining', () {
+    test(
+      'each peer only receives its own messages, never another peer\'s',
+      () async {
+        final repository = _FakeMessageRepository([
+          _message(id: 'to-b', receiver: 'device-b'),
+          _message(id: 'to-c', receiver: 'device-c'),
+        ]);
+        final seenByPeer = <String, List<String>>{};
+
+        final outbox = BleOutbox(
+          repository: repository,
+          send: (peerId, message, {onTransmitted}) async {
+            seenByPeer.putIfAbsent(peerId, () => []).add(message.messageId);
+            await onTransmitted?.call();
+            return BleAckResult.stored;
+          },
+          isLinkUsable: (_) => true,
+          onChanged: (message) async {},
+        );
+
+        await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+        await outbox.drain(localDeviceId: 'device-a', peerId: 'device-c');
+
+        expect(seenByPeer['device-b'], ['to-b']);
+        expect(seenByPeer['device-c'], ['to-c']);
+        expect(repository.statusOf('to-b'), MessageStatus.delivered);
+        expect(repository.statusOf('to-c'), MessageStatus.delivered);
+      },
+    );
+
+    test('one peer\'s failure is confined to that peer\'s queue', () async {
+      final repository = _FakeMessageRepository([
+        _message(id: 'to-b', receiver: 'device-b'),
+        _message(id: 'to-c', receiver: 'device-c'),
+      ]);
+      final outbox = BleOutbox(
+        repository: repository,
+        send: (peerId, message, {onTransmitted}) async {
+          if (peerId == 'device-b') {
+            throw StateError('peer-b link dropped');
+          }
+          await onTransmitted?.call();
+          return BleAckResult.stored;
+        },
+        isLinkUsable: (_) => true,
+        onChanged: (message) async {},
+        retryDelay: (_) => Duration.zero,
+      );
+
+      await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+      await outbox.drain(localDeviceId: 'device-a', peerId: 'device-c');
+
+      // b's message is requeued, c's still delivers.
+      expect(repository.statusOf('to-b'), MessageStatus.queued);
+      expect(repository.statusOf('to-c'), MessageStatus.delivered);
+    });
+
+    test(
+      'draining one peer leaves another peer\'s queued messages untouched',
+      () async {
+        final repository = _FakeMessageRepository([
+          _message(id: 'to-b', receiver: 'device-b'),
+          _message(id: 'to-c', receiver: 'device-c'),
+        ]);
+        final outbox = BleOutbox(
+          repository: repository,
+          send: (peerId, message, {onTransmitted}) async {
+            await onTransmitted?.call();
+            return BleAckResult.stored;
+          },
+          isLinkUsable: (_) => true,
+          onChanged: (message) async {},
+        );
+
+        await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+
+        expect(repository.statusOf('to-b'), MessageStatus.delivered);
+        expect(repository.statusOf('to-c'), MessageStatus.queued);
+      },
+    );
+
+    test(
+      'messages stay queued while that specific peer\'s link is unusable',
+      () async {
+        final repository = _FakeMessageRepository([
+          _message(id: 'to-b', receiver: 'device-b'),
+          _message(id: 'to-c', receiver: 'device-c'),
+        ]);
+        final outbox = BleOutbox(
+          repository: repository,
+          send: (peerId, message, {onTransmitted}) async {
+            await onTransmitted?.call();
+            return BleAckResult.stored;
+          },
+          // Only device-c has a usable link.
+          isLinkUsable: (peerId) => peerId == 'device-c',
+          onChanged: (message) async {},
+        );
+
+        await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+        await outbox.drain(localDeviceId: 'device-a', peerId: 'device-c');
+
+        expect(repository.statusOf('to-b'), MessageStatus.queued);
+        expect(repository.statusOf('to-c'), MessageStatus.delivered);
+      },
+    );
+
+    test('FIFO order is preserved per peer', () async {
+      final repository = _FakeMessageRepository([
+        _message(id: 'first', receiver: 'device-b'),
+        _message(id: 'second', receiver: 'device-b'),
+        _message(id: 'third', receiver: 'device-b'),
+      ]);
+      final sendOrder = <String>[];
+      final outbox = BleOutbox(
+        repository: repository,
+        send: (peerId, message, {onTransmitted}) async {
+          sendOrder.add(message.messageId);
+          await onTransmitted?.call();
+          return BleAckResult.stored;
+        },
+        isLinkUsable: (_) => true,
+        onChanged: (message) async {},
+      );
+
+      await outbox.drain(localDeviceId: 'device-a', peerId: 'device-b');
+
+      expect(sendOrder, ['first', 'second', 'third']);
+    });
+  });
 }
 
-Message _message() {
+Message _message({String id = 'msg-1', String receiver = 'device-b'}) {
   final now = DateTime.utc(2026, 3, 4);
   return Message(
-    messageId: 'msg-1',
+    messageId: id,
     chatId: 'chat-1',
     senderId: 'device-a',
-    receiverId: 'device-b',
+    receiverId: receiver,
     content: 'Queued',
     timestamp: now,
     createdAt: now,

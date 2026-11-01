@@ -52,13 +52,20 @@ class _IncomingConnectionRequestHostState
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => IncomingConnectionRequestDialog(request: request),
+      builder: (context) => IncomingConnectionRequestDialog(
+        request: request,
+        // Simultaneous requests from other peers queue behind this one; the
+        // count tells the user more decisions are waiting.
+        pendingCount: ref.read(bleRuntimeProvider).incomingRequests.length,
+      ),
     );
     _dialogVisible = false;
     _shownRequestId = null;
     if (!mounted) return;
+    // Show whatever is still pending: the next queued request from another
+    // peer, or this one again if its dialog closed without a decision.
     final current = ref.read(bleRuntimeProvider).incomingRequest;
-    if (current != null && current.requestId == request.requestId) {
+    if (current != null) {
       _handleRequest(current);
     }
   }
@@ -74,9 +81,18 @@ class _IncomingConnectionRequestHostState
 }
 
 class IncomingConnectionRequestDialog extends ConsumerStatefulWidget {
-  const IncomingConnectionRequestDialog({super.key, required this.request});
+  const IncomingConnectionRequestDialog({
+    super.key,
+    required this.request,
+    this.pendingCount = 1,
+  });
 
   final IncomingConnectionRequest request;
+
+  /// How many requests are pending in total, including this one. Several
+  /// peers may request a connection at once; they are shown one at a time,
+  /// and this count tells the user more decisions follow this one.
+  final int pendingCount;
 
   @override
   ConsumerState<IncomingConnectionRequestDialog> createState() =>
@@ -107,10 +123,15 @@ class _IncomingConnectionRequestDialogState
   Widget build(BuildContext context) {
     final request = widget.request;
     final signal = request.signalStrength;
+    final morePending = widget.pendingCount > 1;
     return PopScope(
       canPop: false,
       child: AlertDialog(
-        title: const Text('Connection request'),
+        title: Text(
+          morePending
+              ? 'Connection request (${widget.pendingCount} pending)'
+              : 'Connection request',
+        ),
         content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -129,6 +150,17 @@ class _IncomingConnectionRequestDialogState
                   fontSize: 12,
                 ),
               ),
+              if (morePending) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '${widget.pendingCount} connection requests are waiting. '
+                  'Each is decided separately.',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
               if (_error != null) ...[
                 const SizedBox(height: 12),
                 Text(

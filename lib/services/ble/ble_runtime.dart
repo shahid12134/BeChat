@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:bechat/core/ble/ble_link_phase.dart';
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/core/ble/ble_secure_protocol.dart';
@@ -25,6 +26,7 @@ import 'package:bechat/services/background/background_ble_service.dart';
 import 'package:bechat/services/crypto/identity_initialization_coordinator.dart';
 import 'package:bechat/services/crypto/native_secure_session_service.dart';
 import 'package:bechat/services/ble/ble_gatt_operation_gate.dart';
+import 'package:bechat/services/ble/ble_link_manager.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
 import 'package:bechat/services/ble/ble_outbox.dart';
 import 'package:bechat/services/ble/ble_presence_monitor.dart';
@@ -34,6 +36,11 @@ import 'package:bechat/services/ble/incoming_connection_request.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
+
+/// The BLE link role is defined at core level so the link manager can use it
+/// without importing the runtime; re-exported here so existing imports of
+/// this file keep working unchanged.
+export 'package:bechat/core/ble/ble_link_phase.dart' show BleLinkRole;
 
 enum BleRuntimeStatus {
   idle,
@@ -48,8 +55,9 @@ enum BleRuntimeStatus {
   error,
 }
 
-enum BleLinkRole { central, peripheral }
-
+/// The BLE link role is defined at core level so the link manager can use it
+/// without importing the runtime; re-exported here so existing imports of
+/// this file keep working unchanged.
 enum BackgroundBleRuntimeStatus {
   disabled,
   starting,
@@ -117,6 +125,8 @@ class BleRuntimeState {
     this.availabilityEnabled = true,
     this.activeSignalStrength,
     this.isSecureReady = false,
+    this.links = const [],
+    this.incomingRequests = const [],
   });
 
   final BleRuntimeStatus status;
@@ -127,6 +137,11 @@ class BleRuntimeState {
   final String? error;
   final bool canOpenSettings;
   final bool isAdvertising;
+
+  /// The most recent pending incoming connection request, kept as the
+  /// compatibility view for the single-request UI. The authoritative
+  /// collection is [incomingRequests], which may hold several simultaneous
+  /// requests from different peers.
   final IncomingConnectionRequest? incomingRequest;
   final bool isForeground;
   final BackgroundBleRuntimeStatus backgroundStatus;
@@ -140,26 +155,95 @@ class BleRuntimeState {
   /// secure connection, marked online, or served from the outbox. Always
   /// false while an approval request, handshake or reconnect is outstanding,
   /// and cleared whenever the active link is torn down. Legacy v1 links never
-  /// set it.
+  /// set it. Compatibility view over [links]; per-peer truth is each link's
+  /// own phase.
   final bool isSecureReady;
+
+  /// Snapshot of every managed link, one entry per peer, so the UI can show
+  /// all connections with their independent phases at once. A peer missing
+  /// from this list has no managed link. Only entries whose phase is
+  /// [BleLinkPhase.secureReady] are connected for delivery and presence.
+  final List<BlePeerLinkState> links;
+
+  /// Every pending incoming connection request, each independently
+  /// acceptable, deniable, blockable or expiring. [incomingRequest] is the
+  /// most recent of these for compatibility.
+  final List<IncomingConnectionRequest> incomingRequests;
 
   bool get isConnected =>
       status == BleRuntimeStatus.connected && activePeerId != null;
 
+  /// Whether at least one managed link is secure-ready.
+  bool get hasSecureLink => links.any((link) => link.isSecureReady);
+
+  /// The link state for [peerId], or null when this device holds no link to
+  /// that peer.
+  BlePeerLinkState? linkFor(String peerId) {
+    for (final link in links) {
+      if (link.peerId == peerId) return link;
+    }
+    return null;
+  }
+
+  /// Whether [peerId]'s link is secure-ready — the only state in which that
+  /// peer may be treated as connected for secure message delivery.
+  bool isPeerSecureReady(String peerId) =>
+      linkFor(peerId)?.isSecureReady ?? false;
+
   bool get isBackgroundServiceActive =>
       backgroundStatus == BackgroundBleRuntimeStatus.active;
 
-  PeerPresenceContext get presenceContext => PeerPresenceContext(
-    availabilityEnabled: availabilityEnabled,
-    localUnavailable:
-        status == BleRuntimeStatus.unsupported ||
-        status == BleRuntimeStatus.unauthorized ||
-        status == BleRuntimeStatus.bluetoothOff,
-    connected: isConnected,
-    connecting: status == BleRuntimeStatus.connecting,
-    activePeerId: activePeerId,
-    awaitingApprovalPeerId: incomingRequest?.peerId,
-  );
+  /// Presence facts for every saved peer, derived from each peer's own link.
+  ///
+  /// A peer is online only when its own link is secure-ready; a peer with a
+  /// pending approval request shows "approval needed"; every other live link
+  /// phase (connecting, handshaking, awaiting confirmation) reads as
+  /// "connecting". Peers without a link are offline regardless of how many
+  /// other links this device holds. The single-active-peer fields are still
+  /// published for the legacy single-link path.
+  PeerPresenceContext get presenceContext {
+    final approvalPeerIds = <String>{};
+    for (final request in incomingRequests) {
+      approvalPeerIds.add(request.peerId);
+    }
+    final securePeerIds = <String>{};
+    final handshakingPeerIds = <String>{};
+    for (final link in links) {
+      final id = link.peerId;
+      if (id == null) continue;
+      switch (link.phase) {
+        case BleLinkPhase.secureReady:
+          securePeerIds.add(id);
+        case BleLinkPhase.connecting:
+        case BleLinkPhase.handshaking:
+        case BleLinkPhase.awaitingConfirmation:
+          handshakingPeerIds.add(id);
+        case BleLinkPhase.awaitingAuthorization:
+          // A link awaiting this device's approval is covered by its pending
+          // request; any other awaiting link (an outgoing link waiting for
+          // the remote's approval) still reads as connecting.
+          if (!approvalPeerIds.contains(id)) handshakingPeerIds.add(id);
+        case BleLinkPhase.disconnecting:
+        case BleLinkPhase.failed:
+        case BleLinkPhase.closed:
+          break;
+      }
+    }
+    return PeerPresenceContext(
+      availabilityEnabled: availabilityEnabled,
+      localUnavailable:
+          status == BleRuntimeStatus.unsupported ||
+          status == BleRuntimeStatus.unauthorized ||
+          status == BleRuntimeStatus.bluetoothOff,
+      connected: isConnected,
+      connecting: status == BleRuntimeStatus.connecting,
+      activePeerId: activePeerId,
+      awaitingApprovalPeerId: incomingRequest?.peerId,
+      securePeerIds: securePeerIds,
+      awaitingApprovalPeerIds: approvalPeerIds,
+      handshakingPeerIds: handshakingPeerIds,
+    );
+  }
 
   BleRuntimeState copyWith({
     BleRuntimeStatus? status,
@@ -177,12 +261,16 @@ class BleRuntimeState {
     bool? availabilityEnabled,
     int? activeSignalStrength,
     bool? isSecureReady,
+    List<BlePeerLinkState>? links,
+    List<IncomingConnectionRequest>? incomingRequests,
     bool clearActiveLink = false,
     bool clearError = false,
     bool clearIncomingRequest = false,
     bool clearBackgroundError = false,
     bool clearActiveSignal = false,
   }) {
+    final explicitRequests = incomingRequests;
+    final resolvedIncomingRequests = explicitRequests ?? this.incomingRequests;
     return BleRuntimeState(
       status: status ?? this.status,
       candidates: candidates ?? this.candidates,
@@ -194,9 +282,18 @@ class BleRuntimeState {
       error: clearError ? null : error ?? this.error,
       canOpenSettings: canOpenSettings ?? this.canOpenSettings,
       isAdvertising: isAdvertising ?? this.isAdvertising,
+      // The single-request compatibility view always tracks the authoritative
+      // collection: whenever the collection is updated, the view is the
+      // newest pending request, or none.
       incomingRequest: clearIncomingRequest
           ? null
-          : incomingRequest ?? this.incomingRequest,
+          : incomingRequest ??
+                (explicitRequests != null
+                    ? resolvedIncomingRequests.lastOrNull
+                    : this.incomingRequest),
+      incomingRequests: clearIncomingRequest
+          ? const []
+          : resolvedIncomingRequests,
       isForeground: isForeground ?? this.isForeground,
       backgroundStatus: backgroundStatus ?? this.backgroundStatus,
       backgroundError: clearBackgroundError
@@ -212,8 +309,30 @@ class BleRuntimeState {
       isSecureReady: clearActiveLink
           ? false
           : isSecureReady ?? this.isSecureReady,
+      links: links ?? this.links,
     );
   }
+}
+
+/// One pending incoming connection request together with the link it belongs
+/// to.
+///
+/// Each pending request owns its session, its peer identity hint and its own
+/// expiry timer, so several peers can await approval simultaneously and one
+/// decision (accept, deny, block, timeout) can never act on another peer's
+/// request.
+class _PendingIncomingRequest {
+  _PendingIncomingRequest({
+    required this.request,
+    required this.linkId,
+    required this.session,
+    required this.timer,
+  });
+
+  final IncomingConnectionRequest request;
+  final String linkId;
+  final BleLinkSession session;
+  final Timer timer;
 }
 
 class BleRuntimeController extends StateNotifier<BleRuntimeState> {
@@ -298,13 +417,41 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   final Map<String, Peripheral> _candidatesById = {};
   final Map<String, Completer<void>> _connectionWaiters = {};
-  final Map<String, List<Uint8List>> _pendingCentralWrites = {};
 
   Timer? _scanTimer;
   Timer? _candidateCleanupTimer;
-  Timer? _incomingRequestTimer;
-  BleLinkSession? _incomingRequestSession;
+
+  /// Every managed link, keyed by BLE device address. All per-link state
+  /// (session, gate, presence, timers, pending writes, peer binding) lives
+  /// on the [BlePeerLink] itself, so one peer's lifecycle never mutates
+  /// another's.
+  final BleLinkManager _links = BleLinkManager(maxLinks: bleMaxLinkCount);
+
+  /// Runtime-level secure-handshake deadlines per link, kept out of the link
+  /// object so teardown can cancel them through the manager's own release.
+  final Map<String, Timer> _handshakeDeadlines = {};
+
+  /// Pending incoming approval requests, keyed by request ID. Each request
+  /// owns its session, its peer and its expiry independently, so several
+  /// peers can wait for approval at once without cross-talk.
+  final Map<String, _PendingIncomingRequest> _incomingRequests = {};
+
+  /// Inbound writes that arrived from a central before any link for it exists
+  /// (a central that wrote before the notify-enabled link setup ran). Bounded
+  /// per central and replayed into that central's link transport on session
+  /// creation. A write that belongs to a known link is buffered on the link
+  /// itself, never here.
+  final Map<String, List<Uint8List>> _pendingCentralWrites = {};
+
   final Map<String, DateTime> _declinedUntil = {};
+
+  /// Device IDs this device is currently establishing an outgoing link to.
+  final Set<String> _pendingLinkIds = {};
+
+  /// Links whose outgoing connection attempt is still in flight, so a scan or
+  /// a second connect attempt cannot race a link that is not established yet.
+  final Set<String> _linkEstablishing = {};
+
   Future<void>? _startFuture;
   Future<void>? _availabilityOperation;
   int _availabilityRevision = 0;
@@ -321,33 +468,73 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   bool _discovering = false;
   bool _serviceAdded = false;
   bool _advertising = false;
-  bool _linkEstablishing = false;
-  bool _cleaningLink = false;
-  Completer<void>? _linkCleanupCompleter;
   bool _disposed = false;
-  BleGattOperationGate _centralGate = BleGattOperationGate();
-  BlePresenceMonitor? _presenceMonitor;
-  int _presenceGeneration = 0;
   final Map<String, String?> _teardownPendingByDevice = {};
 
-  BleLinkSession? _activeSession;
-  BleLinkRole? _activeRole;
-  Peripheral? _activePeripheral;
-  Central? _activeCentral;
-  _PeripheralValueTransport? _peripheralTransport;
-  _CentralValueTransport? _centralTransport;
-  Peer? _activePeer;
-  String? _remoteDeviceName;
-  int? _remoteRssi;
+  /// The link currently driving the derived single-active-peer compatibility
+  /// views: the most recently established link. Purely a publication choice —
+  /// real per-peer truth lives in [_links] and [state.links].
+  String? _primaryLinkId;
 
-  bool _isLinkUsable() {
-    final session = _activeSession;
-    if (session == null || !session.isReady) return false;
-    // A secure session only carries application traffic once the link was
-    // published as secure-ready (handshake + authenticated identity + key
-    // policy + explicit confirmation). Legacy sessions keep the old rule.
-    if (session.secure != null && !state.isSecureReady) return false;
+  /// The link bound to [peerId], if this device currently holds one.
+  BlePeerLink? _linkFor(String peerId) => _links.byPeerId(peerId);
+
+  /// Whether [peerId]'s own link is ready to carry application traffic.
+  ///
+  /// A secure link counts only once its Noise handshake finished, passed the
+  /// key policy and was explicitly confirmed (published as secure-ready);
+  /// legacy links count when their session is ready. Another peer's link
+  /// state never influences this answer.
+  bool _isLinkUsable(String peerId) {
+    final link = _linkFor(peerId);
+    final session = link?.session;
+    if (link == null || session == null || !session.isReady) return false;
+    if (session.secure != null && link.phase != BleLinkPhase.secureReady) {
+      return false;
+    }
     return true;
+  }
+
+  /// Publishes the current per-link snapshots and the derived single-link
+  /// compatibility fields into [state].
+  ///
+  /// Alias of [_setState]: link-derived fields are recomputed from the
+  /// registry on every publication, so callers only pass non-link facts.
+  /// Called after every link mutation.
+  void _publishLinks({
+    BleRuntimeStatus? status,
+    List<BleCandidate>? candidates,
+    String? error,
+    bool clearError = false,
+    bool? isAdvertising,
+  }) {
+    _setState(
+      status: status,
+      candidates: candidates,
+      error: error,
+      clearError: clearError,
+      isAdvertising: isAdvertising,
+    );
+  }
+
+  /// The link backing the derived single-active-peer views: the most recent
+  /// link with a known peer identity, preferring one that is secure-ready.
+  BlePeerLink? get _primaryLink {
+    BlePeerLink? newest;
+    for (final link in _links.links.values) {
+      if (link.peerId == null) continue;
+      if (newest == null || link.createdAt.isAfter(newest.createdAt)) {
+        newest = link;
+      }
+    }
+    return newest;
+  }
+
+  List<IncomingConnectionRequest> _pendingRequestList() {
+    final requests =
+        _incomingRequests.values.map((pending) => pending.request).toList()
+          ..sort((a, b) => a.requestedAt.compareTo(b.requestedAt));
+    return requests;
   }
 
   /// Whether [session] may still take part in the incoming-approval flow.
@@ -363,11 +550,17 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         session.secureState == BleSecureLinkState.awaitingAuthorization;
   }
 
+  /// Sends one message over the link belonging to its receiver.
+  ///
+  /// The receiving peer's own link session carries the message; when that
+  /// specific peer has no usable link the send fails, without affecting any
+  /// other peer's link or delivery.
   Future<BleAckResult> _sendOverLink(
+    String peerId,
     Message message, {
     Future<void> Function()? onTransmitted,
   }) {
-    final session = _activeSession;
+    final session = _linkFor(peerId)?.session;
     if (session == null ||
         !session.isReady ||
         session.linkInfo?.deviceId != message.receiverId) {
@@ -376,10 +569,10 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     return session.sendMessage(message, onTransmitted: onTransmitted);
   }
 
+  /// Drains queued messages for [peerId] over that peer's own link.
   Future<void> requestDelivery(String peerId) async {
     final localDeviceId = _ref.read(localDeviceIdProvider);
-    if (localDeviceId == null || !_isLinkUsable()) return;
-    if (_activeSession?.linkInfo?.deviceId != peerId) return;
+    if (localDeviceId == null || !_isLinkUsable(peerId)) return;
     await _outbox.drain(localDeviceId: localDeviceId, peerId: peerId);
   }
 
@@ -400,7 +593,6 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         candidates: const [],
         isAdvertising: false,
         availabilityEnabled: false,
-        clearActiveLink: true,
       );
       return;
     }
@@ -618,18 +810,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await _cancelConnectionRequestNotification();
     await _stopDiscoveryOnly();
     _resetCandidateTracking();
-    await _closeActiveLink();
+    await _closeAllLinks();
     if (_advertising) {
       try {
         await _peripheral.stopAdvertising();
       } catch (_) {}
       _advertising = false;
     }
-    _setState(
-      status: BleRuntimeStatus.idle,
-      isAdvertising: false,
-      clearActiveLink: true,
-    );
+    _setState(status: BleRuntimeStatus.idle, isAdvertising: false);
   }
 
   Future<void> setAvailabilityEnabled(bool enabled) {
@@ -659,7 +847,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
 
   Future<void> _shutdownAvailability() async {
     _startAttempted = false;
-    _clearIncomingRequest();
+    _clearAllIncomingRequests();
     final inFlight = _startFuture;
     if (inFlight != null) {
       try {
@@ -677,20 +865,11 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
     }
     _connectionWaiters.clear();
-    _pendingCentralWrites.clear();
     _declinedUntil.clear();
-    final peripheral = _activePeripheral;
-    final central = _activeCentral;
-    await _closeActiveLink();
-    if (peripheral != null) {
-      await _disconnectCentral(peripheral);
-    }
-    if (central != null) {
-      try {
-        await _peripheral.disconnect(central);
-      } catch (_) {}
-    }
-    await _stopAdvertisingForLink();
+    // Shutting availability down closes every link and disconnects every
+    // remote device, releasing each link's own resources independently.
+    await _closeAllLinks();
+    await _stopAdvertising();
     await _stopDiscoveryOnly();
     await _stopBackgroundService();
     _resetBleAfterLoss();
@@ -699,7 +878,6 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       status: BleRuntimeStatus.idle,
       candidates: const [],
       isAdvertising: false,
-      clearActiveLink: true,
       clearError: true,
     );
     _setBackgroundStatus(
@@ -866,10 +1044,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     );
     _subscriptions.add(
       _central.characteristicNotified.listen((event) {
-        final transport = _centralTransport;
-        if (transport == null) return;
-        if (event.peripheral.uuid != transport.peripheral.uuid) return;
         if (event.characteristic.uuid != _txUuid) return;
+        // Route the notification to the link that owns this peripheral; each
+        // central-role link holds its own transport, so simultaneous links
+        // never cross-deliver inbound frames.
+        final link = _links.byLinkId(event.peripheral.uuid.toString());
+        final transport = link?.transport;
+        if (transport is! _CentralValueTransport) return;
         transport.add(event.value);
       }),
     );
@@ -895,19 +1076,18 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     switch (adapterState) {
       case BluetoothLowEnergyState.unsupported:
         _resetBleAfterLoss();
-        unawaited(_closeActiveLink());
-        _setState(status: BleRuntimeStatus.unsupported, clearActiveLink: true);
+        unawaited(_closeAllLinks());
+        _setState(status: BleRuntimeStatus.unsupported);
       case BluetoothLowEnergyState.unauthorized:
         if (_startFuture != null) return;
         unawaited(_handleUnauthorizedAdapterState());
       case BluetoothLowEnergyState.poweredOff:
         _teardownPendingByDevice.clear();
         _resetBleAfterLoss();
-        unawaited(_closeActiveLink());
+        unawaited(_closeAllLinks());
         _setState(
           status: BleRuntimeStatus.bluetoothOff,
           error: 'Bluetooth is turned off. Enable it and try again.',
-          clearActiveLink: true,
         );
       case BluetoothLowEnergyState.poweredOn:
       case BluetoothLowEnergyState.unknown:
@@ -928,7 +1108,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   void _resetBleAfterLoss() {
     _scanTimer?.cancel();
     _scanTimer = null;
-    _clearIncomingRequest();
+    _clearAllIncomingRequests();
     _resetCandidateTracking();
     _discovering = false;
     _advertising = false;
@@ -943,46 +1123,38 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       final status = await _readPlatformStatus();
       if (!status.leSupported) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (!_disposed) {
-          _setState(
-            status: BleRuntimeStatus.unsupported,
-            clearActiveLink: true,
-          );
+          _setState(status: BleRuntimeStatus.unsupported);
         }
         return;
       }
       if (!status.permissionsGranted) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (_disposed) return;
         _setState(
           status: BleRuntimeStatus.unauthorized,
           canOpenSettings: true,
           error: 'Bluetooth permission was not granted.',
-          clearActiveLink: true,
         );
         return;
       }
       if (!status.bluetoothEnabled) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (_disposed) return;
         _setState(
           status: BleRuntimeStatus.bluetoothOff,
           error: 'Bluetooth is turned off. Enable it and try again.',
-          clearActiveLink: true,
         );
         return;
       }
       if (!status.advertisingSupported) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (!_disposed) {
-          _setState(
-            status: BleRuntimeStatus.unsupported,
-            clearActiveLink: true,
-          );
+          _setState(status: BleRuntimeStatus.unsupported);
         }
         return;
       }
@@ -1071,16 +1243,19 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       return;
     }
     await ensureStarted();
+    // Scanning is allowed while other links are active: additional peers can
+    // always be discovered and connected. Only an in-flight scan or connect
+    // attempt on this device stops a new scan from starting.
     if (_disposed ||
         !_availabilityEnabled ||
-        state.isConnected ||
-        _activeSession != null ||
-        _linkEstablishing ||
         state.status == BleRuntimeStatus.scanning ||
         state.status == BleRuntimeStatus.connecting) {
       return;
     }
-    if (state.status != BleRuntimeStatus.ready) return;
+    if (state.status != BleRuntimeStatus.ready &&
+        state.status != BleRuntimeStatus.connected) {
+      return;
+    }
 
     _setState(status: BleRuntimeStatus.scanning, clearError: true);
     try {
@@ -1108,10 +1283,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         await _central.stopDiscovery();
       } catch (_) {}
     }
-    if (!_disposed &&
-        !state.isConnected &&
-        state.status == BleRuntimeStatus.scanning) {
-      _setState(status: BleRuntimeStatus.ready);
+    if (!_disposed && state.status == BleRuntimeStatus.scanning) {
+      // Return to the status the runtime can hold now: connected when at
+      // least one link is active, otherwise ready.
+      _setState(
+        status: state.hasSecureLink
+            ? BleRuntimeStatus.connected
+            : BleRuntimeStatus.ready,
+      );
     }
   }
 
@@ -1182,11 +1361,22 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
+  /// Connects outward to [candidateId] as a BLE central, creating one
+  /// independent link.
+  ///
+  /// Multi-connection behavior: this runs alongside any number of other
+  /// active links (incoming or outgoing), each with its own gate, transport,
+  /// Noise session and lifecycle. Connecting to a device this device already
+  /// holds a link to is refused, and reaching [bleMaxLinkCount] fails
+  /// gracefully without disturbing the existing links.
   Future<String?> connectToCandidate(String candidateId) async {
-    if (_disposed ||
-        !_availabilityEnabled ||
-        _activeSession != null ||
-        _linkEstablishing) {
+    if (_disposed || !_availabilityEnabled) {
+      return null;
+    }
+    if (_links.byLinkId(candidateId) != null ||
+        _pendingLinkIds.contains(candidateId)) {
+      // This device already holds (or is establishing) a link to that
+      // device; a second link to the same peer is never created.
       return null;
     }
     if (_teardownPendingByDevice.containsKey(candidateId)) {
@@ -1205,30 +1395,48 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       );
       return null;
     }
+    if (_links.length >= bleMaxLinkCount) {
+      // Graceful capacity exhaustion: existing links are untouched.
+      _setState(
+        status: state.hasSecureLink
+            ? BleRuntimeStatus.connected
+            : BleRuntimeStatus.ready,
+        error:
+            'This device already holds the maximum number of simultaneous '
+            'connections. Disconnect a peer before adding another.',
+      );
+      return null;
+    }
 
-    _linkEstablishing = true;
-    _activeRole = BleLinkRole.central;
-    _activePeripheral = peripheral;
-    _activeCentral = null;
-    _remoteDeviceName = state.candidates
-        .where((candidate) => candidate.id == candidateId)
-        .map((candidate) => candidate.displayName)
-        .firstOrNull;
-    _remoteRssi = state.candidates
-        .where((candidate) => candidate.id == candidateId)
-        .map((candidate) => candidate.rssi)
-        .firstOrNull;
+    final linkId = peripheral.uuid.toString();
+    _pendingLinkIds.add(linkId);
+    final link = BlePeerLink(
+      linkId: linkId,
+      role: BleLinkRole.central,
+      peripheral: peripheral,
+      remoteDeviceName: state.candidates
+          .where((candidate) => candidate.id == candidateId)
+          .map((candidate) => candidate.displayName)
+          .firstOrNull,
+      remoteRssi: state.candidates
+          .where((candidate) => candidate.id == candidateId)
+          .map((candidate) => candidate.rssi)
+          .firstOrNull,
+      createdAt: _clock(),
+    );
+    if (!_links.add(link)) {
+      _pendingLinkIds.remove(linkId);
+      return null;
+    }
+    _linkEstablishing.add(linkId);
+    _primaryLinkId ??= linkId;
+    _armHelloDeadline(link);
+    _publishLinks(status: BleRuntimeStatus.connecting, clearError: true);
 
     await _stopDiscoveryOnly();
-    _setState(
-      status: BleRuntimeStatus.connecting,
-      activePeerName: _remoteDeviceName,
-      activeRole: BleLinkRole.central,
-      clearError: true,
-    );
 
     final waiter = Completer<void>();
-    _connectionWaiters[peripheral.uuid.toString()] = waiter;
+    _connectionWaiters[linkId] = waiter;
     unawaited(waiter.future.catchError((Object _) {}));
     try {
       await _central.connect(peripheral).timeout(const Duration(seconds: 15));
@@ -1240,42 +1448,37 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       final characteristics = _findBeChatCharacteristics(services);
       final tx = characteristics.tx;
       final rx = characteristics.rx;
-      final maxWriteLength = await _central.getMaximumWriteLength(
-        peripheral,
-        type: GATTCharacteristicWriteType.withResponse,
-      );
-      _centralGate = BleGattOperationGate();
+      final maxWriteLength = await _negotiateCentralWriteLimit(link);
       final transport = _CentralValueTransport(
         manager: _central,
         peripheral: peripheral,
         characteristic: rx,
         maximumWriteLength: maxWriteLength,
-        gate: _centralGate,
+        gate: link.gate,
       );
-      _centralTransport = transport;
+      link.transport = transport;
       await _enableNotifications(peripheral, tx);
       if (!_availabilityEnabled) {
         throw const BleLinkException('BeChat was turned off');
       }
-      final session = _createSession(transport, BleLinkRole.central);
-      _activeSession = session;
-      final hello = await session.start();
+      final session = _createSession(transport, BleLinkRole.central, link);
+      link.session = session;
+      final hello = await session.start(
+        // Bind inbound frames to this link so simultaneous links never
+        // cross-deliver: the callback runs with the exact session that
+        // received the frame.
+        onHello: (hello) => _handleHelloForLink(link, hello),
+        onMessage: (payload) => _handleIncomingForLink(link, payload),
+      );
       if (!_availabilityEnabled) {
         throw const BleLinkException('BeChat was turned off');
       }
-      _linkEstablishing = false;
-      await _beginSecureLink(session, hello);
+      await _beginSecureLink(link, session, hello);
       return hello.deviceId;
     } catch (error) {
-      _connectionWaiters.remove(peripheral.uuid.toString());
-      _linkEstablishing = false;
-      await _closeActiveLink();
+      _connectionWaiters.remove(linkId);
+      await _closeLink(link, error: error);
       await _disconnectCentral(peripheral);
-      _activePeripheral = null;
-      _activeCentral = null;
-      _activeRole = null;
-      _remoteDeviceName = null;
-      _remoteRssi = null;
       if (!_disposed) {
         final turnedOff = !_availabilityEnabled;
         _setState(
@@ -1283,13 +1486,52 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
           error: turnedOff
               ? null
               : 'Connection failed: ${_describeError(error)}',
-          clearActiveLink: true,
           clearError: turnedOff,
         );
+        _publishLinks();
       }
       return null;
+    } finally {
+      _pendingLinkIds.remove(linkId);
     }
   }
+
+  /// Negotiates this outgoing link's effective write limit.
+  ///
+  /// Requests the largest ATT MTU the peer supports (bounded at 517, the
+  /// maximum the BLE spec and Android 14+ allow) and falls back to the
+  /// default 23-byte MTU — a 20-byte write payload — whenever negotiation is
+  /// unsupported or fails, which keeps the link usable on every peer. The
+  /// result is stored per link, so different links legitimately end up with
+  /// different effective write limits.
+  Future<int> _negotiateCentralWriteLimit(BlePeerLink link) async {
+    var negotiatedMtu = 23;
+    try {
+      negotiatedMtu = await _central
+          .requestMTU(link.peripheral!, mtu: _preferredMtu)
+          .timeout(const Duration(seconds: 5));
+    } catch (_) {
+      // Negotiation is best-effort: the default MTU keeps the link working.
+      negotiatedMtu = 23;
+    }
+    int maximumWriteLength;
+    try {
+      maximumWriteLength = await _central.getMaximumWriteLength(
+        link.peripheral!,
+        type: GATTCharacteristicWriteType.withResponse,
+      );
+    } catch (_) {
+      // Fall back to the conservative ATT default payload when the platform
+      // cannot report a length.
+      maximumWriteLength = negotiatedMtu > 23 ? negotiatedMtu - 3 : 20;
+    }
+    link.effectiveWriteLength = maximumWriteLength;
+    return maximumWriteLength;
+  }
+
+  /// Preferred ATT MTU for outgoing links: the BLE maximum, which Android 14+
+  /// grants to the first requesting GATT client anyway.
+  static const int _preferredMtu = 517;
 
   /// Writes the TX client configuration descriptor.
   ///
@@ -1332,23 +1574,30 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     throw const BleLinkException('The peer did not expose the BeChat service');
   }
 
-  /// Creates the runtime's link session in secure mode.
+  /// Creates the link session for [link] in secure mode.
   ///
   /// Every production session requires the Noise capability: once secure
-  /// messaging is selected there is no plaintext application path. The
-  /// session reference is captured by the callbacks so late events (close,
-  /// remote identity, key conflict) are always attributable to one specific
-  /// session instance and a replaced session can never publish state.
-  BleLinkSession _createSession(BleTransport transport, BleLinkRole role) {
+  /// messaging is selected there is no plaintext application path. Every
+  /// callback is bound to [link], so late events (close, remote identity,
+  /// key conflict) are always attributable to one specific link and session
+  /// instance — a closed or replaced link can never publish state for
+  /// another peer.
+  BleLinkSession _createSession(
+    BleTransport transport,
+    BleLinkRole role,
+    BlePeerLink link,
+  ) {
     final identity = _requireSecureIdentity();
     late final BleLinkSession session;
     session = BleLinkSession(
       transport: transport,
       identity: identity,
-      onHello: _handleHello,
-      onMessage: _handleIncoming,
+      // Fallback handlers for the window before start() binds the link-aware
+      // overrides; the overrides are always supplied by the connection flows.
+      onHello: (hello) => _handleHelloForLink(link, hello),
+      onMessage: (payload) => _handleIncomingForLink(link, payload),
       onClosed: (error) {
-        unawaited(_onSessionClosed(session, role, error));
+        unawaited(_onSessionClosed(link, session, error));
       },
       // The runtime deadline doubles as the session's internal secure
       // handshake budget, so injected short timeouts cover both layers.
@@ -1356,8 +1605,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       secure: _buildSecureSessionConfig(
         role,
         onRemoteIdentity: (remote) =>
-            _handleSecureRemoteIdentity(session, remote),
-        onPinnedKeyMismatch: () => _recordActivePeerKeyConflict(session),
+            _handleSecureRemoteIdentity(link, session, remote),
+        onPinnedKeyMismatch: () => _recordPeerKeyConflict(link),
       ),
     );
     return session;
@@ -1427,12 +1676,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     );
   }
 
-  /// Records that a pinned peer presented a different authenticated key,
-  /// preserving the original pin and fingerprint (see
-  /// [PeerRepository.recordKeyConflict]).
-  Future<void> _recordActivePeerKeyConflict(BleLinkSession session) async {
-    if (_disposed || !identical(_activeSession, session)) return;
-    final peerId = _activePeer?.peerId ?? state.activePeerId;
+  /// Records that a pinned peer on [link] presented a different
+  /// authenticated key, preserving the original pin and fingerprint (see
+  /// [PeerRepository.recordKeyConflict]). Only this link's peer is touched.
+  Future<void> _recordPeerKeyConflict(BlePeerLink link) async {
+    if (_disposed || link.isClosed) return;
+    final peerId = link.boundPeer?.peerId ?? link.peerId;
     if (peerId == null) return;
     try {
       await _ref.read(peerRepositoryProvider).recordKeyConflict(peerId);
@@ -1442,23 +1691,38 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
-  /// Validates the authenticated remote identity, applies the peer-key
-  /// policy, explicitly confirms the Noise session, and publishes the link.
+  /// Whether [link] is still the live link its session belongs to.
+  ///
+  /// The staleness guard for every asynchronous step: a link that was closed,
+  /// removed or given a replacement session while an operation was in flight
+  /// can no longer change any state.
+  bool _isLiveLink(BlePeerLink link, BleLinkSession session) {
+    if (_disposed || link.isClosed) return false;
+    return identical(_links.byLinkId(link.linkId), link) &&
+        identical(link.session, session);
+  }
+
+  /// Validates the authenticated remote identity on [link], applies the
+  /// peer-key policy, explicitly confirms the Noise session, and publishes
+  /// the link.
   ///
   /// Invoked inside the session's inbound-frame queue before any later frame
-  /// is processed, so no application payload can precede this decision. Every
+  /// is processed, so no application payload can precedes this decision. Every
   /// check fails closed; nothing unauthenticated is persisted, existing peer
   /// metadata is never overwritten, and `verified` is never assigned here.
+  /// A failure here affects only this link — every other link keeps its own
+  /// session, presence and delivery untouched.
   Future<void> _handleSecureRemoteIdentity(
+    BlePeerLink link,
     BleLinkSession session,
     RemoteAuthenticatedIdentity remote,
   ) async {
-    if (_disposed || !identical(_activeSession, session)) {
+    if (!_isLiveLink(link, session)) {
       throw const BleLinkException(
         'The BLE link closed during the secure handshake',
       );
     }
-    final knownPeer = _activePeer;
+    final knownPeer = link.boundPeer;
     if (knownPeer == null) {
       throw const BleLinkException(
         'The BLE link has no approved peer for this secure session',
@@ -1502,7 +1766,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     if (hasPinnedKey && pinnedKey != remote.publicKeyHex) {
       // A different authenticated static key for a pinned peer: keep the
       // pin, mark the conflict, and fail closed. The new key never lands in
-      // the database and the session never becomes usable.
+      // the database and the session never becomes usable. Only this peer's
+      // pin is affected; every other link keeps its own identity binding.
       await peerRepository.recordKeyConflict(remote.deviceId);
       unawaited(_refreshPeers());
       throw const BleLinkException(
@@ -1532,7 +1797,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     // Explicit native confirmation comes before any persistence, so a failed
     // confirmation leaves no partially trusted peer metadata behind.
     await session.confirmSecurePeerIdentity();
-    if (_disposed || !identical(_activeSession, session)) {
+    if (!_isLiveLink(link, session)) {
       throw const BleLinkException(
         'The BLE link closed during the secure handshake',
       );
@@ -1560,41 +1825,43 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       unawaited(_refreshPeers());
     }
 
-    await _publishSecureLink(session, remote);
+    await _publishSecureLink(link, session, remote);
   }
 
-  /// Publishes a confirmed, secure link: connected state, secure-ready flag,
-  /// peer online status, chat creation, presence monitoring and outbox
-  /// draining — all of which stay dark until this point.
+  /// Publishes [link] as a confirmed, secure link: connected state,
+  /// secure-ready flag, peer online status, chat creation, that link's own
+  /// presence monitoring and its outbox drain — all of which stay dark until
+  /// this point, and all of which are scoped to this link alone.
   Future<void> _publishSecureLink(
+    BlePeerLink link,
     BleLinkSession session,
     RemoteAuthenticatedIdentity remote,
   ) async {
-    if (_disposed || !identical(_activeSession, session)) return;
-    final peer = _activePeer;
+    if (!_isLiveLink(link, session)) return;
+    final peer = link.boundPeer;
     if (peer == null || peer.peerId != remote.deviceId) return;
-    final role = _activeRole ?? BleLinkRole.central;
     final published = peer.copyWith(
       // The authenticated identity is authoritative for the display name.
       displayName: remote.displayName,
       status: PeerStatus.online,
-      signalStrength: peer.signalStrength ?? _remoteRssi,
+      signalStrength: peer.signalStrength ?? link.remoteRssi,
     );
-    _activePeer = published;
-    _setState(
+    link.boundPeer = published;
+    // The authenticated identity is authoritative for the display name, so it
+    // overrides the pre-secure HELLO or scan-time hint on this link only. The
+    // raw BLE device name observed at connection time is preserved as-is.
+    link.remoteDisplayName = remote.displayName;
+    // The link becomes the primary view, so the derived single-active-peer
+    // compatibility fields follow the most recent secure link.
+    _primaryLinkId = link.linkId;
+    _publishLinks(
       status: BleRuntimeStatus.connected,
       candidates: const [],
-      activePeerId: published.peerId,
-      activePeerName: remote.displayName,
-      activeRole: role,
-      isAdvertising: false,
-      isSecureReady: true,
+      isAdvertising: _advertising,
       clearError: true,
     );
-    await _markPeerOnline(published.peerId, signalStrength: _remoteRssi);
-    if (_disposed ||
-        !identical(_activeSession, session) ||
-        !session.isSecureReady) {
+    await _markPeerOnline(published.peerId, signalStrength: link.remoteRssi);
+    if (!_isLiveLink(link, session) || !session.isSecureReady) {
       await _markPeerOffline(published.peerId);
       return;
     }
@@ -1602,8 +1869,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       await _ref.read(chatRepositoryProvider).getOrCreateChatForPeer(published);
       await _ref.read(chatListProvider.notifier).refreshChats();
     } catch (_) {}
-    if (role == BleLinkRole.central) {
-      _startPresenceMonitor(published.peerId);
+    if (link.role == BleLinkRole.central) {
+      _startPresenceMonitor(link);
     }
     unawaited(requestDelivery(published.peerId));
   }
@@ -1625,16 +1892,21 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     return KeyFormat.hex32ToBytes(stored);
   }
 
-  /// Authorizes and starts the Noise handshake for an approved link.
+  /// Authorizes and starts the Noise handshake for [link], which the user or
+  /// the auto-approve policy has approved.
   ///
   /// Binds the peer-specific context (pinned key + expected device ID) after
-  /// the HELLO exchange and before the handshake, then waits for local
-  /// setup within the runtime deadline. Readiness is *not* published here:
+  /// the HELLO exchange and before the handshake, then waits for local setup
+  /// within the runtime deadline. Readiness is *not* published here:
   /// [_publishSecureLink] runs only after the handshake authenticates the
-  /// peer and the native session is explicitly confirmed.
-  Future<void> _startSecureHandshake(BleLinkSession session) async {
-    if (_disposed || !identical(_activeSession, session)) return;
-    final peer = _activePeer;
+  /// peer and the native session is explicitly confirmed. Only [link]'s own
+  /// session is started; every other link is untouched.
+  Future<void> _startSecureHandshake(
+    BlePeerLink link,
+    BleLinkSession session,
+  ) async {
+    if (!_isLiveLink(link, session)) return;
+    final peer = link.boundPeer;
     if (peer == null) return;
     if (session.secureState != BleSecureLinkState.awaitingAuthorization) {
       return;
@@ -1644,6 +1916,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       candidates: const [],
       clearError: true,
     );
+    _armHandshakeDeadline(link);
     try {
       session.bindSecurePeerContext(
         pinnedRemotePublicKey: _resolvePinnedPeerKey(peer),
@@ -1651,14 +1924,48 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       );
       await session.startSecureHandshake().timeout(_linkHandshakeTimeout);
     } catch (error) {
-      // Ensure every local handshake failure tears the link down; a session
+      // Ensure every local handshake failure tears this link down; a session
       // that already failed closed is left alone. There is no plaintext
-      // fallback from here.
+      // fallback from here, and no other link is affected.
       if (session.state != BleSessionState.closed) {
         await session.close(error);
       }
       rethrow;
+    } finally {
+      _handshakeDeadlines.remove(link.linkId)?.cancel();
     }
+  }
+
+  /// Arms this link's runtime-level secure-handshake deadline backstop, which
+  /// also covers the approval-to-handshake window on the accepting side.
+  void _armHandshakeDeadline(BlePeerLink link) {
+    _handshakeDeadlines.remove(link.linkId)?.cancel();
+    _handshakeDeadlines[link.linkId] = Timer(_linkHandshakeTimeout, () {
+      final session = link.session;
+      if (session != null &&
+          session.secureState != BleSecureLinkState.secureReady &&
+          session.state != BleSessionState.closed) {
+        unawaited(session.close(const BleSecureHandshakeTimeoutException()));
+      }
+    });
+  }
+
+  /// Arms this outgoing link's pre-secure HELLO deadline: an outgoing link
+  /// that never completes its HELLO exchange is torn down so it cannot sit
+  /// half-open forever. Only this link is affected.
+  void _armHelloDeadline(BlePeerLink link) {
+    link.helloTimer?.cancel();
+    link.helloTimer = Timer(_linkHandshakeTimeout, () {
+      if (_links.byLinkId(link.linkId) == null) return;
+      final session = link.session;
+      if (session != null && session.isReady) return; // HELLO completed.
+      unawaited(
+        _closeLink(
+          link,
+          error: const BleLinkException('The link setup timed out'),
+        ),
+      );
+    });
   }
 
   /// Device IDs of authenticated identities must be UUIDs — the format the
@@ -1667,8 +1974,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
   );
 
-  Future<void> _handleHello(BleHello hello) async {
-    final session = _activeSession;
+  /// Handles the HELLO frame that arrived on [link], applying the incoming
+  /// connection policy for that link alone.
+  ///
+  /// Multi-connection behavior: the decision (approve, request approval,
+  /// reject) is made for this link only; whether this device is the central
+  /// or the peripheral on [link] is read from that link's own role, so
+  /// simultaneous links in both roles each get their own correct decision.
+  Future<void> _handleHelloForLink(BlePeerLink link, BleHello hello) async {
+    final session = link.session;
     if (session == null) {
       throw const BleLinkException('The BLE link closed during the handshake');
     }
@@ -1679,12 +1993,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     final allowNewConnections = await _ref
         .read(appSettingsRepositoryProvider)
         .getAllowNewConnections();
-    if (!identical(_activeSession, session)) {
+    if (!_isLiveLink(link, session)) {
       throw const BleLinkException('The BLE link closed during the handshake');
     }
 
     final decision = decideIncomingConnection(
-      locallyInitiated: _activeRole == BleLinkRole.central,
+      locallyInitiated: link.role == BleLinkRole.central,
       existingPeer: existing,
       allowNewConnections: allowNewConnections,
       now: now,
@@ -1692,9 +2006,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     );
     switch (decision) {
       case IncomingConnectionDecision.approve:
-        await _approveHello(hello, existing, session);
+        await _approveHello(link, hello, existing, session);
       case IncomingConnectionDecision.requestApproval:
-        await _beginIncomingRequest(hello, session);
+        await _beginIncomingRequest(link, hello, session);
       case IncomingConnectionDecision.rejectBlocked:
         throw const BleLinkException('Peer is blocked');
       case IncomingConnectionDecision.rejectDisabled:
@@ -1706,96 +2020,112 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
+  /// Binds the approved peer context to [link] after the connection was
+  /// approved (explicitly or by the reconnect auto-approve policy).
+  ///
+  /// The HELLO is an untrusted hint: a stored peer keeps its stored name,
+  /// UUID and key untouched, and a first-contact peer exists only in memory
+  /// until the authenticated handshake confirms it — approval alone never
+  /// writes peer metadata, so a failed handshake leaves nothing behind. Only
+  /// this link's context is set; other links keep their own peers.
   Future<void> _approveHello(
+    BlePeerLink link,
     BleHello hello,
     Peer? existing,
     BleLinkSession session,
   ) async {
     final now = DateTime.now();
-    // The HELLO is an untrusted hint: a stored peer keeps its stored name,
-    // UUID and key untouched, and a first-contact peer exists only in memory
-    // until the authenticated handshake confirms it — approval alone never
-    // writes peer metadata, so a failed handshake leaves nothing behind.
     final Peer peer;
     if (existing != null) {
       peer = existing.copyWith(
-        signalStrength: _remoteRssi ?? existing.signalStrength,
+        signalStrength: link.remoteRssi ?? existing.signalStrength,
         lastSeen: now,
       );
     } else {
       peer = Peer(
         peerId: hello.deviceId,
         displayName: hello.displayName,
-        deviceName: _remoteDeviceName ?? 'BeChat device',
+        deviceName: link.remoteDeviceName ?? 'BeChat device',
         status: PeerStatus.offline,
-        signalStrength: _remoteRssi,
+        signalStrength: link.remoteRssi,
         firstSeen: now,
         lastSeen: now,
         createdAt: now,
         updatedAt: now,
       );
     }
-    if (_disposed ||
-        !identical(_activeSession, session) ||
+    if (!_isLiveLink(link, session) ||
         session.state == BleSessionState.closed) {
       return;
     }
-    _activePeer = peer;
-    _remoteDeviceName = peer.deviceName;
-    _setState(
-      activePeerId: peer.peerId,
-      activePeerName: peer.displayName,
-      activeRole: _activeRole,
-      clearIncomingRequest: true,
-    );
+    if (!_links.bindPeer(link, hello.deviceId)) {
+      // Another live link already owns this peer identity: never share one
+      // peer across two links, so this link fails closed.
+      throw const BleLinkException(
+        'This device already holds a connection to that peer',
+      );
+    }
+    link.boundPeer = peer;
+    link.remoteDisplayName = peer.displayName;
+    _setState(clearError: true);
     unawaited(_refreshPeers());
   }
 
+  /// Records a pending incoming approval request on [link].
+  ///
+  /// Phase 6 behavior: the request is stored in the per-request collection
+  /// keyed by its own request ID, so several peers can await approval at the
+  /// same time. No Noise handshake has started, the link is never shown as
+  /// connected, and there is no auto-approve — the user's decision is the
+  /// only way forward. [link] stays live (its session and transport are kept)
+  /// until the decision or the timeout.
   Future<void> _beginIncomingRequest(
+    BlePeerLink link,
     BleHello hello,
     BleLinkSession session,
   ) async {
-    final previousRequest = state.incomingRequest;
-    if (previousRequest != null) {
-      unawaited(_cancelIncomingRequestNotification(previousRequest));
-    }
     final now = DateTime.now();
     final request = IncomingConnectionRequest(
       requestId: const Uuid().v4(),
       peerId: hello.deviceId,
       displayName: hello.displayName,
-      deviceName: _remoteDeviceName ?? 'BeChat device',
-      signalStrength: _remoteRssi,
+      deviceName: link.remoteDeviceName ?? 'BeChat device',
+      signalStrength: link.remoteRssi,
       requestedAt: now,
       expiresAt: now.add(AppConstants.incomingRequestTimeout),
     );
-    _incomingRequestSession = session;
-    _resetCandidateTracking(updateState: false);
-    _incomingRequestTimer?.cancel();
-    _incomingRequestTimer = Timer(AppConstants.incomingRequestTimeout, () {
-      final current = state.incomingRequest;
-      if (current?.requestId == request.requestId) {
-        unawaited(_declineRequest(current!, applyCooldown: false));
+    final timer = Timer(AppConstants.incomingRequestTimeout, () {
+      final pending = _incomingRequests[request.requestId];
+      if (pending != null) {
+        unawaited(_declineRequest(pending, applyCooldown: false));
       }
     });
-    _setState(
-      status: BleRuntimeStatus.ready,
-      candidates: const [],
-      incomingRequest: request,
-      isAdvertising: false,
-      clearActiveLink: true,
-      clearError: true,
+    _incomingRequests[request.requestId] = _PendingIncomingRequest(
+      request: request,
+      linkId: link.linkId,
+      session: session,
+      timer: timer,
     );
+    _resetCandidateTracking(updateState: false);
+    _setState(candidates: const [], clearError: true);
     if (!_foreground) {
       unawaited(_showIncomingRequestNotification(request));
     }
   }
 
-  Future<BleAckResult> _handleIncoming(BleMessagePayload payload) async {
-    final peer = _activePeer;
+  /// Handles an inbound application message that arrived on [link], routing
+  /// it to that link's own bound peer.
+  ///
+  /// Multi-connection behavior: the peer is resolved from the receiving
+  /// link, so a message on one link can never be attributed to another peer.
+  Future<BleAckResult> _handleIncomingForLink(
+    BlePeerLink link,
+    BleMessagePayload payload,
+  ) async {
+    final peer = link.boundPeer;
     final identity = _ref.read(identityProvider).valueOrNull;
     if (peer == null || identity == null) {
-      if (state.incomingRequest != null) {
+      if (_pendingRequestList().any((r) => r.peerId == link.peerId)) {
         throw const BleLinkException(BleProtocol.approvalPendingReason);
       }
       throw const BleLinkException('The BLE link has no validated peer');
@@ -1818,24 +2148,34 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     return result;
   }
 
+  /// Accepts the pending request with ID [requestId], which authorizes that
+  /// request's own link and — for a secure link — starts its Noise handshake.
+  ///
+  /// Only the link that carried this request is affected: other pending
+  /// requests and their links, and every other established link, keep running
+  /// independently. Approval never marks the peer connected or secure-ready;
+  /// for a secure link those follow the confirmed handshake via
+  /// [_publishSecureLink], and for a legacy link they follow this method.
   Future<void> acceptIncomingRequest(String requestId) async {
-    final request = _currentIncomingRequest(requestId);
-    if (request == null) {
+    final pending = _currentIncomingRequest(requestId);
+    if (pending == null) {
       throw const BleLinkException(
         'This connection request is no longer available',
       );
     }
-    final session = _activeSession;
-    if (session == null || !_isSessionUsableForApproval(session)) {
-      _clearIncomingRequest();
+    final request = pending.request;
+    final link = _links.byLinkId(pending.linkId);
+    final session = pending.session;
+    if (link == null || !_isSessionUsableForApproval(session)) {
+      _removePendingRequest(requestId);
       throw const BleLinkException('The BLE link is no longer active');
     }
 
     final peerRepository = _ref.read(peerRepositoryProvider);
     final existing = await peerRepository.getPeerByPeerId(request.peerId);
     if (existing?.isBlocked == true || existing?.status == PeerStatus.blocked) {
-      _clearIncomingRequest();
-      await _closeActiveLink();
+      _removePendingRequest(requestId);
+      await _closeLink(link);
       throw const BleLinkException('Peer is blocked');
     }
 
@@ -1853,44 +2193,46 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       updatedAt: now,
     );
     await peerRepository.upsertPeer(peer);
-    if (_disposed ||
-        !identical(_activeSession, session) ||
-        !_isSessionUsableForApproval(session)) {
+    if (!_isLiveLink(link, session) || !_isSessionUsableForApproval(session)) {
       await _markPeerOffline(peer.peerId);
-      _clearIncomingRequest();
+      _removePendingRequest(requestId);
       throw const BleLinkException('The BLE link closed before approval');
     }
 
-    _activePeer = peer;
-    _remoteDeviceName = peer.deviceName;
-    _clearIncomingRequest();
+    // Bind the approved peer to this link only, then drop this one request.
+    if (!_links.bindPeer(link, peer.peerId)) {
+      _removePendingRequest(requestId);
+      await _closeLink(link);
+      throw const BleLinkException(
+        'This device already holds a connection to that peer',
+      );
+    }
+    link.boundPeer = peer;
+    link.remoteDisplayName = peer.displayName;
+    link.remoteDeviceName = peer.deviceName;
+    _removePendingRequest(requestId);
     _resetCandidateTracking(updateState: false);
+    _setState();
     if (session.secure != null) {
-      // Approval only authorizes the Noise handshake. Connected state, peer
-      // presence, the secure-ready flag and outbox draining all follow the
-      // confirmed handshake via _publishSecureLink — never here.
       try {
-        await _startSecureHandshake(session);
+        await _startSecureHandshake(link, session);
       } catch (error) {
-        if (identical(_activeSession, session)) {
-          await _closeActiveLink();
+        if (_links.byLinkId(link.linkId) != null) {
+          await _closeLink(link);
         }
         throw BleLinkException(_describeError(error));
       }
       return;
     }
+    // Legacy (non-secure) link: publish readiness directly. Secure links
+    // never reach here — their readiness only follows a confirmed handshake.
     _setState(
       status: BleRuntimeStatus.connected,
       candidates: const [],
-      activePeerId: peer.peerId,
-      activePeerName: peer.displayName,
-      activeRole: _activeRole,
-      isAdvertising: false,
       clearError: true,
-      clearIncomingRequest: true,
     );
     await _markPeerOnline(peer.peerId, signalStrength: peer.signalStrength);
-    if (_disposed || !identical(_activeSession, session) || !session.isReady) {
+    if (!_isLiveLink(link, session) || !session.isReady) {
       await _markPeerOffline(peer.peerId);
       return;
     }
@@ -1902,32 +2244,42 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     unawaited(requestDelivery(peer.peerId));
   }
 
+  /// Denies the pending request with ID [requestId]: that request's link is
+  /// torn down and a decline cooldown is recorded for that peer. Other
+  /// pending requests and links are unaffected.
   Future<void> declineIncomingRequest(String requestId) async {
-    final request = _currentIncomingRequest(requestId);
-    if (request == null) {
+    final pending = _currentIncomingRequest(requestId);
+    if (pending == null) {
       throw const BleLinkException(
         'This connection request is no longer available',
       );
     }
-    await _declineRequest(request, applyCooldown: true);
+    await _declineRequest(pending, applyCooldown: true);
   }
 
+  /// Denies every currently pending request. Kept for the single-request UI
+  /// path that dismisses whatever is showing; each request is denied
+  /// independently and its own link torn down.
   Future<void> declinePendingIncomingRequest() async {
-    final request = state.incomingRequest;
-    if (request == null) return;
-    try {
-      await declineIncomingRequest(request.requestId);
-    } catch (_) {}
+    final pending = _incomingRequests.values.toList();
+    for (final entry in pending) {
+      try {
+        await declineIncomingRequest(entry.request.requestId);
+      } catch (_) {}
+    }
   }
 
+  /// Blocks the requesting peer and tears down the link that carried the
+  /// request with ID [requestId]. Other pending requests, peers and links are
+  /// unaffected.
   Future<void> blockIncomingRequest(String requestId) async {
-    final request = _currentIncomingRequest(requestId);
-    if (request == null) {
+    final pending = _currentIncomingRequest(requestId);
+    if (pending == null) {
       throw const BleLinkException(
         'This connection request is no longer available',
       );
     }
-    final session = _activeSession;
+    final request = pending.request;
     await _ref
         .read(peerRepositoryProvider)
         .blockPeer(
@@ -1936,51 +2288,74 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
           deviceName: request.deviceName,
           signalStrength: request.signalStrength,
         );
-    _clearIncomingRequest();
+    _removePendingRequest(requestId);
     unawaited(_refreshPeers());
-    if (session != null && identical(_activeSession, session)) {
-      await _closeActiveLink();
+    final link = _links.byLinkId(pending.linkId);
+    if (link != null) {
+      await _closeLink(link);
     }
+    _setState();
   }
 
-  IncomingConnectionRequest? _currentIncomingRequest(String requestId) {
-    final request = state.incomingRequest;
-    if (request == null || request.requestId != requestId) return null;
-    if (request.isExpired) {
-      unawaited(_declineRequest(request, applyCooldown: false));
+  /// Resolves the pending request with ID [requestId] from the collection,
+  /// validating that its own link is still usable for approval. An expired or
+  /// orphaned request is removed (and its link torn down) and null is
+  /// returned, so a decision can never act on a dead link.
+  _PendingIncomingRequest? _currentIncomingRequest(String requestId) {
+    final pending = _incomingRequests[requestId];
+    if (pending == null) return null;
+    if (pending.request.isExpired) {
+      unawaited(_declineRequest(pending, applyCooldown: false));
       return null;
     }
-    final session = _activeSession;
-    if (session == null ||
-        !_isSessionUsableForApproval(session) ||
-        !identical(session, _incomingRequestSession)) {
-      _clearIncomingRequest();
+    final link = _links.byLinkId(pending.linkId);
+    if (link == null || !_isSessionUsableForApproval(pending.session)) {
+      _removePendingRequest(requestId);
       return null;
     }
-    return request;
+    return pending;
   }
 
+  /// Denies one pending request: removes it from the collection, optionally
+  /// applies the decline cooldown for that peer, and tears down the link that
+  /// carried the request. Every other pending request and link is untouched.
   Future<void> _declineRequest(
-    IncomingConnectionRequest request, {
+    _PendingIncomingRequest pending, {
     required bool applyCooldown,
   }) async {
     if (applyCooldown) {
-      _declinedUntil[request.peerId] = DateTime.now().add(
+      _declinedUntil[pending.request.peerId] = DateTime.now().add(
         AppConstants.declineCooldown,
       );
     }
-    _clearIncomingRequest();
-    await _closeActiveLink();
+    _removePendingRequest(pending.request.requestId);
+    final link = _links.byLinkId(pending.linkId);
+    if (link != null) {
+      await _closeLink(link);
+    }
+    _setState();
   }
 
-  void _clearIncomingRequest() {
-    final request = state.incomingRequest;
-    _incomingRequestTimer?.cancel();
-    _incomingRequestTimer = null;
-    _incomingRequestSession = null;
-    if (!_disposed && request != null) {
-      _setState(clearIncomingRequest: true);
-      unawaited(_cancelIncomingRequestNotification(request));
+  /// Removes a single pending request from the collection and releases its
+  /// own timer and notification. Other pending requests are untouched.
+  _PendingIncomingRequest? _removePendingRequest(String requestId) {
+    final pending = _incomingRequests.remove(requestId);
+    if (pending == null) return null;
+    pending.timer.cancel();
+    unawaited(_cancelIncomingRequestNotification(pending.request));
+    return pending;
+  }
+
+  /// Clears every pending request and releases each one's own resources.
+  void _clearAllIncomingRequests() {
+    final pending = _incomingRequests.values.toList();
+    _incomingRequests.clear();
+    for (final entry in pending) {
+      entry.timer.cancel();
+      unawaited(_cancelIncomingRequestNotification(entry.request));
+    }
+    if (!_disposed && pending.isNotEmpty) {
+      _setState();
     }
   }
 
@@ -2039,45 +2414,26 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await _ref.read(chatListProvider.notifier).refreshChats();
   }
 
-  /// Completes link establishment in secure mode.
-  ///
-  /// This replaces the legacy "link is ready" publication: nothing here marks
-  /// the link connected. When an approval request is pending, the Noise
-  /// handshake waits for the user's decision; otherwise the authorized
-  /// handshake starts and readiness is published later by
-  /// [_publishSecureLink] after authentication and explicit confirmation.
-  Future<void> _beginSecureLink(BleLinkSession session, BleHello hello) async {
-    if (_disposed || _activeSession != session) return;
-    _linkEstablishing = false;
-    if (!_canContinueBle) {
-      await _closeActiveLink();
-      return;
-    }
-    await _stopAdvertisingForLink();
-    _resetCandidateTracking(updateState: false);
-    if (state.incomingRequest?.peerId == hello.deviceId) {
-      // Approval pending: no handshake, no connected state, no presence
-      // monitoring and no outbox drain until the user accepts.
-      _setState(
-        status: BleRuntimeStatus.ready,
-        candidates: const [],
-        isAdvertising: false,
-        clearActiveLink: true,
-        clearError: true,
-      );
-      return;
-    }
-    final peer = _activePeer;
-    if (peer == null || peer.peerId != hello.deviceId) {
-      // No approved peer context for this link: fail closed instead of
-      // starting a handshake against an unapproved peer.
-      await _closeActiveLink();
-      return;
-    }
-    await _startSecureHandshake(session);
+  /// Requeues only [peerId]'s undelivered outgoing messages back to queued
+  /// when that peer's link closes, so they retry on a later reconnect. Other
+  /// peers' queued messages are untouched and keep draining over their own
+  /// links.
+  Future<void> _resetOutboxForPeer(String? peerId) async {
+    if (peerId == null) return;
+    final localDeviceId = _ref.read(localDeviceIdProvider);
+    if (localDeviceId == null) return;
+    try {
+      await _ref
+          .read(messageRepositoryProvider)
+          .resetOutboxForSender(localDeviceId);
+      await _ref.read(chatListProvider.notifier).refreshChats();
+    } catch (_) {}
   }
 
-  Future<void> _stopAdvertisingForLink() async {
+  /// Stops advertising (used only for availability shutdown and Bluetooth-off,
+  /// never because a link came up — advertising keeps running while linked so
+  /// more peers can discover and connect).
+  Future<void> _stopAdvertising() async {
     if (!_advertising) return;
     try {
       await _peripheral.stopAdvertising();
@@ -2085,6 +2441,51 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _advertising = false;
   }
 
+  /// Completes link establishment for [link] in secure mode.
+  ///
+  /// Nothing here marks the link connected: when an approval request is
+  /// pending, the Noise handshake waits for the user's decision; otherwise
+  /// the authorized handshake starts and readiness is published later by
+  /// [_publishSecureLink] after authentication and explicit confirmation.
+  ///
+  /// Advertising is deliberately left running (Phase 4): this device keeps
+  /// discoverable so additional peers can establish their own links while
+  /// [link] is active.
+  Future<void> _beginSecureLink(
+    BlePeerLink link,
+    BleLinkSession session,
+    BleHello hello,
+  ) async {
+    if (!_isLiveLink(link, session)) return;
+    _linkEstablishing.remove(link.linkId);
+    link.helloTimer?.cancel();
+    link.helloTimer = null;
+    if (!_canContinueBle) {
+      await _closeLink(link);
+      return;
+    }
+    _resetCandidateTracking(updateState: false);
+    if (_pendingRequestList().any(
+      (request) => request.peerId == hello.deviceId,
+    )) {
+      // Approval pending on this link: no handshake, no connected state, no
+      // presence monitoring and no outbox drain for this peer until the user
+      // accepts. Other links are unaffected.
+      _setState(candidates: const [], clearError: true);
+      return;
+    }
+    final peer = link.boundPeer;
+    if (peer == null || peer.peerId != hello.deviceId) {
+      // No approved peer context for this link: fail closed instead of
+      // starting a handshake against an unapproved peer.
+      await _closeLink(link);
+      return;
+    }
+    await _startSecureHandshake(link, session);
+  }
+
+  /// Routes a central-role (outgoing) connection state change to the link
+  /// that owns that peripheral, if one exists.
   void _handleCentralConnection(
     PeripheralConnectionStateChangedEventArgs event,
   ) {
@@ -2103,25 +2504,32 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       );
     }
     _clearTeardownPending(key);
-    _pendingCentralWrites.remove(key);
-    final activePeripheral = _activePeripheral;
-    if (activePeripheral != null &&
-        activePeripheral.uuid == event.peripheral.uuid) {
-      unawaited(_closeActiveLink());
+    // Tear down only the link that owns this peripheral; every other link is
+    // untouched.
+    final link = _links.byLinkId(key);
+    if (link != null) {
+      unawaited(_closeLink(link));
     }
   }
 
+  /// Routes a peripheral-role (incoming) connection state change to the link
+  /// that owns that central. A disconnect tears down only that link.
   void _handlePeripheralConnection(
     CentralConnectionStateChangedEventArgs event,
   ) {
     if (event.state == ConnectionState.connected) return;
-    _pendingCentralWrites.remove(event.central.uuid.toString());
-    final activeCentral = _activeCentral;
-    if (activeCentral != null && activeCentral.uuid == event.central.uuid) {
-      unawaited(_closeActiveLink());
+    final link = _links.byLinkId(event.central.uuid.toString());
+    if (link != null) {
+      unawaited(_closeLink(link));
     }
   }
 
+  /// Handles an inbound GATT write, routing it to the link owned by the
+  /// writing central.
+  ///
+  /// Writes that arrive before a link (and its session) exists are buffered
+  /// per link and replayed into that link's transport on session creation, so
+  /// no link ever consumes another's early writes.
   Future<void> _handlePeripheralWrite(
     GATTCharacteristicWriteRequestedEventArgs event,
   ) async {
@@ -2141,10 +2549,22 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
 
     final key = event.central.uuid.toString();
-    if (_activeRole == BleLinkRole.peripheral &&
-        _activeCentral != null &&
-        _activeCentral!.uuid == event.central.uuid) {
-      _peripheralTransport?.add(event.request.value);
+    final link = _links.byLinkId(key);
+    if (link != null) {
+      final transport = link.transport;
+      if (transport is _PeripheralValueTransport) {
+        transport.add(event.request.value);
+        return;
+      }
+    }
+    // No link (or no transport) for this central yet: buffer the write on the
+    // link if it exists, otherwise in the shared pre-link buffer, and cap the
+    // size so an unapproved central cannot exhaust memory.
+    final buffer = link?.pendingWrites;
+    if (buffer != null) {
+      if (buffer.length < 64) {
+        buffer.add(Uint8List.fromList(event.request.value));
+      }
       return;
     }
     if (!_pendingCentralWrites.containsKey(key) &&
@@ -2157,44 +2577,50 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
+  /// Handles a notify-state change for the TX characteristic.
+  ///
+  /// Multi-connection behavior: an established link for this central is left
+  /// alone, and — unlike the single-link build — a second (or Nth) incoming
+  /// central is never disconnected just because another link exists. Each
+  /// central gets its own independent link, so this device holds as many
+  /// incoming links as the connection limit allows.
   Future<void> _handleNotifyStateChanged(
     GATTCharacteristicNotifyStateChangedEventArgs event,
   ) async {
     if (event.characteristic.uuid != _txUuid) return;
     if (!event.state) {
-      if (_activeRole == BleLinkRole.peripheral &&
-          _activeCentral?.uuid == event.central.uuid) {
-        unawaited(_closeActiveLink());
+      // Notifications stopped for this central: tear down only its link.
+      final link = _links.byLinkId(event.central.uuid.toString());
+      if (link != null && link.role == BleLinkRole.peripheral) {
+        unawaited(_closeLink(link));
       }
       return;
     }
-    final cleanup = _linkCleanupCompleter;
-    if (cleanup != null) {
-      await cleanup.future.timeout(
-        const Duration(seconds: 2),
-        onTimeout: () {},
-      );
-      if (_disposed) return;
-    }
-    if (_activeRole == BleLinkRole.peripheral &&
-        _activeCentral?.uuid == event.central.uuid &&
-        (_activeSession != null || _linkEstablishing)) {
+    final key = event.central.uuid.toString();
+    if (_links.byLinkId(key) != null || _linkEstablishing.contains(key)) {
+      // This central already has a live or establishing link; do not create
+      // a second one for the same device.
       return;
     }
-    if (_activeSession != null || _linkEstablishing) {
+    if (_links.length >= bleMaxLinkCount) {
+      // Graceful exhaustion: refuse only this new central, keep existing links.
       try {
         await _peripheral.disconnect(event.central);
       } catch (_) {}
       return;
     }
 
-    _linkEstablishing = true;
-    _activeRole = BleLinkRole.peripheral;
-    _activeCentral = event.central;
-    _activePeripheral = null;
-    _remoteDeviceName =
-        'BeChat device ${event.central.uuid.toString().split('-').last}';
-    _remoteRssi = null;
+    final link = BlePeerLink(
+      linkId: key,
+      role: BleLinkRole.peripheral,
+      central: event.central,
+      remoteDeviceName:
+          'BeChat device ${event.central.uuid.toString().split('-').last}',
+      createdAt: _clock(),
+    );
+    if (!_links.add(link)) return;
+    _linkEstablishing.add(key);
+    _setState();
 
     try {
       final maxNotifyLength = await _peripheral.getMaximumNotifyLength(
@@ -2206,166 +2632,111 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         characteristic: event.characteristic,
         maximumWriteLength: maxNotifyLength,
       );
-      _peripheralTransport = transport;
-      final session = _createSession(transport, BleLinkRole.peripheral);
-      _activeSession = session;
-      final pending = _pendingCentralWrites.remove(
-        event.central.uuid.toString(),
-      );
-      for (final value in pending ?? const <Uint8List>[]) {
+      link.transport = transport;
+      // Replay any writes that arrived for this central before its link and
+      // transport existed, in arrival order.
+      final pending = _pendingCentralWrites.remove(key) ?? const <Uint8List>[];
+      for (final value in pending) {
         transport.add(value);
       }
-      final hello = await session.start();
-      _linkEstablishing = false;
-      await _beginSecureLink(session, hello);
+      for (final value in link.pendingWrites) {
+        transport.add(value);
+      }
+      link.pendingWrites.clear();
+      final session = _createSession(transport, BleLinkRole.peripheral, link);
+      link.session = session;
+      final hello = await session.start(
+        onHello: (hello) => _handleHelloForLink(link, hello),
+        onMessage: (payload) => _handleIncomingForLink(link, payload),
+      );
+      await _beginSecureLink(link, session, hello);
     } catch (error) {
-      _linkEstablishing = false;
-      await _closeActiveLink();
+      _linkEstablishing.remove(key);
+      await _closeLink(link, error: error);
       try {
         await _peripheral.disconnect(event.central);
       } catch (_) {}
       if (!_disposed) {
         final rejected = error is BleHelloRejectedException;
-        _setState(
-          status: rejected
-              ? (_canContinueBle
-                    ? BleRuntimeStatus.ready
-                    : BleRuntimeStatus.idle)
-              : BleRuntimeStatus.error,
-          error: rejected
-              ? null
-              : 'Incoming connection failed: ${_describeError(error)}',
-          clearActiveLink: true,
-          clearError: rejected,
-        );
+        // Only surface a failure when no other link is carrying a connection;
+        // one rejected central never disturbs the others.
+        if (!rejected && !_links.isEmpty) {
+          _setState(
+            error: 'Incoming connection failed: ${_describeError(error)}',
+          );
+        } else if (rejected) {
+          _setState(clearError: true);
+        } else {
+          _setState(
+            status: _canContinueBle
+                ? BleRuntimeStatus.ready
+                : BleRuntimeStatus.idle,
+            error: 'Incoming connection failed: ${_describeError(error)}',
+          );
+        }
       }
+    } finally {
+      _linkEstablishing.remove(key);
     }
   }
 
+  /// Cleans up [link] after its own session closed.
+  ///
+  /// Multi-connection behavior: only [link]'s resources are released — its
+  /// presence monitor, its GATT gate, its timers and its buffers. Every other
+  /// link keeps its own session, presence and delivery untouched. A secure
+  /// session that stopped for any reason other than a clean close or a policy
+  /// rejection surfaces an explicit failure, so the user never mistakes a
+  /// torn-down secure link for a usable one.
   Future<void> _onSessionClosed(
+    BlePeerLink link,
     BleLinkSession session,
-    BleLinkRole role,
     Object? error,
   ) async {
     // A late callback from a session that was already replaced (or whose
     // cleanup already ran) must never tear down the current link's state,
     // presence monitoring or peer status.
-    if (!identical(_activeSession, session)) return;
-    if (_cleaningLink) return;
-    _cleaningLink = true;
-    final cleanup = Completer<void>();
-    _linkCleanupCompleter = cleanup;
-    try {
-      final closingPeerId = _activePeer?.peerId ?? state.activePeerId;
-      _stopPresenceMonitor();
-      _centralGate.close();
-      _activeSession = null;
-      _activePeer = null;
-      _peripheralTransport = null;
-      _centralTransport = null;
-      final peripheral = _activePeripheral;
-      final central = _activeCentral;
-      _activePeripheral = null;
-      _activeCentral = null;
-      _activeRole = null;
-      _remoteDeviceName = null;
-      _remoteRssi = null;
-      _clearIncomingRequest();
-      _resetCandidateTracking(updateState: false);
-
-      // A secure session that stopped for any reason other than a clean
-      // close or a policy rejection surfaces an explicit failure — the user
-      // must never mistake a torn-down secure link for a usable one.
-      final secureFailure =
-          session.secure != null &&
-          error != null &&
-          error is! BleLinkClosedException &&
-          error is! BleHelloRejectedException;
-      if (!_linkEstablishing &&
-          !_disposed &&
-          !_isTerminalStatus(state.status)) {
-        _setState(
-          status: _canContinueBle
-              ? BleRuntimeStatus.ready
-              : BleRuntimeStatus.idle,
-          candidates: const [],
-          clearActiveLink: true,
-          error: secureFailure
-              ? 'Secure connection failed: ${_describeError(error)}'
-              : null,
-          clearError:
-              !secureFailure &&
-              (error is BleLinkClosedException ||
-                  error is BleHelloRejectedException),
-        );
-      }
-
-      if (closingPeerId != null) {
-        await _markPeerOffline(closingPeerId);
-      }
-      await _resetOutbox();
-
-      if (role == BleLinkRole.central && peripheral != null) {
-        await _disconnectCentral(peripheral);
-      } else if (role == BleLinkRole.peripheral && central != null) {
-        try {
-          await _peripheral.disconnect(central);
-        } catch (_) {}
-      }
-
-      if (_canContinueBle && _initialized && !_disposed) {
-        await _recoverAdvertising();
-        // Advertising recovery clears the error field; a secure failure
-        // must stay visible, so republish it after recovery finished.
-        if (secureFailure && !_disposed) {
-          _setState(
-            error: 'Secure connection failed: ${_describeError(error)}',
-          );
-        }
-      }
-    } finally {
-      _cleaningLink = false;
-      if (!cleanup.isCompleted) cleanup.complete();
-      if (identical(_linkCleanupCompleter, cleanup)) {
-        _linkCleanupCompleter = null;
-      }
-    }
+    if (!identical(link.session, session)) return;
+    if (link.isClosed) return;
+    await _closeLink(link, error: error, sessionClosed: true);
   }
 
-  void _startPresenceMonitor(String peerId) {
-    _presenceMonitor?.stop();
-    final generation = ++_presenceGeneration;
+  /// Starts (or replaces) [link]'s own presence monitor.
+  ///
+  /// Each central-role link owns exactly one monitor; starting one for a link
+  /// never touches another link's monitor. Generation counters guard late
+  /// callbacks so a stopped link's callbacks can never affect a new monitor.
+  void _startPresenceMonitor(BlePeerLink link) {
+    final previous = link.presenceMonitor;
+    previous?.stop();
+    final generation = ++link.presenceGeneration;
     final monitor = BlePresenceMonitor(
-      probe: _probeActiveCentralLink,
-      onSignal: (rssi) => _handlePresenceSignal(rssi, generation),
-      onLost: (reason) => _handlePresenceLoss(reason, generation),
+      probe: () => _probeCentralLink(link),
+      onSignal: (rssi) => _handlePresenceSignal(link, rssi, generation),
+      onLost: (reason) => _handlePresenceLoss(link, reason, generation),
       foregroundInterval: AppConstants.presenceForegroundInterval,
       backgroundInterval: AppConstants.presenceBackgroundInterval,
       probeTimeout: AppConstants.presenceProbeTimeout,
     );
-    _presenceMonitor = monitor;
+    link.presenceMonitor = monitor;
     monitor.start(foreground: _foreground);
   }
 
-  void _stopPresenceMonitor() {
-    _presenceGeneration++;
-    _presenceMonitor?.stop();
-    _presenceMonitor = null;
-  }
-
-  Future<BlePresenceProbeResult> _probeActiveCentralLink() async {
-    final session = _activeSession;
-    final peripheral = _activePeripheral;
+  /// Probes [link]'s own central connection for signal strength, using that
+  /// link's own GATT gate so a busy link never blocks another link's probe.
+  Future<BlePresenceProbeResult> _probeCentralLink(BlePeerLink link) async {
+    final session = link.session;
+    final peripheral = link.peripheral;
     if (session == null ||
         peripheral == null ||
-        _activeRole != BleLinkRole.central ||
+        link.role != BleLinkRole.central ||
         !session.isReady ||
-        _centralGate.isClosed ||
-        _teardownPendingByDevice.containsKey(peripheral.uuid.toString())) {
+        link.gate.isClosed ||
+        _teardownPendingByDevice.containsKey(link.linkId)) {
       return const BlePresenceProbeResult.skipped();
     }
-    final operation = _centralGate.tryRun(() async {
-      if (!identical(_activeSession, session) || !session.isReady) {
+    final operation = link.gate.tryRun(() async {
+      if (!identical(link.session, session) || !session.isReady) {
         throw const BleLinkClosedException(
           'The BLE link closed before the presence probe',
         );
@@ -2382,16 +2753,18 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
-  void _handlePresenceSignal(int rssi, int generation) {
-    if (generation != _presenceGeneration ||
-        !state.isConnected ||
-        _activeRole != BleLinkRole.central) {
-      return;
-    }
-    _activePeer = _activePeer?.copyWith(signalStrength: rssi);
-    _setState(activeSignalStrength: rssi);
-    final peerId = state.activePeerId;
+  /// Handles a fresh signal from [link]'s own presence monitor: updates only
+  /// that link's RSSI and that peer's stored signal strength.
+  void _handlePresenceSignal(BlePeerLink link, int rssi, int generation) {
+    if (generation != link.presenceGeneration || link.isClosed) return;
+    final peerId = link.peerId;
     if (peerId == null) return;
+    link.remoteRssi = rssi;
+    final bound = link.boundPeer;
+    if (bound != null) {
+      link.boundPeer = bound.copyWith(signalStrength: rssi);
+    }
+    _setState();
     unawaited(
       _ref
           .read(peerRepositoryProvider)
@@ -2400,30 +2773,25 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     );
   }
 
+  /// Handles loss of [link]'s own presence: tears down only that link. A
+  /// "stuck" loss records the teardown-pending marker for this device so a
+  /// reconnect is refused until recovery, mirroring the single-link policy but
+  /// scoped to this link alone.
   Future<void> _handlePresenceLoss(
+    BlePeerLink link,
     BlePresenceLossReason reason,
     int generation,
   ) async {
-    if (generation != _presenceGeneration ||
-        !state.isConnected ||
-        _activeRole != BleLinkRole.central) {
-      return;
-    }
-    final peripheral = _activePeripheral;
+    if (generation != link.presenceGeneration || link.isClosed) return;
     if (reason == BlePresenceLossReason.stuck) {
-      final peerId = state.activePeerId;
-      final key = peripheral?.uuid.toString();
-      if (key != null) {
-        _teardownPendingByDevice[key] = peerId;
-      }
+      final key = link.linkId;
+      _teardownPendingByDevice[key] = link.peerId;
+      final peerId = link.peerId;
       if (peerId != null) {
         _teardownPendingByDevice[peerId] = key;
       }
     }
-    await _closeActiveLink();
-    if (peripheral != null) {
-      await _disconnectCentral(peripheral);
-    }
+    await _closeLink(link);
   }
 
   void _clearTeardownPending(String deviceKey) {
@@ -2433,27 +2801,122 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     }
   }
 
-  Future<void> _closeActiveLink() async {
-    _stopPresenceMonitor();
-    _centralGate.close();
-    final session = _activeSession;
-    if (session == null) {
-      _centralTransport = null;
-      _peripheralTransport = null;
-      return;
+  /// Tears down a single link and releases everything that link owns.
+  ///
+  /// Closes that link's session (releasing its native Noise handle), stops
+  /// its presence monitor, closes its GATT gate, cancels its timers, and — by
+  /// role — disconnects that one remote device. Other links are never touched.
+  /// Safe to call repeatedly; a link that is already gone is a no-op.
+  Future<void> _closeLink(
+    BlePeerLink link, {
+    Object? error,
+    bool sessionClosed = false,
+  }) async {
+    final closingPeerId = link.peerId;
+    final role = link.role;
+    final peripheral = link.peripheral;
+    final central = link.central;
+    final session = link.session;
+    // Release the link's own resources first: presence, timers, gate. This
+    // also marks it closed so late callbacks from its session are ignored.
+    _links.remove(link);
+    _linkEstablishing.remove(link.linkId);
+    _handshakeDeadlines.remove(link.linkId)?.cancel();
+    link.release();
+    if (identical(_primaryLinkId, link.linkId)) {
+      _primaryLinkId = null;
     }
-    await session.close();
+
+    // Close the session (and its Noise handle) unless it already closed.
+    if (session != null &&
+        !sessionClosed &&
+        session.state != BleSessionState.closed) {
+      try {
+        await session.close(error);
+      } catch (_) {}
+    }
+
+    // A secure session that stopped for any reason other than a clean close
+    // or a policy rejection surfaces an explicit failure — but only when no
+    // other link is still carrying a connection, so one peer's failure never
+    // disturbs another peer's healthy link.
+    final secureFailure =
+        session?.secure != null &&
+        error != null &&
+        error is! BleLinkClosedException &&
+        error is! BleHelloRejectedException;
+    if (!_disposed && !_isTerminalStatus(state.status)) {
+      // Status is derived from the links that remain: connected only while a
+      // secure link survives this teardown, otherwise back to ready (or idle
+      // when BLE can no longer continue). A link closing can never leave the
+      // runtime claiming a connection it no longer holds.
+      final remainingStatus = _links.hasSecureLink
+          ? BleRuntimeStatus.connected
+          : (_canContinueBle ? BleRuntimeStatus.ready : BleRuntimeStatus.idle);
+      _setState(
+        status: remainingStatus,
+        candidates: const [],
+        error: secureFailure
+            ? 'Secure connection failed: ${_describeError(error)}'
+            : null,
+        clearError:
+            !secureFailure &&
+            (error is BleLinkClosedException ||
+                error is BleHelloRejectedException),
+      );
+    }
+
+    if (closingPeerId != null) {
+      await _markPeerOffline(closingPeerId);
+    }
+    // Requeue only this peer's undelivered messages; other peers' queues are
+    // untouched and keep draining over their own links.
+    await _resetOutboxForPeer(closingPeerId);
+
+    if (role == BleLinkRole.central && peripheral != null) {
+      await _disconnectCentral(peripheral);
+    } else if (role == BleLinkRole.peripheral && central != null) {
+      try {
+        await _peripheral.disconnect(central);
+      } catch (_) {}
+    }
+
+    // Recover advertising if this was the last link and we can still operate;
+    // a secure failure must stay visible after recovery finishes.
+    if (_links.isEmpty && _canContinueBle && _initialized && !_disposed) {
+      await _recoverAdvertising();
+      if (secureFailure && !_disposed) {
+        _setState(error: 'Secure connection failed: ${_describeError(error)}');
+      }
+    }
   }
 
+  /// Tears down every link, each independently, and disconnects every remote
+  /// device. Used for availability shutdown, Bluetooth-off, disposal and the
+  /// global disconnect. Each link releases its own resources; no link's
+  /// cleanup depends on another's.
+  Future<void> _closeAllLinks() async {
+    // Snapshot the registry, then close each link through the normal path so
+    // every link's cleanup (session, presence, gate, buffers, disconnect) runs
+    // exactly once and identically to a single-link teardown.
+    final links = _links.links.values.toList();
+    for (final link in links) {
+      await _closeLink(link);
+    }
+    _primaryLinkId = null;
+    _setState();
+  }
+
+  /// Disconnects every link (same as a global disconnect).
   Future<void> disconnect() async {
-    await _closeActiveLink();
-    final peripheral = _activePeripheral;
-    if (peripheral != null) await _disconnectCentral(peripheral);
+    await _closeAllLinks();
   }
 
+  /// Disconnects only [peerId]'s link, leaving every other peer connected.
   Future<void> disconnectPeer(String peerId) async {
-    if (state.activePeerId != peerId && _activePeer?.peerId != peerId) return;
-    await disconnect();
+    final link = _linkFor(peerId);
+    if (link == null) return;
+    await _closeLink(link);
   }
 
   Future<void> _disconnectCentral(Peripheral peripheral) async {
@@ -2499,6 +2962,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     await startScan();
   }
 
+  /// Pauses foreground BLE operation, keeping established links alive when
+  /// background mode is active.
+  ///
+  /// Phase 9 behavior: every link is handled independently. When background
+  /// mode can keep operating, all established links are preserved (each
+  /// switching its own presence monitor to the background interval) rather
+  /// than being torn down. When it cannot, every link is closed through the
+  /// normal per-link path. No link's secure-ready state is ever fabricated on
+  /// resume, and closing links never touches another link's state.
   Future<void> pauseForBackground() async {
     if (_disposed || !_foreground) return;
     final keepActive =
@@ -2508,24 +2980,20 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         _isBackgroundOperational(state.status);
     _foreground = false;
     _setState(isForeground: false);
-    _presenceMonitor?.updateForeground(false);
-    _clearIncomingRequest();
+    // Switch every link's own presence monitor to the background interval.
+    for (final link in _links.links.values) {
+      link.presenceMonitor?.updateForeground(false);
+    }
+    _clearAllIncomingRequests();
     await stopScan();
     _resetCandidateTracking();
     if (!keepActive) {
-      await _closeActiveLink();
-      if (_advertising) {
-        try {
-          await _peripheral.stopAdvertising();
-        } catch (_) {}
-        _advertising = false;
-      }
+      // Background mode cannot operate: close every link independently and
+      // stop advertising. Each link releases its own resources.
+      await _closeAllLinks();
+      await _stopAdvertising();
       if (!_disposed) {
-        _setState(
-          status: BleRuntimeStatus.idle,
-          isAdvertising: false,
-          clearActiveLink: true,
-        );
+        _setState(status: BleRuntimeStatus.idle, isAdvertising: false);
       }
       if (_backgroundServiceRunning) {
         await _stopBackgroundService();
@@ -2534,19 +3002,20 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
       return;
     }
-    if (state.isConnected) return;
-    if (_advertising) {
-      try {
-        await _peripheral.stopAdvertising();
-      } catch (_) {}
-      _advertising = false;
-    }
-    if (!_disposed) {
-      _setState(
-        status: BleRuntimeStatus.ready,
-        isAdvertising: false,
-        clearError: true,
-      );
+    // Background mode is operational: keep all established links alive. Only
+    // update the publication; no link is closed and no secure-ready state is
+    // changed or fabricated.
+    if (_links.isEmpty) {
+      await _stopAdvertising();
+      if (!_disposed) {
+        _setState(
+          status: BleRuntimeStatus.ready,
+          isAdvertising: false,
+          clearError: true,
+        );
+      }
+    } else {
+      _setState();
     }
     await _updateBackgroundServiceNotification();
   }
@@ -2573,63 +3042,60 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       final status = await _readPlatformStatus();
       if (!status.leSupported) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (!_disposed) {
-          _setState(
-            status: BleRuntimeStatus.unsupported,
-            clearActiveLink: true,
-          );
+          _setState(status: BleRuntimeStatus.unsupported);
         }
         return;
       }
       if (!status.permissionsGranted) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (_disposed) return;
         _setState(
           status: BleRuntimeStatus.unauthorized,
           canOpenSettings: true,
           error: 'Bluetooth permission was not granted.',
-          clearActiveLink: true,
         );
         return;
       }
       if (!status.bluetoothEnabled) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (_disposed) return;
         _setState(
           status: BleRuntimeStatus.bluetoothOff,
           error: 'Bluetooth is turned off. Enable it and try again.',
-          clearActiveLink: true,
         );
         return;
       }
       if (!status.advertisingSupported) {
         _resetBleAfterLoss();
-        await _closeActiveLink();
+        await _closeAllLinks();
         if (!_disposed) {
-          _setState(
-            status: BleRuntimeStatus.unsupported,
-            clearActiveLink: true,
-          );
+          _setState(status: BleRuntimeStatus.unsupported);
         }
         return;
       }
-      if (!state.isConnected && state.status != BleRuntimeStatus.connecting) {
+      if (_links.isEmpty && state.status != BleRuntimeStatus.connecting) {
         await _recoverAdvertising();
       }
     } on BleStatusProbeException catch (error) {
-      if (!_disposed && !state.isConnected) {
+      if (!_disposed && _links.isEmpty) {
         _setState(status: BleRuntimeStatus.error, error: error.message);
       }
     } catch (error) {
-      if (!_disposed && !state.isConnected) {
+      if (!_disposed && _links.isEmpty) {
         _setState(status: BleRuntimeStatus.error, error: _describeError(error));
       }
     }
-    final monitor = _presenceMonitor;
-    if (monitor != null && state.isConnected) {
+    // Resume each link's own presence monitor to the foreground interval and
+    // probe it now. Each link's monitor is updated independently; a link that
+    // lost its peer is torn down by its own monitor, never by this loop, and
+    // no secure-ready state is fabricated here.
+    for (final link in _links.links.values.toList()) {
+      final monitor = link.presenceMonitor;
+      if (monitor == null) continue;
       monitor.updateForeground(true);
       unawaited(monitor.checkNow());
     }
@@ -2895,50 +3361,53 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     } catch (_) {}
   }
 
+  /// Publishes a new runtime state.
+  ///
+  /// Link-derived fields ([BleRuntimeState.links], [BleRuntimeState.incomingRequests]
+  /// and the derived single-active-peer views) are always recomputed from the
+  /// link registry and the pending-request collection, never passed in, so a
+  /// stale or hand-written value can never misrepresent a link's phase. Only
+  /// non-link facts (status, candidates, error, advertising, background,
+  /// availability) are accepted as parameters.
   void _setState({
     BleRuntimeStatus? status,
     List<BleCandidate>? candidates,
-    String? activePeerId,
-    String? activePeerName,
-    BleLinkRole? activeRole,
     String? error,
     bool? canOpenSettings,
     bool? isAdvertising,
-    IncomingConnectionRequest? incomingRequest,
     bool? isForeground,
     BackgroundBleRuntimeStatus? backgroundStatus,
     String? backgroundError,
     bool? availabilityEnabled,
-    int? activeSignalStrength,
-    bool? isSecureReady,
-    bool clearActiveLink = false,
     bool clearError = false,
-    bool clearIncomingRequest = false,
     bool clearBackgroundError = false,
-    bool clearActiveSignal = false,
   }) {
     if (_disposed) return;
+    final primary = _primaryLink;
     state = state.copyWith(
       status: status,
       candidates: candidates,
-      activePeerId: activePeerId,
-      activePeerName: activePeerName,
-      activeRole: activeRole,
       error: error,
       canOpenSettings: canOpenSettings,
       isAdvertising: isAdvertising,
-      incomingRequest: incomingRequest,
       isForeground: isForeground,
       backgroundStatus: backgroundStatus,
       backgroundError: backgroundError,
       availabilityEnabled: availabilityEnabled,
-      activeSignalStrength: activeSignalStrength,
-      isSecureReady: isSecureReady,
-      clearActiveLink: clearActiveLink,
       clearError: clearError,
-      clearIncomingRequest: clearIncomingRequest,
       clearBackgroundError: clearBackgroundError,
-      clearActiveSignal: clearActiveSignal,
+      // Recomputed from the registry: one snapshot per live link.
+      links: _links.states(now: _clock()),
+      incomingRequests: _pendingRequestList(),
+      // Derived single-active-peer compatibility views: the primary link's
+      // own values, cleared automatically when no link holds a peer.
+      activePeerId: primary?.peerId,
+      activePeerName: primary?.remoteDisplayName ?? primary?.remoteDeviceName,
+      activeRole: primary?.role,
+      activeSignalStrength: primary?.remoteRssi,
+      isSecureReady:
+          primary != null && primary.phase == BleLinkPhase.secureReady,
+      clearActiveLink: primary == null,
     );
     if (_backgroundServiceRunning) {
       unawaited(_refreshBackgroundServiceState());
@@ -2948,11 +3417,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   @override
   void dispose() {
     _disposed = true;
-    _stopPresenceMonitor();
-    _centralGate.close();
     _scanTimer?.cancel();
     _candidateCleanupTimer?.cancel();
-    _incomingRequestTimer?.cancel();
     for (final waiter in _connectionWaiters.values) {
       if (!waiter.isCompleted) {
         waiter.completeError(const BleLinkException('BLE runtime disposed'));
@@ -2962,7 +3428,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }
-    unawaited(_activeSession?.close());
+    // Close every link's session so no native Noise handle is leaked, then
+    // release the links' own resources (presence, timers, gates).
+    for (final link in _links.links.values) {
+      unawaited(link.session?.close());
+    }
+    _links.removeAll();
     super.dispose();
   }
 }

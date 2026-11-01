@@ -77,11 +77,15 @@ pub const MAX_TRANSPORT_PLAINTEXT_LENGTH: usize = MAX_TRANSPORT_MESSAGE_LENGTH -
 
 /// Maximum number of concurrently open sessions.
 ///
-/// Conservative initial bound: BeChat maintains at most one active link, with
-/// a small allowance for a link in teardown overlapping its replacement. If
-/// the runtime later needs a different limit, change this constant and its
-/// capacity test together.
-pub const MAX_SESSIONS: usize = 4;
+/// Aligned with the Dart-side link limit (`bleMaxLinkCount` in
+/// `lib/services/ble/ble_link_manager.dart`) so the runtime never accepts a
+/// link it could not secure: the multi-connection architecture maintains up to
+/// this many simultaneous Noise sessions, one per connected peer. A link that
+/// has not started its Noise handshake (still awaiting approval) occupies a
+/// Dart link slot but no native session slot, which is why the two limits only
+/// need to match at their maximum. If the runtime later needs a different
+/// limit, change both constants and this capacity test together.
+pub const MAX_SESSIONS: usize = 8;
 
 /// Format version of the encoded authenticated identity payload.
 const IDENTITY_PAYLOAD_FORMAT_VERSION: u8 = 1;
@@ -755,7 +759,10 @@ mod tests {
             assert!(MAX_HANDSHAKE_MESSAGE_LENGTH < MAX_TRANSPORT_MESSAGE_LENGTH);
             assert!(MAX_IDENTITY_PAYLOAD_LENGTH < MAX_HANDSHAKE_MESSAGE_LENGTH);
         }
-        assert_eq!(MAX_SESSIONS, 4);
+        // The native session capacity must match the Dart link limit
+        // (`bleMaxLinkCount`) so the runtime never accepts a link it could not
+        // secure. Both are raised together with this test.
+        assert_eq!(MAX_SESSIONS, 8);
         assert_eq!(SECURE_PROLOGUE, b"BeChat secure transport v1");
     }
 

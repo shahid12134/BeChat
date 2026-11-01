@@ -720,6 +720,131 @@ fn session_capacity_is_bounded_and_released_on_close() {
     }
 }
 
+/// Multiple simultaneous sessions must keep fully independent cipher state.
+///
+/// Multi-connection foundation (Phase 3): two confirmed links are live at
+/// once, exactly as the runtime holds one Noise session per connected peer.
+/// A ciphertext produced by one link must decrypt only on its own peer, and
+/// closing one link must never disturb the other's counters or transport.
+#[test]
+fn concurrent_sessions_keep_independent_counters_and_ciphers() {
+    let _guard = exclusive();
+    let (alice_a, bob_a) = confirmed_pair(0x01, 0x02);
+    let (alice_b, bob_b) = confirmed_pair(0x03, 0x04);
+
+    // Both links are ready and hold distinct sessions.
+    assert_eq!(
+        session_status(alice_a.handle).expect("status").stage,
+        SessionStageName::Ready
+    );
+    assert_eq!(
+        session_status(alice_b.handle).expect("status").stage,
+        SessionStageName::Ready
+    );
+    assert_ne!(alice_a.handle, alice_b.handle);
+    assert_ne!(bob_a.handle, bob_b.handle);
+
+    // Link A carries traffic while link B stays idle: A's counters advance.
+    let a_ciphertext = session_encrypt(alice_a.handle, b"link A payload").expect("encrypt A");
+    assert_eq!(
+        session_decrypt(bob_a.handle, &a_ciphertext).expect("decrypt A"),
+        b"link A payload"
+    );
+
+    // Link B is untouched: it can still send its own first message, which is
+    // not a replay of A's (independent counters) and never cross-decrypts.
+    let b_ciphertext = session_encrypt(alice_b.handle, b"link B payload").expect("encrypt B");
+    assert_eq!(
+        session_decrypt(bob_b.handle, &b_ciphertext).expect("decrypt B"),
+        b"link B payload"
+    );
+    assert_ne!(a_ciphertext, b_ciphertext);
+
+    // Closing link A leaves link B fully usable: B keeps exchanging messages
+    // with its own counters intact. This mirrors the runtime rule that one
+    // peer's disconnect never tears down another peer's link.
+    assert!(session_close(alice_a.handle));
+    assert!(session_close(bob_a.handle));
+    let b_next = session_encrypt(alice_b.handle, b"link B still alive").expect("encrypt B again");
+    assert_eq!(
+        session_decrypt(bob_b.handle, &b_next).expect("decrypt B again"),
+        b"link B still alive"
+    );
+    assert_ne!(a_ciphertext, b_next);
+
+    // A ciphertext from one link must never decrypt on another link's peer.
+    // This runs last because a failed decrypt deliberately poisons the
+    // receiving session (proven by `tampered_ciphertext_poisons_the_session`),
+    // so it would break the surviving-link checks above.
+    assert_eq!(
+        session_decrypt(bob_b.handle, &a_ciphertext).unwrap_err(),
+        "transport message authentication failed"
+    );
+
+    assert!(session_close(alice_b.handle));
+    assert!(session_close(bob_b.handle));
+}
+
+/// Closing one session must not close or reset any other session.
+///
+/// Mirrors the runtime rule that one peer's disconnect never tears down
+/// another peer's link: the surviving sessions keep their stage, their pinned
+/// remote identity and their ability to encrypt.
+#[test]
+fn closing_one_session_leaves_the_others_untouched() {
+    let _guard = exclusive();
+    let (alice_a, bob_a) = confirmed_pair(0x11, 0x12);
+    let (alice_b, bob_b) = confirmed_pair(0x13, 0x14);
+
+    // Close link A entirely.
+    assert!(session_close(alice_a.handle));
+    assert!(session_close(bob_a.handle));
+
+    // Closed handles are rejected and are not reused for later sessions.
+    assert!(session_encrypt(alice_a.handle, b"zombie").is_err());
+    assert!(session_decrypt(bob_a.handle, b"zombie").is_err());
+    assert!(session_status(alice_a.handle).is_err());
+
+    // Link B is still confirmed, still ready, and still carries traffic.
+    let report = session_status(alice_b.handle).expect("status B");
+    assert_eq!(report.stage, SessionStageName::Ready);
+    let ciphertext = session_encrypt(bob_b.handle, b"survivor").expect("encrypt survivor");
+    assert_eq!(
+        session_decrypt(alice_b.handle, &ciphertext).expect("decrypt survivor"),
+        b"survivor"
+    );
+
+    assert!(session_close(alice_b.handle));
+    assert!(session_close(bob_b.handle));
+}
+
+/// A fresh session must never receive a recycled handle of a closed session.
+///
+/// Handle reuse would let a late frame for a torn-down link be routed into an
+/// unrelated peer's live session; the registry must keep every handle unique
+/// for the lifetime of the process.
+#[test]
+fn session_handles_are_not_reused_after_close() {
+    let _guard = exclusive();
+    let seed = vec![0x21u8; 32];
+    let public_hex = derive_identity_public_key_hex(&seed).expect("derive");
+    install_identity(&seed, &public_hex).expect("install");
+
+    let first = session_create(true, ALICE_ID, "Alice", None, None).expect("create");
+    assert!(session_close(first));
+
+    let mut seen = HashSet::new();
+    seen.insert(first);
+    for _ in 0..MAX_SESSIONS {
+        let handle = session_create(true, ALICE_ID, "Alice", None, None).expect("create");
+        assert!(
+            seen.insert(handle),
+            "a closed session's handle was reused for a new session"
+        );
+        assert!(session_close(handle));
+    }
+}
+
 #[test]
 fn fresh_sessions_use_fresh_ephemeral_material() {
     let _guard = exclusive();

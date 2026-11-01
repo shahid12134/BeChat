@@ -91,8 +91,16 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
   ) {
     final presence = resolvePeerPresence(peer, bleState.presenceContext);
     final isBleConnected = isPeerPresenceConnected(presence);
+    // Signal strength comes from this peer's own link, so one peer's RSSI
+    // never leaks into another peer's row. The legacy single-link view
+    // supplies the active peer's signal when no per-link snapshot exists.
+    final peerLink = bleState.linkFor(peer.peerId);
     final signalStrength = isBleConnected
-        ? bleState.activeSignalStrength ?? peer.signalStrength
+        ? peerLink?.signalStrength ??
+              (bleState.activePeerId == peer.peerId
+                  ? bleState.activeSignalStrength
+                  : null) ??
+              peer.signalStrength
         : peer.signalStrength;
     return Scaffold(
       appBar: AppBar(
@@ -171,10 +179,9 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
             _buildSecuritySection(
               context,
               peer,
-              isSecureLinkActive:
-                  isBleConnected &&
-                  bleState.isSecureReady &&
-                  bleState.activePeerId == peer.peerId,
+              // Per-peer truth: this peer's own link must be secure-ready,
+              // regardless of what other peers' links are doing.
+              isSecureLinkActive: bleState.isPeerSecureReady(peer.peerId),
             ),
             const SizedBox(height: 24),
             _buildActions(context, peer, isBleConnected),
@@ -317,17 +324,21 @@ class _PeerDetailsScreenState extends ConsumerState<PeerDetailsScreen> {
           const SizedBox(height: 8),
           SizedBox(
             width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: null,
-              icon: Icon(
-                isBleConnected ? Icons.bluetooth_connected : Icons.bluetooth,
-              ),
-              label: Text(
-                isBleConnected
-                    ? 'Direct BLE link active'
-                    : 'Connect from Nearby Peers',
-              ),
-            ),
+            child: isBleConnected
+                // This peer has its own live link; disconnecting it never
+                // touches any other peer's connection.
+                ? OutlinedButton.icon(
+                    onPressed: () => ref
+                        .read(bleRuntimeProvider.notifier)
+                        .disconnectPeer(peer.peerId),
+                    icon: const Icon(Icons.link_off),
+                    label: const Text('Disconnect This Peer'),
+                  )
+                : OutlinedButton.icon(
+                    onPressed: null,
+                    icon: const Icon(Icons.bluetooth),
+                    label: const Text('Connect from Nearby Peers'),
+                  ),
           ),
           const SizedBox(height: 8),
           SizedBox(

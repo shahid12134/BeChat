@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:bechat/core/ble/ble_link_phase.dart';
 import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/core/widgets/ble_availability_button.dart';
 import 'package:bechat/core/widgets/empty_state.dart';
@@ -142,12 +143,10 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
     }
   }
 
-  Future<void> _openActiveChat() async {
-    final peerId = ref.read(bleRuntimeProvider).activePeerId;
-    if (peerId == null) return;
+  Future<void> _openChatWithPeer(String peerId) async {
     final peer = await ref.read(peerRepositoryProvider).getPeerByPeerId(peerId);
     if (peer == null) {
-      _showError('The connected peer is not stored yet.');
+      _showError('That peer is not saved yet.');
       return;
     }
     final chat = await ref
@@ -155,6 +154,10 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
         .getOrCreateChatForPeer(peer);
     await ref.read(chatListProvider.notifier).refreshChats();
     if (mounted) context.push('/chat/${chat.chatId}');
+  }
+
+  Future<void> _disconnectPeer(String peerId) async {
+    await ref.read(bleRuntimeProvider.notifier).disconnectPeer(peerId);
   }
 
   Future<void> _setAllowNewConnections(bool value) async {
@@ -270,7 +273,6 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
                     isScanning: isScanning,
                     isStarting: bleState.status == BleRuntimeStatus.starting,
                     operationInProgress: operationInProgress,
-                    isConnected: bleState.isConnected,
                   ),
                   _buildBleBanner(context, bleState),
                   _buildRealContent(context, bleState, allPeersAsync),
@@ -343,9 +345,11 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
     required bool isScanning,
     required bool isStarting,
     required bool operationInProgress,
-    required bool isConnected,
   }) {
-    final canScan = !isScanning && !operationInProgress && !isConnected;
+    // Scanning stays available while links are active: the multi-connection
+    // runtime keeps discovery running alongside live connections so another
+    // peer can be found and connected without dropping existing links.
+    final canScan = !isScanning && !operationInProgress;
     final showProgress = isScanning || isStarting;
     return Card(
       margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
@@ -379,9 +383,7 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
               const SizedBox(height: 8),
             ],
             Text(
-              isConnected
-                  ? 'Disconnect from the active peer before scanning again.'
-                  : isScanning
+              isScanning
                   ? 'Scanning for nearby BeChat devices. Results refresh as '
                         'advertisements arrive.'
                   : isStarting
@@ -390,7 +392,8 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
                   ? 'Scans stop automatically after '
                         '${AppConstants.scanTimeout.inSeconds} seconds. '
                         'Recently seen devices remain for '
-                        '${AppConstants.candidateExpiration.inSeconds} seconds.'
+                        '${AppConstants.candidateExpiration.inSeconds} seconds. '
+                        'Scanning works while connected to other peers.'
                   : 'Turn on BeChat to scan. Scanning never enables BeChat by '
                         'itself.',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -431,46 +434,60 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
 
   Widget _buildBleBanner(BuildContext context, BleRuntimeState bleState) {
     final theme = Theme.of(context);
-    if (bleState.isConnected) {
+    if (bleState.links.isNotEmpty) {
+      final secureCount = bleState.links.where((l) => l.isSecureReady).length;
       return Container(
         width: double.infinity,
         color: theme.colorScheme.primaryContainer,
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.bluetooth_connected),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Connected to ${bleState.activePeerName ?? bleState.activePeerId}',
+            Row(
+              children: [
+                Icon(
+                  secureCount > 0
+                      ? Icons.bluetooth_connected
+                      : Icons.bluetooth_searching,
+                  color: theme.colorScheme.onPrimaryContainer,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    secureCount > 0
+                        ? '$secureCount secure connection'
+                              '${secureCount == 1 ? '' : 's'}'
+                        : '${bleState.links.length} device'
+                              '${bleState.links.length == 1 ? '' : 's'} '
+                              'connecting',
                     style: TextStyle(
                       color: theme.colorScheme.onPrimaryContainer,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  Text(
-                    'App identity exchanged over BLE. This is not '
-                    'cryptographic authentication.',
-                    style: TextStyle(
-                      color: theme.colorScheme.onPrimaryContainer,
-                      fontSize: 12,
-                    ),
-                  ),
-                ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            for (final link in bleState.links) ...[
+              _LinkRow(
+                link: link,
+                onMessage: link.isSecureReady && link.peerId != null
+                    ? () => _openChatWithPeer(link.peerId!)
+                    : null,
+                onDisconnect: link.peerId != null
+                    ? () => _disconnectPeer(link.peerId!)
+                    : null,
               ),
-            ),
-            TextButton(
-              onPressed: _openActiveChat,
-              child: const Text('Message'),
-            ),
-            IconButton(
-              tooltip: 'Disconnect',
-              onPressed: () =>
-                  ref.read(bleRuntimeProvider.notifier).disconnect(),
-              icon: const Icon(Icons.link_off),
+            ],
+            const SizedBox(height: 4),
+            Text(
+              'Secure means the Noise handshake finished and the peer '
+              'identity was confirmed. Only secure links carry messages.',
+              style: TextStyle(
+                color: theme.colorScheme.onPrimaryContainer,
+                fontSize: 12,
+              ),
             ),
           ],
         ),
@@ -581,7 +598,11 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
     BleRuntimeState bleState,
     AsyncValue<List<Peer>> allPeersAsync,
   ) {
-    if (bleState.status == BleRuntimeStatus.connecting) {
+    // The full-screen connecting placeholder belongs to the first connection;
+    // once any link is secure the list stays visible so other peers can be
+    // managed and connected while this one continues in the banner above.
+    if (bleState.status == BleRuntimeStatus.connecting &&
+        !bleState.hasSecureLink) {
       return Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
@@ -787,6 +808,99 @@ class _CandidateTile extends StatelessWidget {
       ),
       isThreeLine: true,
       trailing: const Icon(Icons.chevron_right),
+    );
+  }
+}
+
+/// One managed link inside the connections banner: the peer's name, its own
+/// independent phase chip and its per-peer Message and Disconnect actions.
+class _LinkRow extends StatelessWidget {
+  const _LinkRow({required this.link, this.onMessage, this.onDisconnect});
+
+  final BlePeerLinkState link;
+  final VoidCallback? onMessage;
+  final VoidCallback? onDisconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final name = link.displayName ?? link.deviceName ?? 'BeChat device';
+    final chipColor = switch (link.phase) {
+      BleLinkPhase.secureReady => Colors.green,
+      BleLinkPhase.failed => theme.colorScheme.error,
+      BleLinkPhase.awaitingAuthorization => Colors.orange,
+      _ => theme.colorScheme.onPrimaryContainer,
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: theme.colorScheme.onPrimaryContainer,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Wrap(
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  spacing: 8,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 1,
+                      ),
+                      decoration: BoxDecoration(
+                        color: chipColor.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Text(
+                        bleLinkPhaseLabel(link.phase),
+                        style: TextStyle(
+                          color: chipColor,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    if (link.signalStrength != null)
+                      Text(
+                        '${link.signalStrength} dBm',
+                        style: TextStyle(
+                          color: theme.colorScheme.onPrimaryContainer,
+                          fontSize: 12,
+                        ),
+                      ),
+                  ],
+                ),
+                if (link.error != null)
+                  Text(
+                    link.error!,
+                    style: TextStyle(
+                      color: theme.colorScheme.onErrorContainer,
+                      fontSize: 12,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          if (onMessage != null)
+            TextButton(onPressed: onMessage, child: const Text('Message')),
+          if (onDisconnect != null)
+            IconButton(
+              tooltip: 'Disconnect',
+              onPressed: onDisconnect,
+              icon: const Icon(Icons.link_off),
+            ),
+        ],
+      ),
     );
   }
 }

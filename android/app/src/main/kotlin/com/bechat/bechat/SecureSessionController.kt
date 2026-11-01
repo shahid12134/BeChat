@@ -87,7 +87,21 @@ object SecureSessionController : MethodChannel.MethodCallHandler {
     private const val KEY_PLAINTEXT = "plaintext"
     private const val KEY_STAGE = "stage"
 
-    private const val MAX_QUEUED_OPERATIONS = 32
+    /**
+     * Capacity of the serial crypto-operation queue.
+     *
+     * The executor stays single-threaded: native calls are never parallelized,
+     * because the Rust engine's per-session state and the Dart session TX/RX
+     * queues already serialize work per session and running crypto on multiple
+     * threads would buy nothing while complicating that ordering. Only the
+     * queue depth changed for multi-connection: with up to 8 simultaneous
+     * links, a single peer's message round can occupy several slots at once
+     * (encrypt, decrypt, acknowledgement), so the old depth of 32 could be
+     * exhausted by legitimate cross-peer traffic and fail healthy links with
+     * SESSION_BUSY. 64 gives headroom for all links draining concurrently
+     * while still bounding memory and failing fast when saturated.
+     */
+    private const val MAX_QUEUED_OPERATIONS = 64
 
     /** Every transport message carries at least the ChaChaPoly tag. */
     const val AUTHENTICATION_TAG_BYTES = 16

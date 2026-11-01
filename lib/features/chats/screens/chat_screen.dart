@@ -140,15 +140,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           'Demo mode: messages are saved locally and are not sent over BLE.';
       background = theme.colorScheme.secondaryContainer;
       foreground = theme.colorScheme.onSecondaryContainer;
-    } else if (bleState.isConnected && bleState.activePeerId == peerId) {
-      message = bleState.isSecureReady
-          ? 'Secure BLE link active with this peer. Messages are encrypted '
-                'end-to-end while in transit over BLE.'
-          : 'BLE link active with this peer, but secure messaging is not '
-                'established on this link. Messages stay queued.';
+    } else if (peerId != null && bleState.isPeerSecureReady(peerId)) {
+      message =
+          'Secure BLE link active with this peer. Messages are encrypted '
+          'end-to-end while in transit over BLE.';
       background = theme.colorScheme.primaryContainer;
       foreground = theme.colorScheme.onPrimaryContainer;
-    } else if (bleState.isConnected) {
+    } else if (peerId != null && bleState.linkFor(peerId) != null) {
+      message =
+          'BLE link with this peer is still connecting or securing. '
+          'Messages stay queued until it is confirmed.';
+      background = theme.colorScheme.primaryContainer;
+      foreground = theme.colorScheme.onPrimaryContainer;
+    } else if (bleState.hasSecureLink || bleState.links.isNotEmpty) {
       message =
           'BLE is connected to another device. Messages here stay queued until '
           'you connect to this peer.';
