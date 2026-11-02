@@ -54,6 +54,9 @@ class DatabaseHelper {
     if (oldVersion < 4) {
       await migrateToVersion4(db);
     }
+    if (oldVersion < 5) {
+      await migrateToVersion5(db);
+    }
   }
 
   /// Adds the persistent application settings table without touching user data.
@@ -113,6 +116,56 @@ class DatabaseHelper {
       "UPDATE peers SET verification_state = '${PeerKeyVerificationState.unverified.name}' "
       "WHERE public_key IS NOT NULL "
       "AND verification_state = '${PeerKeyVerificationState.none.name}'",
+    );
+  }
+
+  /// v5: durable multi-hop routing foundations (additive only).
+  ///
+  /// * `seen_messages` — dedup ledger keyed by envelope id, so a relay drops a
+  ///   copy it has already forwarded. `expires_at` lets cleanup find expired
+  ///   rows with a plain range scan.
+  /// * `relay_queue` — envelopes parked for future forwarding, with hop data,
+  ///   attempts, next hop, and a textual state machine.
+  ///
+  /// No forwarding logic is activated here; this is storage only. Timestamps
+  /// use [TimestampUtils] canonical UTC ISO-8601 so expiry comparisons are
+  /// correct lexicographic range scans. Runs inside sqflite's upgrade
+  /// transaction, so it must not open a nested one.
+  static Future<void> migrateToVersion5(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS seen_messages (
+        envelope_id TEXT PRIMARY KEY NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_seen_messages_expires_at '
+      'ON seen_messages (expires_at)',
+    );
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS relay_queue (
+        envelope_id TEXT PRIMARY KEY NOT NULL,
+        envelope BLOB NOT NULL,
+        origin_device_id TEXT NOT NULL,
+        destination_device_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        hop_limit INTEGER NOT NULL,
+        hop_count INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_hop_device_id TEXT,
+        state TEXT NOT NULL DEFAULT 'queued',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_relay_queue_expires_at '
+      'ON relay_queue (expires_at)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_relay_queue_state '
+      'ON relay_queue (state)',
     );
   }
 
@@ -315,6 +368,32 @@ class DatabaseHelper {
         updated_at TEXT NOT NULL
       )
     ''');
+
+    // v5 routing foundations. Kept in sync with [migrateToVersion5].
+    await db.execute('''
+      CREATE TABLE seen_messages (
+        envelope_id TEXT PRIMARY KEY NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE relay_queue (
+        envelope_id TEXT PRIMARY KEY NOT NULL,
+        envelope BLOB NOT NULL,
+        origin_device_id TEXT NOT NULL,
+        destination_device_id TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        hop_limit INTEGER NOT NULL,
+        hop_count INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_hop_device_id TEXT,
+        state TEXT NOT NULL DEFAULT 'queued',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    ''');
   }
 
   static Future<void> _createIndexes(Database db) async {
@@ -340,6 +419,16 @@ class DatabaseHelper {
     );
     await db.execute(
       'CREATE INDEX idx_attachments_message ON attachments(message_id)',
+    );
+    // v5 routing foundations. Kept in sync with [migrateToVersion5].
+    await db.execute(
+      'CREATE INDEX idx_seen_messages_expires_at ON seen_messages(expires_at)',
+    );
+    await db.execute(
+      'CREATE INDEX idx_relay_queue_expires_at ON relay_queue(expires_at)',
+    );
+    await db.execute(
+      'CREATE INDEX idx_relay_queue_state ON relay_queue(state)',
     );
   }
 
