@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:bechat/core/ble/ble_protocol.dart';
 import 'package:bechat/core/utils/timestamp_utils.dart';
 import 'package:bechat/data/database/database_helper.dart';
+import 'package:bechat/data/models/attachment.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
@@ -33,6 +34,8 @@ class BleMessageStore {
   Future<BleIncomingReceipt> storeIncoming({
     required BleMessagePayload payload,
     required Peer peer,
+    MessageTransport transport = MessageTransport.ble,
+    Attachment? attachment,
   }) async {
     final db = await _openDatabase();
     return db.transaction<BleIncomingReceipt>((txn) async {
@@ -125,14 +128,17 @@ class BleMessageStore {
         senderId: payload.metadata.senderId,
         receiverId: payload.metadata.receiverId,
         content: payload.content,
-        messageType: MessageType.text,
+        messageType: attachment == null
+            ? MessageType.text
+            : (attachment.isImage ? MessageType.image : MessageType.file),
         timestamp: payload.metadata.timestamp,
         status: MessageStatus.delivered,
-        transport: MessageTransport.ble,
+        transport: transport,
         ttl: payload.metadata.ttl,
         isEncrypted: false,
         createdAt: now,
         updatedAt: now,
+        attachment: attachment,
       );
       final inserted = await txn.insert(
         'messages',
@@ -202,17 +208,26 @@ class BleIncomingMessageHandler {
   )?
   _onStored;
 
+  /// [relayedFrom] is set only for a multi-hop envelope's inner payload: the
+  /// envelope's CLAIMED origin device id, which is unverified (every hop is
+  /// authenticated hop-by-hop, never end-to-end). The authenticated
+  /// [linkedPeerId] remains the peer/chat context either way; when
+  /// [relayedFrom] is present it is only required to be consistent with the
+  /// payload's sender id — never used to resolve a peer or conversation.
+  /// Direct messages (null) keep the original sender check byte-identical.
   Future<BleAckResult> handle(
     BleMessagePayload payload, {
     required Peer peer,
     required String linkedPeerId,
+    String? relayedFrom,
   }) async {
     if (payload.metadata.receiverId != identity.deviceId) {
       throw const BleProtocolException(
         'Incoming message receiver does not match local identity',
       );
     }
-    if (payload.metadata.senderId != linkedPeerId ||
+    final expectedSender = relayedFrom ?? linkedPeerId;
+    if (payload.metadata.senderId != expectedSender ||
         peer.peerId != linkedPeerId) {
       throw const BleProtocolException(
         'Incoming message sender does not match linked peer',

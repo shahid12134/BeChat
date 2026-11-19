@@ -57,6 +57,12 @@ class DatabaseHelper {
     if (oldVersion < 5) {
       await migrateToVersion5(db);
     }
+    if (oldVersion < 6) {
+      await migrateToVersion6(db);
+    }
+    if (oldVersion < 7) {
+      await migrateToVersion7(db);
+    }
   }
 
   /// Adds the persistent application settings table without touching user data.
@@ -167,6 +173,32 @@ class DatabaseHelper {
       'CREATE INDEX IF NOT EXISTS idx_relay_queue_state '
       'ON relay_queue (state)',
     );
+  }
+
+  /// v6: the authenticated peer an envelope arrived from, kept on the queue
+  /// row so the retry loop can exclude it after a restart (Phase 3D.2B).
+  ///
+  /// Purely additive and nullable: every existing row keeps its bytes and
+  /// stays parked; a NULL incoming peer is never retried (the exclusion set
+  /// cannot be trusted without it). Runs inside sqflite's upgrade
+  /// transaction, so it must not open a nested one.
+  static Future<void> migrateToVersion6(Database db) async {
+    await _addColumnIfMissing(
+      db,
+      'relay_queue',
+      'incoming_peer_device_id',
+      'TEXT',
+    );
+  }
+
+  /// v7: media attachment metadata on the message itself (additive).
+  ///
+  /// Attachment bytes never enter SQLite; this column only holds the JSON
+  /// metadata (name, MIME type, size, Storage path) so an attachment always
+  /// travels with its message through the existing queue and transports. No
+  /// existing row is rewritten and no table is recreated.
+  static Future<void> migrateToVersion7(Database db) async {
+    await _addColumnIfMissing(db, 'messages', 'attachment_json', 'TEXT');
   }
 
   /// Adds [column] to [table] unless it already exists.
@@ -320,6 +352,7 @@ class DatabaseHelper {
         receiver_id TEXT NOT NULL,
         content TEXT NOT NULL,
         message_type TEXT NOT NULL DEFAULT 'text',
+        attachment_json TEXT,
         timestamp TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'sending',
         transport TEXT NOT NULL DEFAULT 'pending',
@@ -389,6 +422,7 @@ class DatabaseHelper {
         hop_count INTEGER NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0,
         next_hop_device_id TEXT,
+        incoming_peer_device_id TEXT,
         state TEXT NOT NULL DEFAULT 'queued',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL

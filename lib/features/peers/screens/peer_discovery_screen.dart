@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:bechat/core/ble/ble_link_phase.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/core/utils/error_formatter.dart';
 import 'package:bechat/core/widgets/ble_availability_button.dart';
 import 'package:bechat/core/widgets/empty_state.dart';
 import 'package:bechat/data/models/app_settings.dart';
@@ -102,7 +103,8 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
           .read(bleRuntimeProvider.notifier)
           .setAvailabilityEnabled(enabled);
     } catch (error) {
-      _showError('Could not update BeChat availability: $error');
+      _showError('Could not update BeChat availability: '
+          '${describeErrorForUser(error)}');
     }
   }
 
@@ -137,7 +139,8 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
       await ref.read(chatListProvider.notifier).refreshChats();
       if (mounted) context.push('/chat/${chat.chatId}');
     } catch (error) {
-      _showError('Unable to open the conversation: $error');
+      _showError('Unable to open the conversation: '
+          '${describeErrorForUser(error)}');
     } finally {
       if (mounted) setState(() => _connectingId = null);
     }
@@ -173,7 +176,8 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
             .declinePendingIncomingRequest();
       }
     } catch (error) {
-      _showError('Could not save the connection setting: $error');
+      _showError('Could not save the connection setting: '
+          '${describeErrorForUser(error)}');
     } finally {
       if (mounted) setState(() => _savingConnectionSetting = false);
     }
@@ -670,7 +674,9 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
       ),
       error: (e, _) => Padding(
         padding: const EdgeInsets.all(24),
-        child: Center(child: Text('Error loading peers: $e')),
+        child: Center(
+          child: Text('Could not load peers: ${describeErrorForUser(e)}'),
+        ),
       ),
     );
   }
@@ -707,7 +713,9 @@ class _PeerDiscoveryScreenState extends ConsumerState<PeerDiscoveryScreen> {
         return _buildSavedPeers(context, peers, scrollable: true);
       },
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) => Center(child: Text('Error loading peers: $e')),
+      error: (e, _) => Center(
+        child: Text('Could not load peers: ${describeErrorForUser(e)}'),
+      ),
     );
   }
 

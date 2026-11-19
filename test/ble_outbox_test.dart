@@ -350,6 +350,15 @@ class _FakeMessageRepository extends MessageRepository {
   }
 
   @override
+  Future<bool> tryClaimForSending(String messageId) async {
+    // Mirrors the repository's atomic claim: only a queued message can be
+    // taken, by exactly one caller.
+    if (statusOf(messageId) != MessageStatus.queued) return false;
+    _setStatus(messageId, MessageStatus.sending);
+    return true;
+  }
+
+  @override
   Future<void> markMessageSent(String messageId) async {
     sentCount++;
     _setStatus(messageId, MessageStatus.sent);

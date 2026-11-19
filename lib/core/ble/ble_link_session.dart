@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/ble/ble_routing_envelope.dart';
 import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
 import 'package:bechat/data/models/identity.dart';
@@ -210,6 +211,7 @@ class BleLinkSession {
     required this.identity,
     required this.onHello,
     required this.onMessage,
+    this.onRoutingEnvelope,
     this.onClosed,
     this.ackPolicy = const BleAckPolicy(),
     this.handshakeTimeout = const Duration(seconds: 15),
@@ -222,6 +224,13 @@ class BleLinkSession {
   final Identity identity;
   final Future<void> Function(BleHello hello) onHello;
   final Future<BleAckResult> Function(BleMessagePayload message) onMessage;
+
+  /// Optional routing-envelope handler (Phase 3D.1), strongly typed like
+  /// [onMessage]. Null (the default) makes an inbound envelope fail closed as
+  /// rejected; direct messages never reach it.
+  final Future<BleAckResult> Function(BleRoutingEnvelope envelope)?
+  onRoutingEnvelope;
+
   final void Function(Object? error)? onClosed;
   final BleAckPolicy ackPolicy;
   final Duration handshakeTimeout;
@@ -254,11 +263,25 @@ class BleLinkSession {
   /// constructor-provided handler.
   Future<BleAckResult> Function(BleMessagePayload message)? _onMessageOverride;
 
+  /// Per-start replacement for [onRoutingEnvelope]; see [start]. Null keeps
+  /// the constructor-provided handler.
+  Future<BleAckResult> Function(BleRoutingEnvelope envelope)?
+  _onRoutingEnvelopeOverride;
+
   /// The effective inbound-message handler: the per-start override when the
   /// owning runtime bound one, otherwise the constructor handler.
   Future<BleAckResult> _dispatchMessage(BleMessagePayload message) {
     final handler = _onMessageOverride ?? onMessage;
     return handler(message);
+  }
+
+  /// The effective inbound-envelope handler, following [_dispatchMessage].
+  /// With no handler bound at all the envelope is rejected: an unroutable
+  /// envelope is never delivered as a direct message.
+  Future<BleAckResult> _dispatchEnvelope(BleRoutingEnvelope envelope) async {
+    final handler = _onRoutingEnvelopeOverride ?? onRoutingEnvelope;
+    if (handler == null) return BleAckResult.rejected;
+    return handler(envelope);
   }
 
   // Secure-mode state. All fields are inert when [secure] is null.
@@ -300,13 +323,17 @@ class BleLinkSession {
   /// callbacks alone cannot tell which link a HELLO or message arrived on,
   /// while these overrides run with the exact session that received the
   /// frame. Throwing from either rejects or fails exactly like the
-  /// constructor handler.
+  /// constructor handler. [onRoutingEnvelope] follows the same rule for
+  /// routing envelopes.
   Future<BleHello> start({
     Future<void> Function(BleHello hello)? onHello,
     Future<BleAckResult> Function(BleMessagePayload message)? onMessage,
+    Future<BleAckResult> Function(BleRoutingEnvelope envelope)?
+    onRoutingEnvelope,
   }) async {
     _onHelloOverride = onHello;
     _onMessageOverride = onMessage;
+    _onRoutingEnvelopeOverride = onRoutingEnvelope;
     if (_state != BleSessionState.idle) {
       throw const BleLinkException('BLE session has already been started');
     }
@@ -488,8 +515,74 @@ class BleLinkSession {
       throw const BleLinkException('Message content is too large');
     }
 
+    return _sendSecurePayload(
+      ackKey: message.messageId,
+      plaintext: plaintext,
+      onTransmitted: onTransmitted,
+    );
+  }
+
+  /// Secure-mode outbound routing envelope (Phase 3D.1): encode with the
+  /// existing routing codec, encrypt through the Noise gateway, write it as a
+  /// v2 `secureMessage`, and complete only on the authenticated ACK correlated
+  /// by [BleRoutingEnvelope.envelopeId].
+  ///
+  /// Unlike [sendMessage] the destination may be several hops away, so the
+  /// envelope's destination is deliberately *not* compared with this session's
+  /// authenticated peer: the Noise session authenticates the immediate relay
+  /// hop, never the envelope origin. Requires a confirmed secure session, has
+  /// the same counter-safety rules as [_sendSecurePayload], and never falls
+  /// back to plaintext.
+  Future<BleAckResult> sendEnvelope(BleRoutingEnvelope envelope) async {
+    if (_closed || _state == BleSessionState.closed) {
+      throw const BleLinkClosedException('BLE link is not ready');
+    }
+    if (_secureState != BleSecureLinkState.secureReady) {
+      throw const BleLinkException(
+        'The secure session is not ready for messaging',
+      );
+    }
+    if (_pendingAcks.containsKey(envelope.envelopeId)) {
+      throw BleLinkException(
+        'Message ${envelope.envelopeId} is already awaiting acknowledgement',
+      );
+    }
+    final plaintext = envelope.encode();
+    if (plaintext.length > BleSecureProtocol.maxTransportPlaintextBytes) {
+      // Reject oversized plaintext before any large allocation or native
+      // encryption call (the Rust engine enforces the same bound).
+      // shortcut: BleRoutingEnvelope.maxPayloadBytes (8176) is the transport
+      // plaintext ceiling itself, so an envelope near that payload bound plus
+      // its header is rejected here; lower maxPayloadBytes to leave header
+      // room if full-size payloads must round-trip.
+      throw const BleLinkException('Routing envelope is too large');
+    }
+    return _sendSecurePayload(
+      ackKey: envelope.envelopeId,
+      plaintext: plaintext,
+    );
+  }
+
+  /// Shared secure TX core for messages and routing envelopes: register
+  /// [ackKey] as pending, encrypt [plaintext] once *inside* the serialized TX
+  /// queue (Noise send-counter order == wire order), write it as a v2
+  /// `secureMessage`, and return the result of the authenticated ACK for
+  /// [ackKey].
+  ///
+  /// Counter safety: a Noise transport message consumes a send counter at
+  /// encryption time, so encryption happens inside the TX queue and is never
+  /// repeated on this session. A failed encrypt/write or an ACK timeout
+  /// therefore fails the send **and** closes the secure session; recovery is
+  /// a fresh connection plus a fresh handshake, where a higher layer may retry
+  /// the payload. There is no plaintext fallback and no counter reset, ever.
+  /// Callers must have validated their own payload and [ackKey] beforehand.
+  Future<BleAckResult> _sendSecurePayload({
+    required String ackKey,
+    required Uint8List plaintext,
+    Future<void> Function()? onTransmitted,
+  }) async {
     final completer = Completer<BleAck>();
-    _pendingAcks[message.messageId] = completer;
+    _pendingAcks[ackKey] = completer;
     // Never leave the pending completer's error unhandled if the link closes
     // while this send is still queued or waiting for its acknowledgement.
     unawaited(completer.future.then<void>((_) {}, onError: (_) {}));
@@ -525,7 +618,7 @@ class BleLinkSession {
       // A failed encrypt or write makes transport-counter synchronization
       // uncertain: fail this send and tear the secure session down so a
       // later attempt runs on a freshly handshaked session.
-      _pendingAcks.remove(message.messageId);
+      _pendingAcks.remove(ackKey);
       if (!_closed && _secureState != BleSecureLinkState.failed) {
         await _failSecure(error);
       }
@@ -541,7 +634,7 @@ class BleLinkSession {
       final ack = await completer.future.timeout(timeout);
       if (ack.result == BleAckResult.rejected &&
           ack.reason?.contains(BleProtocol.approvalPendingReason) == true) {
-        throw BleApprovalPendingException(message.messageId);
+        throw BleApprovalPendingException(ackKey);
       }
       return ack.result;
     } on TimeoutException {
@@ -549,13 +642,13 @@ class BleLinkSession {
       // peer's wire, so this session can never be reused for a re-encrypt.
       // Drop the pending entry first (so close() cannot error an abandoned
       // completer), then invalidate the session.
-      _pendingAcks.remove(message.messageId);
+      _pendingAcks.remove(ackKey);
       if (!_closed && _secureState != BleSecureLinkState.failed) {
-        await _failSecure(BleAckTimeoutException(message.messageId, timeout));
+        await _failSecure(BleAckTimeoutException(ackKey, timeout));
       }
-      throw BleAckTimeoutException(message.messageId, timeout);
+      throw BleAckTimeoutException(ackKey, timeout);
     } finally {
-      _pendingAcks.remove(message.messageId);
+      _pendingAcks.remove(ackKey);
     }
   }
 
@@ -950,8 +1043,16 @@ class BleLinkSession {
       // in flight; this late plaintext must not change any state.
       return;
     }
-    // Authenticated plaintext, decoded once. Any malformed payload throws and
-    // tears the session down; it is never retried as a legacy message.
+    // Authenticated plaintext, decoded once. A routing envelope is recognized
+    // by its distinct magic byte and handled on its own path; anything else
+    // is the existing direct message. Any malformed payload throws and tears
+    // the session down — it is never retried as the other kind. A direct
+    // message can never start with this byte: its first two bytes are the
+    // 16-bit metadata length, which is validated against maxMetadataBytes.
+    if (plaintext.isNotEmpty && plaintext[0] == BleRoutingEnvelope.magic) {
+      await _handleSecureRoutingEnvelope(plaintext);
+      return;
+    }
     final message = BleMessagePayload.decode(plaintext);
 
     final remote = _secureRemoteIdentity;
@@ -978,11 +1079,50 @@ class BleLinkSession {
       reason = error.toString();
     }
 
-    final ack = BleAck(
-      messageId: message.metadata.messageId,
-      result: result,
-      reason: reason,
+    await _sendSecureAck(
+      BleAck(
+        messageId: message.metadata.messageId,
+        result: result,
+        reason: reason,
+      ),
     );
+  }
+
+  /// Secure-mode inbound routing envelope: decode the authenticated plaintext
+  /// with the routing codec, dispatch it to [onRoutingEnvelope], and
+  /// acknowledge with an ACK whose ID is [BleRoutingEnvelope.envelopeId].
+  ///
+  /// Only the immediate hop peer is authenticated by the Noise session. The
+  /// envelope's origin field is *not* authenticated identity, and a relayed
+  /// envelope legitimately originates elsewhere, so the direct-message sender
+  /// check is deliberately not applied here. A malformed envelope throws into
+  /// [_queueIncoming] and fails the session closed; it is never re-decoded as
+  /// a direct message.
+  Future<void> _handleSecureRoutingEnvelope(Uint8List plaintext) async {
+    final envelope = BleRoutingEnvelope.decode(plaintext);
+
+    BleAckResult result;
+    String? reason;
+    try {
+      result = await _dispatchEnvelope(envelope);
+    } catch (error) {
+      // Existing rejection semantics, identical to direct messages: the
+      // reason travels only inside the encrypted acknowledgement.
+      result = BleAckResult.rejected;
+      reason = error.toString();
+    }
+
+    await _sendSecureAck(
+      BleAck(
+        messageId: envelope.envelopeId,
+        result: result,
+        reason: reason,
+      ),
+    );
+  }
+
+  /// Encrypts and writes [ack] as a v2 `secureAck` on the serialized TX path.
+  Future<void> _sendSecureAck(BleAck ack) async {
     final ackBytes = ack.encode();
     await _enqueue(() async {
       final (config, handle) = _requireSecureTransport('acknowledgement');

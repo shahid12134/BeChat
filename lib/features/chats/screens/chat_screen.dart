@@ -1,12 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:uuid/uuid.dart';
 import 'package:bechat/core/ble/peer_presence.dart';
+import 'package:bechat/core/media/attachment_policy.dart';
+import 'package:bechat/core/utils/error_formatter.dart';
 import 'package:bechat/data/models/message.dart';
+import 'package:bechat/features/chats/widgets/attachment_bubble.dart';
+import 'package:bechat/providers/media_providers.dart';
+import 'package:bechat/services/media/media_storage_service.dart';
 import 'package:bechat/data/models/peer.dart';
 import 'package:bechat/core/widgets/avatar_widget.dart';
 import 'package:bechat/core/utils/date_utils.dart';
@@ -14,9 +21,11 @@ import 'package:bechat/core/constants/app_constants.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
 import 'package:bechat/providers/message_providers.dart';
+import 'package:bechat/providers/online_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/services/ble/ble_runtime.dart';
+import 'package:bechat/services/online/transport_manager.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String chatId;
@@ -108,14 +117,338 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     unawaited(
       ref
-          .read(bleRuntimeProvider.notifier)
-          .requestDelivery(chat.peerId)
+          .read(transportManagerProvider.notifier)
+          .onMessageQueued(chat.peerId)
           .catchError((Object _) {
             if (mounted) {
-              _showError('Message is queued; BLE delivery could not start.');
+              _showError('Message is queued; delivery could not start.');
             }
           }),
     );
+  }
+
+  /// Attachment entry point: Gallery/Images, Videos, Documents.
+  Future<void> _showAttachmentMenu() async {
+    final kind = await showModalBottomSheet<AttachmentKind>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 8),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Gallery / Images'),
+              subtitle: Text(
+                'JPG, PNG, WebP up to '
+                '${AttachmentPolicy.formatBytes(AppConstants.maxImageBytes)}',
+              ),
+              onTap: () => Navigator.pop(context, AttachmentKind.image),
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam_outlined),
+              title: const Text('Videos'),
+              subtitle: Text(
+                'MP4, MOV up to '
+                '${AttachmentPolicy.formatBytes(AppConstants.maxVideoBytes)}',
+              ),
+              onTap: () => Navigator.pop(context, AttachmentKind.video),
+            ),
+            ListTile(
+              leading: const Icon(Icons.description_outlined),
+              title: const Text('Documents'),
+              subtitle: Text(
+                'PDF, TXT, DOCX and more up to '
+                '${AttachmentPolicy.formatBytes(AppConstants.maxDocumentBytes)}',
+              ),
+              onTap: () => Navigator.pop(context, AttachmentKind.document),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (kind != null) await _pickAttachment(kind);
+  }
+
+  Future<void> _pickAttachment(AttachmentKind kind) async {
+    final extensions = switch (kind) {
+      AttachmentKind.image => ['jpg', 'jpeg', 'png', 'webp'],
+      AttachmentKind.video => ['mp4', 'mov'],
+      AttachmentKind.document => [
+        'pdf',
+        'txt',
+        'csv',
+        'doc',
+        'docx',
+        'xls',
+        'xlsx',
+        'zip',
+      ],
+    };
+    final result = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: extensions,
+      withData: false,
+    );
+    final picked = result?.files.singleOrNull;
+    final path = picked?.path;
+    if (picked == null || path == null) return;
+
+    final file = File(path);
+    final mimeType = AttachmentPolicy.resolveMimeType(
+      fileName: picked.name,
+    );
+    final int size;
+    try {
+      size = await file.length();
+    } catch (_) {
+      _showError('That file could not be read.');
+      return;
+    }
+    final error = AttachmentPolicy.validate(
+      fileName: picked.name,
+      mimeType: mimeType,
+      size: size,
+    );
+    if (error != null) {
+      _showError(error);
+      return;
+    }
+    if (!mounted) return;
+
+    final confirmed = await _showAttachmentPreview(
+      file: file,
+      fileName: picked.name,
+      mimeType: mimeType!,
+      size: size,
+    );
+    if (confirmed != true || !mounted) return;
+    await _sendAttachment(
+      file: file,
+      fileName: picked.name,
+      mimeType: mimeType,
+      size: size,
+    );
+  }
+
+  /// Preview with name, size and (for images) a thumbnail. Returns true when
+  /// the user chooses Send.
+  Future<bool?> _showAttachmentPreview({
+    required File file,
+    required String fileName,
+    required String mimeType,
+    required int size,
+  }) {
+    final isImage = AttachmentPolicy.kindForMime(mimeType) == AttachmentKind.image;
+    return showModalBottomSheet<bool>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Send attachment',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 12),
+              if (isImage)
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.file(
+                    file,
+                    height: 160,
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, _, __) => const SizedBox.shrink(),
+                  ),
+                ),
+              if (isImage) const SizedBox(height: 12),
+              Row(
+                children: [
+                  Icon(
+                    isImage
+                        ? Icons.image_outlined
+                        : Icons.description_outlined,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      fileName,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                AttachmentPolicy.formatBytes(size),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Remove'),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Send'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Uploads the bytes first, then saves the message. Doing it in this order is
+  /// what keeps a media message from ever looking delivered before its file
+  /// exists; a cancelled or failed upload leaves no message behind.
+  Future<void> _sendAttachment({
+    required File file,
+    required String fileName,
+    required String mimeType,
+    required int size,
+  }) async {
+    final identity = ref.read(identityProvider).valueOrNull;
+    final chat = ref
+        .read(chatListProvider)
+        .valueOrNull
+        ?.where((c) => c.chatId == widget.chatId)
+        .firstOrNull;
+    if (identity == null || chat == null) {
+      _showError('Attachment cannot be sent right now.');
+      return;
+    }
+
+    // Uploads need Firebase Storage; BLE never carries media bytes, so an
+    // offline attempt would only leave an orphan. Say so instead.
+    if (ref.read(transportManagerProvider).mode != TransportMode.online) {
+      _showError(
+        'Attachments need an internet connection. Try again once BeChat is '
+        'online.',
+      );
+      return;
+    }
+
+    final messageId = 'msg-${_uuid.v4()}';
+    final storagePath = AttachmentPolicy.storagePath(
+      uploaderDeviceId: identity.deviceId,
+      messageId: messageId,
+    );
+    final progress = ValueNotifier<double>(0);
+    final navigator = Navigator.of(context, rootNavigator: true);
+    var cancelled = false;
+
+    unawaited(
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Sending attachment'),
+          content: ValueListenableBuilder<double>(
+            valueListenable: progress,
+            builder: (context, value, _) => Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(fileName, maxLines: 2, overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 12),
+                LinearProgressIndicator(
+                  value: value <= 0 ? null : value,
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '${(value * 100).round()}% of '
+                  '${AttachmentPolicy.formatBytes(size)}',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                cancelled = true;
+                unawaited(
+                  ref
+                      .read(mediaSendServiceProvider)
+                      .cancel(storagePath: storagePath),
+                );
+              },
+              child: const Text('Cancel'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    try {
+      final attachment = await ref
+          .read(mediaSendServiceProvider)
+          .upload(
+            file: file,
+            fileName: fileName,
+            mimeType: mimeType,
+            size: size,
+            messageId: messageId,
+            senderDeviceId: identity.deviceId,
+            onProgress: (value) => progress.value = value,
+          );
+      if (cancelled) {
+        await ref
+            .read(mediaSendServiceProvider)
+            .cancel(storagePath: storagePath);
+        return;
+      }
+
+      final now = DateTime.now();
+      final message = Message(
+        messageId: messageId,
+        chatId: widget.chatId,
+        senderId: identity.deviceId,
+        receiverId: chat.peerId,
+        content:
+            '${AttachmentPolicy.label(attachment.kind)}: '
+            '${attachment.fileName}',
+        messageType: attachment.isImage ? MessageType.image : MessageType.file,
+        timestamp: now,
+        status: MessageStatus.queued,
+        transport: MessageTransport.pending,
+        createdAt: now,
+        updatedAt: now,
+        attachment: attachment,
+      );
+      await ref
+          .read(messageListProvider(widget.chatId).notifier)
+          .sendMessage(message);
+      await ref.read(chatListProvider.notifier).refreshChats();
+      unawaited(
+        ref
+            .read(transportManagerProvider.notifier)
+            .onMessageQueued(chat.peerId),
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    } on MediaTransferCancelled {
+      _showError('Attachment cancelled.');
+    } catch (error) {
+      _showError(describeErrorForUser(error));
+    } finally {
+      if (navigator.canPop()) navigator.pop();
+      progress.dispose();
+    }
   }
 
   void _showError(String message) {
@@ -129,6 +462,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     BuildContext context,
     BleRuntimeState bleState,
     String? peerId,
+    TransportManagerState transport,
   ) {
     final theme = Theme.of(context);
     late final String message;
@@ -170,7 +504,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       width: double.infinity,
       color: background,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      child: Text(message, style: TextStyle(color: foreground, fontSize: 12)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            switch (transport.mode) {
+              TransportMode.online =>
+                'Online (Firebase) — messages send over Firestore.',
+              TransportMode.connecting => 'Connecting — checking Firebase…',
+              TransportMode.bluetooth =>
+                'Bluetooth — messages send over the BLE link.',
+              TransportMode.offline =>
+                'Offline / Pending — no transport available; messages stay '
+                    'queued.',
+            },
+            style: TextStyle(
+              color: foreground,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          // When online, the transport line already describes delivery — the BLE
+          // detail below would contradict it (messages are not going over BLE).
+          if (transport.mode != TransportMode.online)
+            Text(message, style: TextStyle(color: foreground, fontSize: 12)),
+        ],
+      ),
     );
   }
 
@@ -271,7 +630,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 ),
               ),
             ),
-          _buildBleBanner(context, bleState, chat?.peerId),
+          _buildBleBanner(
+            context,
+            bleState,
+            chat?.peerId,
+            ref.watch(transportManagerProvider),
+          ),
           Expanded(
             child: messagesAsync.when(
               data: (messages) {
@@ -373,35 +737,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         child: Row(
           children: [
             IconButton(
+              tooltip: 'Attach image, video or document',
               icon: const Icon(Icons.attach_file),
-              onPressed: () {
-                showModalBottomSheet(
-                  context: context,
-                  builder: (context) => SafeArea(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(height: 8),
-                        Container(
-                          width: 40,
-                          height: 4,
-                          decoration: BoxDecoration(
-                            color: Theme.of(context).colorScheme.outline,
-                            borderRadius: BorderRadius.circular(2),
-                          ),
-                        ),
-                        const Padding(
-                          padding: EdgeInsets.all(16),
-                          child: Text(
-                            'Media transfer will be available in a future phase.',
-                            style: TextStyle(color: Colors.grey),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
+              onPressed: _showAttachmentMenu,
             ),
             Expanded(
               child: TextField(
@@ -485,15 +823,21 @@ class MessageBubble extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            Text(
-              message.content,
-              style: TextStyle(
-                color: isMe
-                    ? Colors.white
-                    : Theme.of(context).colorScheme.onSurface,
-                fontSize: 15,
+            if (message.attachment != null)
+              AttachmentBubble(
+                attachment: message.attachment!,
+                isMe: isMe,
+              )
+            else
+              Text(
+                message.content,
+                style: TextStyle(
+                  color: isMe
+                      ? Colors.white
+                      : Theme.of(context).colorScheme.onSurface,
+                  fontSize: 15,
+                ),
               ),
-            ),
             const SizedBox(height: 2),
             Row(
               mainAxisSize: MainAxisSize.min,

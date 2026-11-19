@@ -86,6 +86,10 @@ class BleOutbox {
         _rerun.remove(peerId);
         final messages = await _repository.getQueuedOutgoingMessages(
           localDeviceId,
+          // Media stays queued for the online transport: a chunked BLE file
+          // transfer is a protocol change, and sending only the text label
+          // would look delivered while the file never arrived.
+          excludeAttachments: true,
         );
         for (final message in messages) {
           // Only this destination's messages: another peer's queue is drained
@@ -106,7 +110,10 @@ class BleOutbox {
     while (true) {
       if (!_isLinkUsable(peerId)) return;
       attempt++;
-      await _repository.markMessageSending(message.messageId);
+      // Atomic claim: if the online transport already owns this message,
+      // skip it here instead of sending it over both transports.
+      final claimed = await _repository.tryClaimForSending(message.messageId);
+      if (!claimed) return;
       await _onChanged(message.copyWith(status: MessageStatus.sending));
 
       try {

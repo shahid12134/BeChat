@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/ble/ble_routing_envelope.dart';
 import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
 import 'package:bechat/data/models/identity.dart';
@@ -612,6 +613,12 @@ class SecurePair {
         if (override != null) return override(payload);
         return BleAckResult.stored;
       },
+      onRoutingEnvelope: (envelope) async {
+        receivedEnvelopesOnA.add(envelope);
+        final override = onRoutingEnvelopeA;
+        if (override != null) return override(envelope);
+        return BleAckResult.stored;
+      },
       onClosed: closedErrorsA.add,
       ackPolicy: ackPolicy,
       handshakeTimeout: handshakeTimeout,
@@ -637,6 +644,12 @@ class SecurePair {
         receivedOnB.add(payload);
         final override = onMessageB;
         if (override != null) return override(payload);
+        return BleAckResult.stored;
+      },
+      onRoutingEnvelope: (envelope) async {
+        receivedEnvelopesOnB.add(envelope);
+        final override = onRoutingEnvelopeB;
+        if (override != null) return override(envelope);
         return BleAckResult.stored;
       },
       onClosed: closedErrorsB.add,
@@ -668,6 +681,15 @@ class SecurePair {
   /// or park persistence until it releases the returned future.
   Future<BleAckResult> Function(BleMessagePayload payload)? onMessageA;
   Future<BleAckResult> Function(BleMessagePayload payload)? onMessageB;
+
+  /// Routing-envelope counterparts of [onMessageA]/[onMessageB]: every
+  /// envelope is captured first, then handed to the optional override.
+  Future<BleAckResult> Function(BleRoutingEnvelope envelope)?
+  onRoutingEnvelopeA;
+  Future<BleAckResult> Function(BleRoutingEnvelope envelope)?
+  onRoutingEnvelopeB;
+  final List<BleRoutingEnvelope> receivedEnvelopesOnA = [];
+  final List<BleRoutingEnvelope> receivedEnvelopesOnB = [];
 
   /// B authorizes first, so its handle is created before A's.
   SecureSessionHandle get sessionBHandle => gateway.createdHandles[0];

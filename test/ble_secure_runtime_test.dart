@@ -19,13 +19,16 @@ import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/ble/ble_routing_envelope.dart';
 import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
 import 'package:bechat/core/ble/peer_presence.dart';
+import 'package:bechat/data/database/database_helper.dart';
 import 'package:bechat/data/models/app_settings.dart';
 import 'package:bechat/data/models/identity.dart';
 import 'package:bechat/data/models/message.dart';
 import 'package:bechat/data/models/peer.dart';
+import 'package:bechat/data/models/relay_queue_entry.dart';
 import 'package:bechat/data/repositories/app_settings_repository.dart';
 import 'package:bechat/data/repositories/chat_repository.dart';
 import 'package:bechat/data/repositories/identity_repository.dart';
@@ -589,6 +592,78 @@ void main() {
       expect(h.gateway.decryptHandles.length, decryptCalls);
     });
 
+    test('direct messages still work when the local routing identity is '
+        'unavailable', () async {
+      // The runtime's incoming message store opens DatabaseHelper's app
+      // database through sqflite's global factory, which plain flutter test
+      // never registers (sqfliteFfiInit only loads the Windows sqlite3 DLL).
+      databaseFactory = databaseFactoryFfi;
+      final h = await _SecureRuntimeHarness.create(
+        nullLocalRoutingIdentity: true,
+      );
+      addTearDown(h.dispose);
+      await h.seedPeer(publicKeyHex: _peerKeyHex);
+
+      h.createPeerSession(role: BleSecureRole.initiator);
+      await h.connectAsCentral();
+      await h.pumpUntil(
+        () => h.gateway.countFor(h.localDevice.deviceId, 'createSession') == 1,
+        reason: 'the link never became secure',
+      );
+      await h.finishSecureHandshake(peerIsInitiator: true);
+      expect(h.controller.state.isSecureReady, isTrue);
+
+      // The routing handler is constructed only for routing envelopes, so
+      // plain direct payloads must neither require nor notice the local
+      // routing identity.
+      expect(h.container.read(localDeviceIdProvider), isNull);
+
+      // Unique per run: the runtime's incoming pipeline persists through
+      // DatabaseHelper (the app database the store opens by default), whose
+      // file outlives the test run — unlike this harness's test database.
+      final messageId =
+          'in-direct-no-routing-id-${DateTime.now().microsecondsSinceEpoch}';
+      BleAckResult? ackResult;
+      Object? sendError;
+      unawaited(
+        h.peerSession!
+            .sendMessage(
+              Message(
+                messageId: messageId,
+                chatId: 'chat-direct',
+                senderId: h.peerDevice.deviceId,
+                receiverId: h.localDevice.deviceId,
+                content: 'direct without a routing identity',
+                timestamp: DateTime.now(),
+              ),
+            )
+            .then(
+              (result) {
+                ackResult = result;
+              },
+              onError: (Object error) {
+                sendError = error;
+              },
+            ),
+      );
+      await h.pumpUntil(
+        () => ackResult != null || sendError != null,
+        reason: 'the direct message never got an ACK',
+      );
+      expect(sendError, isNull);
+      expect(ackResult, BleAckResult.stored);
+
+      // The ACK is written only after durable storage, so the row must exist
+      // in the database the runtime's message store actually uses.
+      final rows = await (await DatabaseHelper.database).query(
+        'messages',
+        where: 'message_id = ?',
+        whereArgs: [messageId],
+        limit: 1,
+      );
+      expect(rows, hasLength(1));
+    });
+
     test('the local cryptographic identity is initialized exactly once and '
         'never re-provisioned', () async {
       final h = await _SecureRuntimeHarness.create();
@@ -736,6 +811,253 @@ void main() {
         );
       }
     });
+
+    test('a parked queued envelope is retried when a secure-ready link '
+        'becomes available', () async {
+      final envelopeId =
+          'retry-on-link-${DateTime.now().microsecondsSinceEpoch}';
+      final db = await _seedRelayQueue([
+        _parkedEntry(
+          envelopeId: envelopeId,
+          origin: _otherUuid,
+          destination: _retryDestinationUuid,
+          incomingPeer: _retryRelayUuid,
+        ),
+      ]);
+      final h = await _SecureRuntimeHarness.create();
+      addTearDown(h.dispose);
+      await h.seedPeer(publicKeyHex: _peerKeyHex);
+
+      final received = <BleRoutingEnvelope>[];
+      h.createPeerSession(
+        role: BleSecureRole.initiator,
+        onRoutingEnvelope: (envelope) async {
+          received.add(envelope);
+          return BleAckResult.stored;
+        },
+      );
+      await h.connectAsCentral();
+      await h.pumpUntil(
+        () => h.gateway.countFor(h.localDevice.deviceId, 'createSession') >= 1,
+        reason: 'the link never reached the handshake',
+      );
+      await h.finishSecureHandshake(peerIsInitiator: true);
+      expect(h.controller.state.isSecureReady, isTrue);
+
+      // No explicit retry call: the secure-ready publish itself triggers the
+      // sweep, exactly as a relay reconnecting unblocks parked envelopes.
+      await h.pumpUntil(
+        () async {
+          final rows = await db.query(
+            'relay_queue',
+            where: 'envelope_id = ?',
+            whereArgs: [envelopeId],
+            limit: 1,
+          );
+          return rows.isNotEmpty && rows.first['state'] == 'sent';
+        },
+        reason: 'the parked envelope was never retried after link-up',
+      );
+      expect(received, hasLength(1));
+      expect(received.single.envelopeId, envelopeId);
+    });
+
+    test('retry never bounces an envelope to the incoming peer or the origin',
+        () async {
+      final db = await _seedRelayQueue([
+        _parkedEntry(
+          envelopeId: 'retry-excl-incoming',
+          origin: _otherUuid,
+          destination: _retryDestinationUuid,
+          incomingPeer: _peerUuid, // the only link this test ever opens
+        ),
+        _parkedEntry(
+          envelopeId: 'retry-excl-origin',
+          origin: _peerUuid, // the origin IS the link's peer
+          destination: _retryDestinationUuid,
+          incomingPeer: _retryRelayUuid,
+        ),
+      ]);
+      final h = await _SecureRuntimeHarness.create();
+      addTearDown(h.dispose);
+      await h.seedPeer(publicKeyHex: _peerKeyHex);
+
+      final received = <BleRoutingEnvelope>[];
+      h.createPeerSession(
+        role: BleSecureRole.initiator,
+        onRoutingEnvelope: (envelope) async {
+          received.add(envelope);
+          return BleAckResult.stored;
+        },
+      );
+      await h.connectAsCentral();
+      await h.pumpUntil(
+        () => h.gateway.countFor(h.localDevice.deviceId, 'createSession') >= 1,
+        reason: 'the link never reached the handshake',
+      );
+      await h.finishSecureHandshake(peerIsInitiator: true);
+
+      // Explicit sweep over a secure-ready link: both entries are backoff-
+      // eligible, so any send would have to happen now.
+      await h.controller.retryRelayQueue();
+      for (var i = 0; i < 5; i++) {
+        await h.pump();
+      }
+
+      expect(
+        received,
+        isEmpty,
+        reason: 'the link is both the incoming peer and an origin — excluded',
+      );
+      final rows = await db.query('relay_queue', orderBy: 'envelope_id');
+      expect(rows, hasLength(2));
+      for (final row in rows) {
+        // No eligible hop means no attempt was burned and nothing changed.
+        expect(row['state'], 'queued', reason: '${row['envelope_id']}');
+        expect(row['attempts'], 0, reason: '${row['envelope_id']}');
+      }
+    });
+
+    test('a retry sends the stored envelope bytes without incrementing '
+        'hopCount', () async {
+      final envelopeId =
+          'retry-no-hopcount-${DateTime.now().microsecondsSinceEpoch}';
+      final db = await _seedRelayQueue([
+        _parkedEntry(
+          envelopeId: envelopeId,
+          origin: _otherUuid,
+          destination: _retryDestinationUuid,
+          incomingPeer: _retryRelayUuid,
+          hopCount: 2, // already forwarded twice upstream
+        ),
+      ]);
+      final h = await _SecureRuntimeHarness.create();
+      addTearDown(h.dispose);
+      await h.seedPeer(publicKeyHex: _peerKeyHex);
+
+      final received = <BleRoutingEnvelope>[];
+      h.createPeerSession(
+        role: BleSecureRole.initiator,
+        onRoutingEnvelope: (envelope) async {
+          received.add(envelope);
+          return BleAckResult.stored;
+        },
+      );
+      await h.connectAsCentral();
+      await h.pumpUntil(
+        () => h.gateway.countFor(h.localDevice.deviceId, 'createSession') >= 1,
+        reason: 'the link never reached the handshake',
+      );
+      await h.finishSecureHandshake(peerIsInitiator: true);
+
+      final retry = h.controller.retryRelayQueue();
+      await h.pumpUntil(
+        () async {
+          final rows = await db.query(
+            'relay_queue',
+            where: 'envelope_id = ?',
+            whereArgs: [envelopeId],
+            limit: 1,
+          );
+          return rows.isNotEmpty && rows.first['state'] == 'sent';
+        },
+        reason: 'the retry never completed',
+      );
+      await retry;
+
+      expect(received, hasLength(1));
+      expect(
+        received.single.hopCount,
+        2,
+        reason: 'retry must send stored bytes as-is, never forward() again',
+      );
+      final rows = await db.query(
+        'relay_queue',
+        where: 'envelope_id = ?',
+        whereArgs: [envelopeId],
+        limit: 1,
+      );
+      expect(rows.first['hop_count'], 2);
+    });
+
+    test('a reconnect waits for the previous teardown of the same device '
+        'before touching the GATT layer again', () async {
+      final h = await _SecureRuntimeHarness.create();
+      addTearDown(h.dispose);
+      await h.seedPeer(publicKeyHex: null);
+
+      // Count connects directly: mockito verify() consumes matched calls,
+      // so it cannot observe the same call twice.
+      var connectCalls = 0;
+      when(h.central.connect(any)).thenAnswer((invocation) async {
+        connectCalls++;
+        if (connectCalls > 1) {
+          throw Exception('reconnect probe');
+        }
+        final p = invocation.positionalArguments.first as Peripheral;
+        h.connections.add(
+          PeripheralConnectionStateChangedEventArgs(p, ConnectionState.connected),
+        );
+      });
+
+      h.createPeerSession(role: BleSecureRole.initiator);
+      await h.connectAsCentral();
+      expect(connectCalls, 1);
+
+      // Hold the disconnect open so the previous GATT instance for this
+      // address is still tearing down when the user retries.
+      var disconnectStarted = false;
+      final release = Completer<void>();
+      when(h.central.disconnect(any)).thenAnswer((_) {
+        disconnectStarted = true;
+        return release.future;
+      });
+      final closing = h.controller.disconnect();
+      await h.pumpUntil(
+        () => disconnectStarted,
+        reason: 'the disconnect never started',
+      );
+
+      // A fresh scan repopulates the candidate map that the successful link
+      // had dropped (the user scans again after a link goes away), while the
+      // previous teardown for this address is still in flight.
+      await h.controller.startScan();
+      h.discovered.add(
+        DiscoveredEventArgs(
+          h.peerPeripheral,
+          -60,
+          Advertisement(
+            name: _helloName,
+            serviceUUIDs: [UUID.fromString(BleProtocol.serviceUuid)],
+          ),
+        ),
+      );
+      await h.pumpUntil(
+        () => h.controller.state.candidates.isNotEmpty,
+        reason: 'the candidate never returned',
+      );
+
+      // The retry must queue behind the teardown instead of overwriting the
+      // plugin's address-keyed GATT state (the status-1 descriptor failure).
+      final reconnect = h.controller.connectToCandidate(_peerUuid);
+      for (var i = 0; i < 5; i++) {
+        await h.pump();
+      }
+      expect(connectCalls, 1, reason: 'reconnect started during teardown');
+
+      release.complete();
+      await closing;
+      expect(await reconnect, isNull);
+      expect(
+        connectCalls,
+        2,
+        reason:
+            'reconnect never ran after teardown; '
+            'error=${h.controller.state.error} '
+            'candidates=${h.controller.state.candidates.map((c) => c.id)} '
+            'links=${h.controller.state.links}',
+      );
+    });
   });
 }
 
@@ -800,6 +1122,78 @@ bool _containsBytes(List<int> hay, List<int> needle) {
 }
 
 // ---------------------------------------------------------------------------
+// Relay-queue seeding for retry tests (Phase 3D.2B).
+// ---------------------------------------------------------------------------
+
+// Parked envelopes are addressed to/from devices this harness never links;
+// only the incoming/origin ids are chosen per test (UUID-formatted, like
+// every authenticated id in this suite).
+const _retryRelayUuid = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+const _retryDestinationUuid = 'cccccccc-dddd-4eee-8fff-000000000000';
+
+/// Builds a queue row as a completed background forward leaves it: stored
+/// bytes from an already-forwarded envelope, an authenticated incoming peer,
+/// and an `updated_at` old enough that any backoff window has elapsed.
+RelayQueueEntry _parkedEntry({
+  required String envelopeId,
+  required String origin,
+  required String destination,
+  required String incomingPeer,
+  int hopCount = 1,
+}) {
+  final created = DateTime.now().toUtc().subtract(const Duration(minutes: 5));
+  const content = 'retry';
+  final envelope = BleRoutingEnvelope(
+    envelopeId: envelopeId,
+    originDeviceId: origin,
+    destinationDeviceId: destination,
+    createdAt: created,
+    expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+    hopLimit: 5,
+    hopCount: hopCount,
+    payload: BleMessagePayload(
+      metadata: BleMessageMetadata(
+        messageId: 'msg-$envelopeId',
+        senderId: origin,
+        receiverId: destination,
+        messageType: MessageType.text.name,
+        timestamp: DateTime.utc(2026, 4, 5, 6, 7),
+        ttl: 3600,
+        contentLength: content.length,
+        isEncrypted: false,
+      ),
+      content: content,
+    ).encode(),
+  );
+  return RelayQueueEntry(
+    envelopeId: envelopeId,
+    envelope: envelope.encode(),
+    originDeviceId: origin,
+    destinationDeviceId: destination,
+    incomingPeerDeviceId: incomingPeer,
+    expiresAt: envelope.expiresAt,
+    hopLimit: 5,
+    hopCount: hopCount,
+    createdAt: created,
+    updatedAt: created,
+  );
+}
+
+/// Clears and seeds the relay queue in the app database the routing handler
+/// actually reads (DatabaseHelper — a file that outlives each test run) and
+/// returns it for assertions.
+Future<Database> _seedRelayQueue(List<RelayQueueEntry> entries) async {
+  // plain flutter test never registers sqflite's global factory.
+  databaseFactory = databaseFactoryFfi;
+  final db = await DatabaseHelper.database;
+  await db.delete('relay_queue');
+  for (final entry in entries) {
+    await db.insert('relay_queue', entry.toMap());
+  }
+  return db;
+}
+
+// ---------------------------------------------------------------------------
 // Harness: one real runtime + real database, faked platform layer.
 // ---------------------------------------------------------------------------
 
@@ -810,6 +1204,7 @@ class _SecureRuntimeHarness {
     bool initializeIdentity = true,
     Uint8List? peerKey,
     Duration linkHandshakeTimeout = const Duration(seconds: 2),
+    bool nullLocalRoutingIdentity = false,
   }) async {
     final h = _SecureRuntimeHarness._();
     h.db = await openTestDatabase();
@@ -843,39 +1238,43 @@ class _SecureRuntimeHarness {
     );
 
     h._stubManagers();
-    h.container = ProviderContainer(
-      overrides: [
-        identityRepositoryProvider.overrideWithValue(h.identityRepository),
-        peerRepositoryProvider.overrideWithValue(h.peerRepository),
-        chatRepositoryProvider.overrideWithValue(h.chatRepository),
-        messageRepositoryProvider.overrideWithValue(h.messageRepository),
-        appSettingsRepositoryProvider.overrideWithValue(h.settings),
-        backgroundBleServiceProvider.overrideWithValue(h.background),
-        secureSessionGatewayProvider.overrideWithValue(h.gateway),
-        identityInitializationCoordinatorProvider.overrideWithValue(
-          IdentityInitializationCoordinator(
-            repository: h.identityRepository,
-            nativeIdentity: h.nativeIdentity,
-            ensureDatabase: () async {},
-            isSupportedPlatform: () => true,
-          ),
+    final overrides = <Override>[
+      identityRepositoryProvider.overrideWithValue(h.identityRepository),
+      peerRepositoryProvider.overrideWithValue(h.peerRepository),
+      chatRepositoryProvider.overrideWithValue(h.chatRepository),
+      messageRepositoryProvider.overrideWithValue(h.messageRepository),
+      appSettingsRepositoryProvider.overrideWithValue(h.settings),
+      backgroundBleServiceProvider.overrideWithValue(h.background),
+      secureSessionGatewayProvider.overrideWithValue(h.gateway),
+      identityInitializationCoordinatorProvider.overrideWithValue(
+        IdentityInitializationCoordinator(
+          repository: h.identityRepository,
+          nativeIdentity: h.nativeIdentity,
+          ensureDatabase: () async {},
+          isSupportedPlatform: () => true,
         ),
-        bleRuntimeProvider.overrideWith(
-          (ref) => BleRuntimeController(
-            ref,
-            centralManager: h.central,
-            peripheralManager: h.peripheral,
-            statusProbe: _FakeStatusProbe(_grantedBleStatus()),
-            isAndroidOverride: true,
-            availabilityEnabled: true,
-            candidateExpiration: const Duration(seconds: 60),
-            candidateCleanupInterval: const Duration(seconds: 60),
-            linkHandshakeTimeout: linkHandshakeTimeout,
-            backgroundBleService: h.background,
-          ),
+      ),
+      bleRuntimeProvider.overrideWith(
+        (ref) => BleRuntimeController(
+          ref,
+          centralManager: h.central,
+          peripheralManager: h.peripheral,
+          statusProbe: _FakeStatusProbe(_grantedBleStatus()),
+          isAndroidOverride: true,
+          availabilityEnabled: true,
+          candidateExpiration: const Duration(seconds: 60),
+          candidateCleanupInterval: const Duration(seconds: 60),
+          linkHandshakeTimeout: linkHandshakeTimeout,
+          backgroundBleService: h.background,
         ),
-      ],
-    );
+      ),
+    ];
+    // A test can flip the local routing identity off before the container is
+    // built (riverpod forbids adding overrides to a live container).
+    if (nullLocalRoutingIdentity) {
+      overrides.add(localDeviceIdProvider.overrideWithValue(null));
+    }
+    h.container = ProviderContainer(overrides: overrides);
     h.controller = h.container.read(bleRuntimeProvider.notifier);
     if (initializeIdentity) await h.initializeIdentity();
     return h;
@@ -1045,6 +1444,8 @@ class _SecureRuntimeHarness {
     bool secure = true,
     Uint8List? pinnedRemotePublicKey,
     Duration handshakeTimeout = const Duration(seconds: 5),
+    Future<BleAckResult> Function(BleRoutingEnvelope envelope)?
+    onRoutingEnvelope,
   }) {
     final identity = Identity(
       deviceId: peerDevice.deviceId,
@@ -1056,6 +1457,7 @@ class _SecureRuntimeHarness {
       identity: identity,
       onHello: (_) async {},
       onMessage: (message) async => BleAckResult.stored,
+      onRoutingEnvelope: onRoutingEnvelope,
       handshakeTimeout: handshakeTimeout,
       secure: secure
           ? BleSecureSessionConfig(

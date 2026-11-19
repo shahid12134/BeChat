@@ -1,0 +1,68 @@
+rules_version = '2';
+
+// Firebase Storage rules for BeChat attachments.
+//
+// Layout is deliberately not user-controlled: every object lives at
+//   attachments/{uploaderUid}/{messageId}
+// so an uploader can only write under their own UID, and a recipient can only
+// read an object belonging to an accepted contact. There is no public path and
+// no permanent download URL is required: the app downloads through the
+// authenticated Storage API (or an authenticated REST read).
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Same sorted-pair id `firestore.rules` uses, so the accepted-contact
+    // check here reads the exact same document.
+    function pairId(a, b) {
+      return a < b ? a + '.' + b : b + '.' + a;
+    }
+
+    function acceptedBetween(a, b) {
+      return firestore.get(
+        /databases/(default)/documents/connectionRequests/$(pairId(a, b))
+      ).data.status == 'accepted';
+    }
+
+    function allowedType(contentType) {
+      return contentType in [
+        'image/jpeg', 'image/png', 'image/webp',
+        'video/mp4', 'video/quicktime',
+        'application/pdf', 'text/plain', 'text/csv',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/zip'
+      ];
+    }
+
+    match /attachments/{ownerUid}/{messageId} {
+      // Only the two ends of an accepted connection may read the bytes: the
+      // uploader itself, or the peer whose request with them is 'accepted'.
+      allow read: if signedIn()
+        && (request.auth.uid == ownerUid
+            || acceptedBetween(ownerUid, request.auth.uid));
+
+      // Only the owning account may write, only to its own folder, only an
+      // allowed type and only up to the hard 50 MB ceiling. Per-kind limits
+      // (10/20/50 MB) are enforced again on the Firestore message metadata,
+      // which is what a reader trusts.
+      allow create, update: if signedIn()
+        && request.auth.uid == ownerUid
+        && request.resource.size > 0
+        && request.resource.size <= 52428800
+        && allowedType(request.resource.contentType);
+
+      allow delete: if signedIn() && request.auth.uid == ownerUid;
+    }
+
+    // Nothing else in the bucket is reachable by clients.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

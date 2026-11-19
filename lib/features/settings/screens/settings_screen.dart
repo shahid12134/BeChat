@@ -11,6 +11,7 @@ import 'package:bechat/providers/message_providers.dart';
 import 'package:bechat/providers/peer_providers.dart';
 import 'package:bechat/providers/settings_providers.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/core/utils/error_formatter.dart';
 import 'package:bechat/services/ble/ble_runtime.dart';
 import 'package:bechat/services/crypto/identity_initialization_coordinator.dart';
 
@@ -113,10 +114,19 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         leading: CircleAvatar(child: Icon(Icons.person)),
         title: Text('Loading...'),
       ),
-      error: (e, _) => ListTile(
-        leading: const CircleAvatar(child: Icon(Icons.error)),
+      error: (e, st) => ExpansionTile(
+        leading: const Icon(Icons.error),
         title: const Text('Error loading profile'),
-        subtitle: Text('$e'),
+        subtitle: Text(describeErrorForUser(e)),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: SelectableText(
+              describeErrorDiagnostics(e, st),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -320,7 +330,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
           error: (e, _) => Padding(
             padding: const EdgeInsets.all(16),
-            child: Text('Error: $e'),
+            child: Text('Could not read the database: '
+                '${describeErrorForUser(e)}'),
           ),
         ),
       ],
@@ -416,7 +427,10 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               } catch (e) {
                 if (context.mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Failed to clear data: $e')),
+                    SnackBar(
+                      content: Text('Failed to clear data: '
+                          '${describeErrorForUser(e)}'),
+                    ),
                   );
                 }
               }

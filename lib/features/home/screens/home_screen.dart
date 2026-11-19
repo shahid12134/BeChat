@@ -8,6 +8,7 @@ import 'package:bechat/features/peers/widgets/incoming_request_dialog.dart';
 import 'package:bechat/features/settings/screens/settings_screen.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/providers/chat_providers.dart';
+import 'package:bechat/providers/online_providers.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -45,6 +46,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen>
       unawaited(ble.pauseForBackground());
     } else if (state == AppLifecycleState.resumed) {
       unawaited(ble.resumeFromBackground());
+      // Reset the connectivity monitor's backoff and probe immediately.
+      ref.read(transportManagerProvider.notifier).onForeground();
     }
   }
 

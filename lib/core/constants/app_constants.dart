@@ -2,7 +2,7 @@ class AppConstants {
   static const String appName = 'BeChat';
   static const String appVersion = '1.0.0';
   static const String databaseName = 'bechat.db';
-  static const int databaseVersion = 4;
+  static const int databaseVersion = 7;
 
   // Persistent application settings.
   static const String settingBleEnabled = 'ble_enabled';
@@ -30,6 +30,43 @@ class AppConstants {
 
   static const int maxMessageLength = 4096;
   static const int defaultPageSize = 50;
+
+  // ---------------------------------------------------------------------
+  // Media transfer. Every limit lives here so it can be changed in one place;
+  // `attachment_policy.dart`, the Firestore rules and the Storage rules all
+  // mirror these numbers.
+  // ---------------------------------------------------------------------
+  static const int maxImageBytes = 10 * 1024 * 1024;
+  static const int maxVideoBytes = 50 * 1024 * 1024;
+  static const int maxDocumentBytes = 20 * 1024 * 1024;
+
+  /// Hard ceiling used by the Storage rules (the largest per-kind limit).
+  static const int maxAttachmentBytes = maxVideoBytes;
+
+  /// Storage prefix; the full path is `attachments/{uploaderUid}/{messageId}`.
+  static const String mediaStoragePrefix = 'attachments';
+
+  static const List<String> imageMimeTypes = [
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+  ];
+
+  static const List<String> videoMimeTypes = ['video/mp4', 'video/quicktime'];
+
+  static const List<String> documentMimeTypes = [
+    'application/pdf',
+    'text/plain',
+    'text/csv',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/zip',
+  ];
+
+  /// Bounded filename length; names are display-only and never used in paths.
+  static const int maxFileNameLength = 120;
 
   /// Noise suite used for the persistent cryptographic identity. Stored with
   /// the public identity metadata so a future algorithm change is detectable;

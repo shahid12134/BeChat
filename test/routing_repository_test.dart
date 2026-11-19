@@ -11,6 +11,7 @@ RelayQueueEntry buildEntry({
   String envelopeId = 'env-1',
   String origin = 'device-a',
   String destination = 'device-b',
+  String? incomingPeer,
   int hopLimit = 5,
   int hopCount = 1,
   DateTime? expiresAt,
@@ -22,6 +23,7 @@ RelayQueueEntry buildEntry({
     envelope: Uint8List.fromList([0x52, 3, 1, 0]),
     originDeviceId: origin,
     destinationDeviceId: destination,
+    incomingPeerDeviceId: incomingPeer,
     expiresAt: expiresAt ?? created.add(const Duration(hours: 1)),
     hopLimit: hopLimit,
     hopCount: hopCount,
@@ -209,6 +211,27 @@ void main() {
       final read = await reopened.findByEnvelopeId('env-persist');
       expect(read, isNotNull);
       expect(read!.envelope, Uint8List.fromList([0x52, 3, 1, 0]));
+    });
+
+    test('the authenticated incoming peer is persisted and restored',
+        () async {
+      final entry = buildEntry(
+        envelopeId: 'env-incoming',
+        incomingPeer: 'device-relay',
+      );
+      await repository().enqueue(entry);
+
+      // Read back through a fresh instance: the v6 column round-trips, and a
+      // row without one still restores as null instead of failing.
+      final read = await RoutingRepository(
+        database: () async => db,
+      ).findByEnvelopeId('env-incoming');
+      expect(read, isNotNull);
+      expect(read!.incomingPeerDeviceId, 'device-relay');
+
+      await repository().enqueue(buildEntry(envelopeId: 'env-legacy'));
+      final legacy = await repository().findByEnvelopeId('env-legacy');
+      expect(legacy!.incomingPeerDeviceId, isNull);
     });
   });
 }

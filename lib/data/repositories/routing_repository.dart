@@ -103,6 +103,53 @@ class RoutingRepository {
     });
   }
 
+  /// Records [entry.envelopeId] in the dedup ledger AND parks the envelope in
+  /// the relay queue inside ONE transaction, so a crash can never leave a seen
+  /// row without its queue row — the state the old two-transaction sequence
+  /// produced, which stranded the envelope as a "duplicate" forever with
+  /// nothing to retry. Both inserts commit or roll back together; the ledger
+  /// row's expiry comes from the envelope itself ([RelayQueueEntry.expiresAt]),
+  /// not a default TTL.
+  ///
+  /// Returns `true` when the envelope was newly accepted. When the id was
+  /// already seen, `false` is returned: an existing-but-missing queue row is
+  /// repaired from [entry] (the legacy crash window) so its bytes are parked
+  /// and recoverable by the future retry loop, but the copy is not treated as
+  /// new or re-forwarded here.
+  Future<bool> recordSeenAndEnqueue(RelayQueueEntry entry) async {
+    final db = await _db;
+    final map = entry.toMap();
+    final now = TimestampUtils.nowUtcIso8601();
+    return db.transaction((txn) async {
+      final existing = await txn.query(
+        'seen_messages',
+        columns: ['envelope_id'],
+        where: 'envelope_id = ?',
+        whereArgs: [map['envelope_id']],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        await txn.insert(
+          'relay_queue',
+          map,
+          conflictAlgorithm: ConflictAlgorithm.ignore,
+        );
+        return false;
+      }
+      await txn.insert('seen_messages', {
+        'envelope_id': map['envelope_id'],
+        'first_seen_at': now,
+        'expires_at': map['expires_at'],
+      });
+      await txn.insert(
+        'relay_queue',
+        map,
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+      return true;
+    });
+  }
+
   /// Reads one queued envelope by id, or `null` when absent.
   Future<RelayQueueEntry?> findByEnvelopeId(String envelopeId) async {
     final db = await _db;
@@ -114,6 +161,22 @@ class RoutingRepository {
     );
     if (rows.isEmpty) return null;
     return RelayQueueEntry.fromMap(rows.first);
+  }
+
+  /// Envelopes a retry sweep may consider at [now]: `queued` or `failed`,
+  /// and not expired.
+  ///
+  /// Expiry is filtered here so no caller can even see a dead envelope —
+  /// "expired is never retried" holds whatever state the row is in.
+  Future<List<RelayQueueEntry>> findPending(DateTime now) async {
+    final db = await _db;
+    final rows = await db.query(
+      'relay_queue',
+      where: "state IN ('queued', 'failed') AND expires_at > ?",
+      whereArgs: [TimestampUtils.toUtcIso8601(now)],
+      orderBy: 'created_at',
+    );
+    return rows.map(RelayQueueEntry.fromMap).toList();
   }
 
   /// All queued envelopes whose expiry is at or before [now] — the entries a

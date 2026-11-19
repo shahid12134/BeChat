@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:bechat/core/utils/timestamp_utils.dart';
+import 'package:bechat/data/models/attachment.dart';
 
 enum MessageType { text, image, file, system }
 
@@ -22,6 +25,11 @@ class Message {
   final DateTime? createdAt;
   final DateTime? updatedAt;
 
+  /// Attachment metadata for a media message. The bytes themselves live in
+  /// Firebase Storage (online) — never in SQLite or a Firestore field — and
+  /// this metadata travels with the message through the existing queue.
+  final Attachment? attachment;
+
   const Message({
     this.id,
     required this.messageId,
@@ -37,9 +45,12 @@ class Message {
     this.isEncrypted = false,
     this.createdAt,
     this.updatedAt,
+    this.attachment,
   });
 
   bool isSentBy(String localDeviceId) => senderId == localDeviceId;
+
+  bool get hasAttachment => attachment != null;
 
   Message copyWith({
     String? id,
@@ -56,6 +67,8 @@ class Message {
     bool? isEncrypted,
     DateTime? createdAt,
     DateTime? updatedAt,
+    Attachment? attachment,
+    bool clearAttachment = false,
   }) {
     return Message(
       id: id ?? this.id,
@@ -72,6 +85,7 @@ class Message {
       isEncrypted: isEncrypted ?? this.isEncrypted,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
+      attachment: clearAttachment ? null : (attachment ?? this.attachment),
     );
   }
 
@@ -84,6 +98,7 @@ class Message {
       'receiver_id': receiverId,
       'content': content,
       'message_type': messageType.name,
+      'attachment_json': attachment == null ? null : jsonEncode(attachment!.toJson()),
       'timestamp': TimestampUtils.toUtcIso8601(timestamp),
       'status': status.name,
       'transport': transport.name,
@@ -109,6 +124,9 @@ class Message {
       messageType: MessageType.values.firstWhere(
         (e) => e.name == map['message_type'],
         orElse: () => MessageType.text,
+      ),
+      attachment: Attachment.tryFromJsonString(
+        map['attachment_json'] as String?,
       ),
       timestamp: DateTime.parse(map['timestamp'] as String),
       status: MessageStatus.values.firstWhere(

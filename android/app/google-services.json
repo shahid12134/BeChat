@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "965495189894",
+    "project_id": "bechat-43a4f",
+    "storage_bucket": "bechat-43a4f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:965495189894:android:e98dc5436f8654994abc07",
+        "android_client_info": {
+          "package_name": "com.bechat.bechat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCmA8_2LJLlz_ypXlQIaogaUKMKNtmVQ4Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

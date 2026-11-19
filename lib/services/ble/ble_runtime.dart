@@ -1,14 +1,15 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:bechat/core/ble/ble_link_phase.dart';
 import 'package:bechat/core/ble/ble_link_session.dart';
 import 'package:bechat/core/ble/ble_protocol.dart';
+import 'package:bechat/core/ble/ble_routing_envelope.dart';
 import 'package:bechat/core/ble/ble_secure_protocol.dart';
 import 'package:bechat/core/ble/ble_transport.dart';
 import 'package:bechat/core/ble/peer_presence.dart';
 import 'package:bechat/core/constants/app_constants.dart';
+import 'package:bechat/core/utils/error_formatter.dart';
 import 'package:bechat/core/utils/key_format.dart';
 import 'package:bechat/data/models/ble_candidate.dart';
 import 'package:bechat/data/models/identity.dart';
@@ -25,6 +26,8 @@ import 'package:bechat/providers/background_service_provider.dart';
 import 'package:bechat/services/background/background_ble_service.dart';
 import 'package:bechat/services/crypto/identity_initialization_coordinator.dart';
 import 'package:bechat/services/crypto/native_secure_session_service.dart';
+import 'package:bechat/core/ble/ble_routing_handler.dart';
+import 'package:bechat/data/repositories/routing_repository.dart';
 import 'package:bechat/services/ble/ble_gatt_operation_gate.dart';
 import 'package:bechat/services/ble/ble_link_manager.dart';
 import 'package:bechat/services/ble/ble_message_store.dart';
@@ -34,6 +37,7 @@ import 'package:bechat/services/ble/ble_status_probe.dart';
 import 'package:bechat/services/ble/incoming_connection_policy.dart';
 import 'package:bechat/services/ble/incoming_connection_request.dart';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
@@ -421,6 +425,12 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   Timer? _scanTimer;
   Timer? _candidateCleanupTimer;
 
+  /// Periodic safety net for parked relay envelopes whose retry needs no new
+  /// link event (Phase 3D.2B). Half the 60s backoff cap, so an eligible
+  /// envelope waits at most ~90s for a tick.
+  static const Duration _relayRetryInterval = Duration(seconds: 30);
+  Timer? _relayRetryTimer;
+
   /// Every managed link, keyed by BLE device address. All per-link state
   /// (session, gate, presence, timers, pending writes, peer binding) lives
   /// on the [BlePeerLink] itself, so one peer's lifecycle never mutates
@@ -452,6 +462,17 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   /// a second connect attempt cannot race a link that is not established yet.
   final Set<String> _linkEstablishing = {};
 
+  /// Central disconnects in flight, keyed by device address. The Android
+  /// plugin keys every GATT callback map by address and `connectGatt`
+  /// overwrites the previous instance without closing it, so a connect issued
+  /// before the previous teardown finishes receives the obsolete connection's
+  /// callbacks — surfacing as "Write descriptor failed with status: 1" on
+  /// reconnect. Every connect waits for its device's teardown first.
+  /// shortcut: a native disconnect that never reports back is bounded by
+  /// gattTeardownTimeout only; if Android wedges deeper than that, the
+  /// upgrade path is patching the plugin's address-keyed callback maps.
+  final Map<String, Future<void>> _centralTeardowns = {};
+
   Future<void>? _startFuture;
   Future<void>? _availabilityOperation;
   int _availabilityRevision = 0;
@@ -475,6 +496,127 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   /// views: the most recently established link. Purely a publication choice —
   /// real per-peer truth lives in [_links] and [state.links].
   String? _primaryLinkId;
+
+  /// Routing handler for multi-hop envelope processing.
+  ///
+  /// Initialized lazily on first use to avoid database dependency during
+  /// construction. The forward callback selects an eligible next-hop peer and
+  /// sends the envelope over their link.
+  BleRoutingHandler? _routingHandler;
+
+  /// Gets or creates the routing handler with the forward callback bound to
+  /// this runtime.
+  BleRoutingHandler _getRoutingHandler() {
+    if (_routingHandler != null) return _routingHandler!;
+    final localDeviceId = _ref.read(localDeviceIdProvider);
+    if (localDeviceId == null) {
+      throw const BleLinkException('Local device ID not available');
+    }
+    final repository = RoutingRepository();
+    _routingHandler = BleRoutingHandler(
+      routingRepository: repository,
+      localDeviceId: localDeviceId,
+      forward: _forwardEnvelope,
+    );
+    return _routingHandler!;
+  }
+
+  /// Forward callback for the routing handler: selects the next hop and
+  /// sends the envelope over their link, returning (outcome, next hop).
+  ///
+  /// Queue and dedup persistence live in [BleRoutingHandler]; this method is
+  /// deliberately storage-free so every queue write happens in the one class
+  /// that owns the repository. Never routes back to the origin or to the peer
+  /// the envelope arrived from, and only over secure-ready links.
+  Future<(BleRoutingResult, String?)> _forwardEnvelope(
+    BleRoutingEnvelope envelope,
+    String incomingPeerId,
+  ) async {
+    final originId = envelope.originDeviceId;
+    BlePeerLink? nextHopLink;
+
+    for (final link in _links.links.values) {
+      if (!isForwardCandidate(
+        link.peerId,
+        originId: originId,
+        incomingPeerId: incomingPeerId,
+      )) {
+        continue;
+      }
+      if (link.phase != BleLinkPhase.secureReady) continue;
+      if (link.session == null || !link.session!.isReady) continue;
+
+      nextHopLink = link;
+      break;
+    }
+
+    if (nextHopLink == null) {
+      // No eligible hop right now: reported as failure so the handler parks
+      // the envelope (state=failed, bytes intact) for the future retry loop.
+      return (BleRoutingResult.rejected, null);
+    }
+
+    // Send the envelope over the next hop's link as a Noise-encrypted
+    // secureMessage carrying the routing envelope (Phase 3D.1). A rejected
+    // ACK or a transport error is never reported as successful forwarding.
+    try {
+      final ackResult = await _sendRawOverSecureLink(nextHopLink, envelope);
+      if (ackResult == BleAckResult.rejected) {
+        return (BleRoutingResult.rejected, nextHopLink.peerId);
+      }
+    } catch (_) {
+      return (BleRoutingResult.rejected, nextHopLink.peerId);
+    }
+    return (BleRoutingResult.queuedForForward, nextHopLink.peerId);
+  }
+
+  /// Pure next-hop identity exclusion: a link bound to [peerId] may carry a
+  /// forward only when that peer is neither the envelope's origin nor the
+  /// peer the envelope arrived from — the two identities that would bounce
+  /// the envelope straight back. Readiness (secure-ready phase, live
+  /// session) is checked separately by the caller.
+  static bool isForwardCandidate(
+    String? peerId, {
+    required String originId,
+    required String incomingPeerId,
+  }) {
+    if (peerId == null) return false;
+    if (peerId == originId) return false;
+    if (peerId == incomingPeerId) return false;
+    return true;
+  }
+
+  /// Sends a routing envelope over a secure link's session.
+  ///
+  /// Requires a confirmed secure session (no plaintext fallback) and returns
+  /// the next hop's actual ACK result, so a rejected envelope is visible to
+  /// the caller instead of looking like a successful forward.
+  Future<BleAckResult> _sendRawOverSecureLink(
+    BlePeerLink link,
+    BleRoutingEnvelope envelope,
+  ) async {
+    final session = link.session;
+    if (session == null || session.secure == null || !session.isSecureReady) {
+      throw const BleLinkException('Secure link not ready');
+    }
+    return session.sendEnvelope(envelope);
+  }
+
+  /// One persistent-retry sweep over the relay queue (Phase 3D.2B).
+  ///
+  /// Triggered after runtime/database init, whenever a link becomes
+  /// secure-ready, and periodically while active — callers fire and forget
+  /// it. Never throws, and without a local routing identity there is nothing
+  /// to retry yet.
+  Future<void> retryRelayQueue() async {
+    if (_disposed) return;
+    if (_ref.read(localDeviceIdProvider) == null) return;
+    try {
+      await _getRoutingHandler().retryPending(now: _clock());
+    } catch (_) {
+      // The next trigger (init, a secure link, or the periodic timer) retries.
+    }
+  }
 
   /// The link bound to [peerId], if this device currently holds one.
   BlePeerLink? _linkFor(String peerId) => _links.byPeerId(peerId);
@@ -976,6 +1118,9 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         clearError: true,
       );
       await _resetOutbox();
+      // Parked envelopes from a previous run may already be retryable.
+      unawaited(retryRelayQueue());
+      _ensureRelayRetryTimer();
       await _syncBackgroundServiceForState(startIfNeeded: true);
     } on BleStatusProbeException catch (error) {
       _setState(
@@ -1332,6 +1477,14 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     );
   }
 
+  /// Starts the periodic relay-queue retry sweep once, at runtime init.
+  void _ensureRelayRetryTimer() {
+    if (_relayRetryTimer != null) return;
+    _relayRetryTimer = Timer.periodic(_relayRetryInterval, (_) {
+      unawaited(retryRelayQueue());
+    });
+  }
+
   void _expireCandidates() {
     if (_disposed) return;
     final now = _clock();
@@ -1439,12 +1592,22 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _connectionWaiters[linkId] = waiter;
     unawaited(waiter.future.catchError((Object _) {}));
     try {
+      // Never overlap a new connect with this device's previous teardown:
+      // the Android plugin routes GATT callbacks by address, so the old
+      // instance's late callbacks would complete this connection's
+      // operations (the observed "Write descriptor failed with status: 1").
+      final teardown = _centralTeardowns[linkId];
+      if (teardown != null) {
+        await teardown;
+      }
       await _central.connect(peripheral).timeout(const Duration(seconds: 15));
       await waiter.future.timeout(const Duration(seconds: 15));
       if (!_availabilityEnabled) {
         throw const BleLinkException('BeChat was turned off');
       }
-      final services = await _central.discoverGATT(peripheral);
+      final services = await _central
+          .discoverGATT(peripheral)
+          .timeout(const Duration(seconds: 15));
       final characteristics = _findBeChatCharacteristics(services);
       final tx = characteristics.tx;
       final rx = characteristics.rx;
@@ -1469,13 +1632,16 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
         // received the frame.
         onHello: (hello) => _handleHelloForLink(link, hello),
         onMessage: (payload) => _handleIncomingForLink(link, payload),
+        onRoutingEnvelope: (envelope) =>
+            _handleIncomingForLink(link, envelope),
       );
       if (!_availabilityEnabled) {
         throw const BleLinkException('BeChat was turned off');
       }
       await _beginSecureLink(link, session, hello);
       return hello.deviceId;
-    } catch (error) {
+    } catch (error, stackTrace) {
+      _logError('connect failed', error, stackTrace);
       _connectionWaiters.remove(linkId);
       await _closeLink(link, error: error);
       await _disconnectCentral(peripheral);
@@ -1544,11 +1710,17 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     GATTCharacteristic characteristic,
   ) {
     return retryBleOperation(
-      () => _central.setCharacteristicNotifyState(
-        peripheral,
-        characteristic,
-        state: true,
-      ),
+      // A lost native callback would otherwise hang the connect flow forever:
+      // the descriptor write must complete (or fail) before the link can be
+      // declared ready. Failure propagates to the connect flow, which tears
+      // the link down instead of pretending it succeeded.
+      () => _central
+          .setCharacteristicNotifyState(
+            peripheral,
+            characteristic,
+            state: true,
+          )
+          .timeout(const Duration(seconds: 5)),
       delay: (attempt) => Duration(milliseconds: 250 * attempt),
     );
   }
@@ -1596,6 +1768,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       // overrides; the overrides are always supplied by the connection flows.
       onHello: (hello) => _handleHelloForLink(link, hello),
       onMessage: (payload) => _handleIncomingForLink(link, payload),
+      onRoutingEnvelope: (envelope) =>
+          _handleIncomingForLink(link, envelope),
       onClosed: (error) {
         unawaited(_onSessionClosed(link, session, error));
       },
@@ -1873,6 +2047,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       _startPresenceMonitor(link);
     }
     unawaited(requestDelivery(published.peerId));
+    // A new secure-ready link may unblock parked relay envelopes.
+    unawaited(retryRelayQueue());
   }
 
   /// Resolves the pinned remote key for [peer] from the bound peer context.
@@ -2118,9 +2294,13 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   ///
   /// Multi-connection behavior: the peer is resolved from the receiving
   /// link, so a message on one link can never be attributed to another peer.
+  ///
+  /// This now delegates to the routing handler which handles both direct
+  /// messages (delivered locally) and routing envelopes (forwarded or
+  /// delivered locally based on destination).
   Future<BleAckResult> _handleIncomingForLink(
     BlePeerLink link,
-    BleMessagePayload payload,
+    Object payload,
   ) async {
     final peer = link.boundPeer;
     final identity = _ref.read(identityProvider).valueOrNull;
@@ -2130,22 +2310,103 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       }
       throw const BleLinkException('The BLE link has no validated peer');
     }
-    final handler = BleIncomingMessageHandler(
-      identity: identity,
-      store: BleMessageStore(),
-      onStored: (storedPayload, receipt) => _notifyIncomingMessage(
-        payload: storedPayload,
+
+    if (payload is BleRoutingEnvelope) {
+      // Built only for envelopes: direct messages must keep working without
+      // a local routing identity (localDeviceIdProvider can be null).
+      final routingHandler = _getRoutingHandler();
+
+      final (result, _) = await routingHandler.processEnvelope(
+        payload,
+        incomingPeerId: link.peerId ?? '',
+        deliver: (inner, relayedFrom) => _deliverRoutedMessage(
+          inner,
+          relayedFrom: relayedFrom,
+          peer: peer,
+          identity: identity,
+        ),
+      );
+
+      // Convert routing result to ACK result
+      final ackResult = switch (result) {
+        BleRoutingResult.delivered => BleAckResult.stored,
+        BleRoutingResult.queuedForForward => BleAckResult.stored,
+        BleRoutingResult.duplicate => BleAckResult.duplicate,
+        BleRoutingResult.expired => BleAckResult.rejected,
+        BleRoutingResult.hopLimitExhausted => BleAckResult.rejected,
+        BleRoutingResult.rejected => BleAckResult.rejected,
+      };
+
+      unawaited(_refreshIncoming(peer));
+      return ackResult;
+    } else if (payload is BleMessagePayload) {
+      // Handle direct message via existing handler
+      final handler = BleIncomingMessageHandler(
+        identity: identity,
+        store: BleMessageStore(),
+        onStored: (storedPayload, receipt) => _notifyIncomingMessage(
+          payload: storedPayload,
+          peer: peer,
+          receipt: receipt,
+        ),
+      );
+      final result = await handler.handle(
+        payload,
         peer: peer,
-        receipt: receipt,
-      ),
-    );
-    final result = await handler.handle(
-      payload,
-      peer: peer,
-      linkedPeerId: peer.peerId,
-    );
-    unawaited(_refreshIncoming(peer));
-    return result;
+        linkedPeerId: peer.peerId,
+      );
+      unawaited(_refreshIncoming(peer));
+      return result;
+    } else {
+      throw const BleLinkException('Unknown payload type');
+    }
+  }
+
+  /// Delivers a routing envelope's inner payload through the existing
+  /// incoming-message pipeline (same store transaction, same validation as a
+  /// direct message).
+  ///
+  /// Identity: the authenticated immediate relay ([peer], [linkedPeerId]) is
+  /// the peer/chat context; the envelope's claimed origin travels only as
+  /// [relayedFrom] for a consistency check inside the handler. The origin is
+  /// NOT authenticated and is never used to resolve a peer or conversation.
+  /// Validation failures map to rejected — a message is never stored under a
+  /// weakened check.
+  ///
+  /// shortcut: the message is stored in the relay's chat with the unverified
+  /// origin as senderId, so the 1:1 UI shows the relay as the conversation
+  /// partner and cannot prove who really wrote it — upgrade to true origin
+  /// attribution when end-to-end authenticated payloads exist (deferred E2EE).
+  Future<BleRoutingResult> _deliverRoutedMessage(
+    BleMessagePayload payload, {
+    required String relayedFrom,
+    required Peer peer,
+    required Identity identity,
+  }) async {
+    try {
+      final handler = BleIncomingMessageHandler(
+        identity: identity,
+        store: BleMessageStore(),
+        onStored: (storedPayload, receipt) => _notifyIncomingMessage(
+          payload: storedPayload,
+          peer: peer,
+          receipt: receipt,
+        ),
+      );
+      final ack = await handler.handle(
+        payload,
+        peer: peer,
+        linkedPeerId: peer.peerId,
+        relayedFrom: relayedFrom,
+      );
+      return switch (ack) {
+        BleAckResult.stored => BleRoutingResult.delivered,
+        BleAckResult.duplicate => BleRoutingResult.duplicate,
+        BleAckResult.rejected => BleRoutingResult.rejected,
+      };
+    } on BleProtocolException {
+      return BleRoutingResult.rejected;
+    }
   }
 
   /// Accepts the pending request with ID [requestId], which authorizes that
@@ -2648,6 +2909,8 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
       final hello = await session.start(
         onHello: (hello) => _handleHelloForLink(link, hello),
         onMessage: (payload) => _handleIncomingForLink(link, payload),
+        onRoutingEnvelope: (envelope) =>
+            _handleIncomingForLink(link, envelope),
       );
       await _beginSecureLink(link, session, hello);
     } catch (error) {
@@ -2920,11 +3183,27 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
   }
 
   Future<void> _disconnectCentral(Peripheral peripheral) async {
+    final address = peripheral.uuid.toString();
+    final inFlight = _centralTeardowns[address];
+    if (inFlight != null) {
+      // One teardown per device: a second caller awaits the same future
+      // instead of racing the plugin's address-keyed state again.
+      await inFlight;
+      return;
+    }
+    final teardown = () async {
+      try {
+        await _central
+            .disconnect(peripheral)
+            .timeout(AppConstants.gattTeardownTimeout);
+      } catch (_) {}
+    }();
+    _centralTeardowns[address] = teardown;
     try {
-      await _central
-          .disconnect(peripheral)
-          .timeout(AppConstants.gattTeardownTimeout);
-    } catch (_) {}
+      await teardown;
+    } finally {
+      _centralTeardowns.remove(address);
+    }
   }
 
   Future<void> _stopDiscoveryOnly() async {
@@ -3120,7 +3399,15 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     if (error is BleProtocolException) return error.message;
     if (error is BleLinkException) return error.message;
     if (error is BleLinkClosedException) return error.message;
-    return error.toString();
+    // Concise, single-line, never a Java/Dart stack trace: this string is the
+    // only thing the Nearby and Settings banners display.
+    return describeErrorForUser(error);
+  }
+
+  /// Keeps the full detail (native code, Java message, stack) in the log, where
+  /// it belongs — the UI only ever receives [describeErrorForUser].
+  void _logError(String context, Object error, [StackTrace? stackTrace]) {
+    debugPrint('BeChat BLE $context: ${describeErrorDiagnostics(error, stackTrace)}');
   }
 
   bool _isBackgroundOperational(BleRuntimeStatus status) =>
@@ -3419,6 +3706,7 @@ class BleRuntimeController extends StateNotifier<BleRuntimeState> {
     _disposed = true;
     _scanTimer?.cancel();
     _candidateCleanupTimer?.cancel();
+    _relayRetryTimer?.cancel();
     for (final waiter in _connectionWaiters.values) {
       if (!waiter.isCompleted) {
         waiter.completeError(const BleLinkException('BLE runtime disposed'));

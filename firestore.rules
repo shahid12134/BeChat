@@ -1,0 +1,271 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Owner UID of a BeChat device id, or null when the device has never
+    // registered. Reading a missing document is allowed on purpose: it is
+    // how a sender discovers that a peer is unregistered, and only a
+    // UUID-shaped device id can be probed.
+    function ownerOf(deviceId) {
+      return get(/databases/$(database)/documents/deviceRegistry/$(deviceId)).data.uid;
+    }
+
+    // Binds a BeChat deviceId (the document id) to exactly one Firebase UID.
+    // A registration can never be created by, transferred to, or overwritten
+    // by a different UID — the client checks this too, but this is the
+    // enforcement that actually matters.
+    match /deviceRegistry/{deviceId} {
+      // Exact lookups only. A sender probes one device id at a time to see
+      // whether (and by whom) it is registered; the registry as a whole is
+      // never enumerable, so the device-id space cannot be harvested.
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.deviceId == deviceId
+        && request.resource.data.uid is string
+        && request.resource.data.uid.size() > 0
+        && request.resource.data.keys().hasOnly(['uid', 'deviceId', 'createdAt', 'updatedAt']);
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.deviceId == resource.data.deviceId;
+
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /messages/{messageId} {
+      // One document per user pair: the id is the two uids sorted, so
+      // both directions — and any concurrent submission from either side —
+      // resolve to the SAME document and Firestore's create-only semantics
+      // make duplicates impossible. '.' never occurs in a Firebase uid, so
+      // the pair reconstructed from a path is unambiguous.
+      function pairId(a, b) {
+        return a < b ? a + '.' + b : b + '.' + a;
+      }
+
+      function pairPath(a, b) {
+        return /databases/$(database)/documents/connectionRequests/$(pairId(a, b));
+      }
+
+      // Online messaging runs only while the pair's request was accepted
+      // by its recipient (BLE links never touch Firestore).
+      function acceptedBetween(a, b) {
+        return exists(pairPath(a, b))
+          && get(pairPath(a, b)).data.status == 'accepted';
+      }
+
+      // Attachment metadata (the bytes live in Storage, never here). The
+      // document id, the sender's device and the Storage path must all agree,
+      // and the size must fit the per-kind limit, so a client cannot declare
+      // a small file and upload a large one, or point at a foreign object.
+      function attachmentOk(data) {
+        // `data.attachment` would error when the field is absent, so the
+        // presence check goes through keys() instead of a null comparison.
+        return !data.keys().hasAny(['attachment']) || (
+          data.attachment.keys().hasOnly([
+            'attachmentId', 'fileName', 'mimeType', 'size', 'storagePath', 'kind'
+          ])
+          && data.attachment.attachmentId == data.messageId
+          && data.attachment.fileName is string
+          && data.attachment.fileName.size() > 0
+          && data.attachment.fileName.size() <= 255
+          && data.attachment.kind in ['image', 'video', 'document']
+          && data.attachment.mimeType is string
+          && data.attachment.mimeType in [
+            'image/jpeg', 'image/png', 'image/webp',
+            'video/mp4', 'video/quicktime',
+            'application/pdf', 'text/plain', 'text/csv',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/zip'
+          ]
+          && data.attachment.size is int
+          && data.attachment.size > 0
+          && data.attachment.size <= (data.attachment.kind == 'image'
+               ? 10485760
+               : data.attachment.kind == 'video' ? 52428800 : 20971520)
+          && data.attachment.storagePath is string
+          && data.attachment.storagePath == 'attachments/' + data.senderDeviceId + '/' + data.messageId
+        );
+      }
+
+      // Only the two endpoints of a conversation can see it.
+      allow read: if signedIn()
+        && (request.auth.uid == resource.data.senderUid
+            || request.auth.uid == resource.data.recipientUid);
+
+      // Create only. The sender must be the authenticated UID, both device
+      // ids must resolve to the UIDs claimed in the document, and the
+      // payload/identity fields are frozen from this moment on.
+      allow create: if signedIn()
+        && request.resource.data.messageId == messageId
+        && request.resource.data.senderUid == request.auth.uid
+        && request.resource.data.senderDeviceId is string
+        && ownerOf(request.resource.data.senderDeviceId) == request.auth.uid
+        && request.resource.data.recipientUid is string
+        && request.resource.data.recipientDeviceId is string
+        && ownerOf(request.resource.data.recipientDeviceId) == request.resource.data.recipientUid
+        && request.resource.data.status == 'sent'
+        && request.resource.data.deliveredAt == null
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.content is string
+        && request.resource.data.content.size() <= 4096
+        && attachmentOk(request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'messageId', 'senderUid', 'senderDeviceId', 'recipientUid',
+          'recipientDeviceId', 'content', 'status', 'createdAt', 'deliveredAt',
+          'attachment'
+        ])
+        // Last condition on purpose: every specific violation above must
+        // still fail for its own reason, before the contact check is hit.
+        && acceptedBetween(
+          request.resource.data.senderUid,
+          request.resource.data.recipientUid,
+        );
+
+      // Only the addressed recipient may acknowledge delivery, and only the
+      // two acknowledgement fields may change: sender, recipient, message id
+      // and payload are immutable after creation.
+      allow update: if signedIn()
+        && request.auth.uid == resource.data.recipientUid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'deliveredAt'])
+        && request.resource.data.status == 'delivered'
+        && request.resource.data.deliveredAt == request.time
+        && request.resource.data.senderUid == resource.data.senderUid
+        && request.resource.data.senderDeviceId == resource.data.senderDeviceId
+        && request.resource.data.recipientUid == resource.data.recipientUid
+        && request.resource.data.recipientDeviceId == resource.data.recipientDeviceId
+        && request.resource.data.content == resource.data.content
+        && request.resource.data.messageId == resource.data.messageId;
+
+      // Message history is retained for offline recipients.
+      allow delete: if false;
+    }
+
+    // Private profile: display name, public ID and device binding — no
+    // secrets, but read access stays with its owner.
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      // Created once by the owner on first use of the shareable ID. The
+      // document id is the uid, so a profile can never be created for
+      // (or under the name of) another account.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.publicId is string
+        && request.resource.data.publicId.matches('BC-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}')
+        && request.resource.data.displayName is string
+        && request.resource.data.deviceId is string
+        && request.resource.data.keys().hasOnly([
+          'publicId', 'displayName', 'deviceId', 'createdAt', 'updatedAt'
+        ]);
+      // No update/delete: the ID is permanent, and the client never
+      // rewrites a profile (an existing profile is read, not replaced).
+    }
+
+    // Lookup table for the shareable BeChat ID. Any signed-in user may
+    // read it — this is the minimal preview behind ID search (name, public
+    // ID, device id; the uid adds no exposure over deviceRegistry above).
+    // The document id is the claimed ID itself, which is what makes a
+    // claim atomic: a collision is a create on an existing document.
+    match /publicIds/{publicId} {
+      // Exact lookups only: ID search reads the document named by the ID, so
+      // the claim table can never be listed or scraped in bulk.
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.publicId == publicId
+        // Only the canonical format the generator produces can be claimed,
+        // so a claim always round-trips through `normalizePublicId`.
+        && request.resource.data.publicId.matches('BC-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}')
+        && request.resource.data.displayName is string
+        && request.resource.data.deviceId is string
+        && request.resource.data.keys().hasOnly([
+          'uid', 'publicId', 'displayName', 'deviceId', 'createdAt', 'updatedAt'
+        ]);
+
+      // Claim release by its owner (after a failed profile write) or
+      // account cleanup. A claim can never be deleted by, or transferred
+      // to, another UID.
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+      // No update: claims are immutable; a rename only changes the private
+      // profile, and the preview name is refreshed by the next claim.
+    }
+
+    // One document per user pair (id = the two uids sorted — see the
+    // pairId helper below) holds the pending/accepted/declined state that
+    // gates online messaging.
+    match /connectionRequests/{requestId} {
+      // Sorted pair id: both directions of a pair, and concurrent
+      // submissions from both sides, target this one document — a second
+      // create can only fail. '.' never occurs in a Firebase uid.
+      function pairId(a, b) {
+        return a < b ? a + '.' + b : b + '.' + a;
+      }
+
+      function isParty() {
+        return signedIn()
+          && (request.auth.uid == resource.data.requesterUid
+              || request.auth.uid == resource.data.recipientUid);
+      }
+
+      // Either side reads its own requests; the equality queries the app
+      // issues (on requesterUid / recipientUid = own uid) are provable
+      // under this rule, an unfiltered list is not.
+      allow read: if isParty();
+
+      // Only the requester creates, only under their own uid, and the
+      // document id must be exactly the sorted pair — which makes a
+      // duplicate request impossible for repeated AND concurrent
+      // submissions, in either direction (both write the same document).
+      allow create: if signedIn()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.requesterUid == request.auth.uid
+        && request.resource.data.recipientUid is string
+        && request.resource.data.requesterUid != request.resource.data.recipientUid
+        && requestId == pairId(request.auth.uid, request.resource.data.recipientUid)
+        // Both claimed IDs are format-checked (no path tricks) and must
+        // really belong to the claimed UIDs.
+        && request.resource.data.requesterPublicId.matches('BC-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}')
+        && request.resource.data.recipientPublicId.matches('BC-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}')
+        && get(/databases/$(database)/documents/publicIds/$(request.resource.data.requesterPublicId)).data.uid == request.auth.uid
+        && get(/databases/$(database)/documents/publicIds/$(request.resource.data.recipientPublicId)).data.uid == request.resource.data.recipientUid
+        // Both frozen device ids must resolve to the claimed UIDs.
+        && ownerOf(request.resource.data.requesterDeviceId) == request.auth.uid
+        && ownerOf(request.resource.data.recipientDeviceId) == request.resource.data.recipientUid
+        && request.resource.data.keys().hasOnly([
+          'requesterUid', 'requesterPublicId', 'requesterDeviceId',
+          'recipientUid', 'recipientPublicId', 'recipientDeviceId',
+          'status', 'createdAt', 'updatedAt'
+        ]);
+
+      // Only the recipient may accept or decline, only once, and only the
+      // status (plus timestamp) may change — sender, IDs and device ids
+      // are frozen from creation.
+      allow update: if signedIn()
+        && request.auth.uid == resource.data.recipientUid
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['accepted', 'declined']
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt']);
+
+      // Either side may remove the relationship (or the requester may
+      // cancel a pending request); nobody else can.
+      allow delete: if signedIn()
+        && (request.auth.uid == resource.data.requesterUid
+            || request.auth.uid == resource.data.recipientUid);
+    }
+  }
+}

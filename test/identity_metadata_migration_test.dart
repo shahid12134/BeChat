@@ -181,9 +181,13 @@ void main() {
     }
   }
 
-  /// Opens the seeded file at the current version, running the real upgrade
-  /// step, and reports the old version sqflite observed.
-  Future<(Database, int?)> upgradeToVersion4() async {
+  /// Opens the seeded file at the current version, running every migration a
+  /// v3 database still needs (4, then 5, then 6), and reports the old
+  /// version sqflite observed.
+  ///
+  /// The steps mirror [DatabaseHelper]'s own upgrade chain, so the upgraded
+  /// file must land on exactly the schema a fresh database is created with.
+  Future<(Database, int?)> upgradeToCurrent() async {
     int? observedOldVersion;
     final db = await databaseFactoryFfi.openDatabase(
       path,
@@ -191,7 +195,9 @@ void main() {
         version: AppConstants.databaseVersion,
         onUpgrade: (db, oldVersion, newVersion) async {
           observedOldVersion = oldVersion;
-          await DatabaseHelper.migrateToVersion4(db);
+          if (oldVersion < 4) await DatabaseHelper.migrateToVersion4(db);
+          if (oldVersion < 5) await DatabaseHelper.migrateToVersion5(db);
+          if (oldVersion < 6) await DatabaseHelper.migrateToVersion6(db);
         },
         onConfigure: (db) async {
           await db.execute('PRAGMA foreign_keys = ON');
@@ -207,14 +213,18 @@ void main() {
   }
 
   test(
-    'version 3 database upgrades to 4 preserving every user record',
+    'version 3 database upgrades through every migration to the current '
+    'schema preserving every user record',
     () async {
       await seedVersion3();
 
-      final (db, observedOldVersion) = await upgradeToVersion4();
+      final (db, observedOldVersion) = await upgradeToCurrent();
       try {
         expect(observedOldVersion, 3);
-        expect(AppConstants.databaseVersion, 4);
+        // Deliberately hardcoded, not read back from the upgrade target: a
+        // schema bump must fail here until this end-to-end chain test is
+        // reviewed and the pin below updated with it.
+        expect(AppConstants.databaseVersion, 6);
 
         // Identity row: nothing is rewritten and no key material appears.
         final identityRows = await db.query('identity');
@@ -301,7 +311,7 @@ void main() {
   test('every legacy peer stays unverified after the migration', () async {
     await seedVersion3();
 
-    final (db, _) = await upgradeToVersion4();
+    final (db, _) = await upgradeToCurrent();
     try {
       final peers = await peersById(db);
 
@@ -356,10 +366,23 @@ void main() {
     () async {
       await seedVersion3();
 
-      final (upgraded, _) = await upgradeToVersion4();
+      final (upgraded, _) = await upgradeToCurrent();
       final fresh = await openTestDatabase(singleInstance: false);
       try {
-        expect(await _schemaOf(upgraded), await _schemaOf(fresh));
+        final upgradedSchema = await _schemaOf(upgraded);
+        expect(upgradedSchema, await _schemaOf(fresh));
+
+        // Named explicitly on top of the whole-schema equality: the v5
+        // routing tables and the v6 incoming-peer column must be part of
+        // this comparison, never absent from both sides at once.
+        expect(
+          upgradedSchema.keys,
+          containsAll(['seen_messages', 'relay_queue']),
+        );
+        expect(
+          upgradedSchema['relay_queue']!.map((column) => column['name']),
+          contains('incoming_peer_device_id'),
+        );
       } finally {
         await upgraded.close();
         await fresh.close();
@@ -370,7 +393,7 @@ void main() {
   test('running the migration again is a no-op', () async {
     await seedVersion3();
 
-    final (db, _) = await upgradeToVersion4();
+    final (db, _) = await upgradeToCurrent();
     try {
       final before = await peersById(db);
       final identityBefore = (await db.query('identity')).single;
@@ -426,7 +449,14 @@ Future<Map<String, List<Map<String, Object?>>>> _schemaOf(Database db) async {
   final schema = <String, List<Map<String, Object?>>>{};
   for (final table in tables) {
     final name = table['name'] as String;
-    final info = await db.rawQuery('PRAGMA table_info($name)');
+    // Spread into a growable copy: the query result set itself is read-only.
+    final info = [...await db.rawQuery('PRAGMA table_info($name)')];
+    // Compare the column set, not physical order: an upgraded table gains
+    // its newest columns last (SQLite ALTER TABLE only appends), a fresh one
+    // declares them inline — same schema, different layout by construction.
+    info.sort(
+      (a, b) => (a['name']! as String).compareTo(b['name']! as String),
+    );
     schema[name] = [
       for (final row in info)
         {

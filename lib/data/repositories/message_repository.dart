@@ -141,6 +141,23 @@ class MessageRepository {
     );
   }
 
+  /// Atomically claims a queued message for one transport, so the online
+  /// relay and the BLE outbox can never send the same message at once:
+  /// the conditional UPDATE succeeds for exactly one caller.
+  Future<bool> tryClaimForSending(String messageId) async {
+    final db = await _db;
+    final updated = await db.update(
+      'messages',
+      {
+        'status': MessageStatus.sending.name,
+        'updated_at': TimestampUtils.nowUtcIso8601(),
+      },
+      where: 'message_id = ? AND status = ?',
+      whereArgs: [messageId, MessageStatus.queued.name],
+    );
+    return updated == 1;
+  }
+
   Future<void> markMessageSent(String messageId) async {
     await _updateDeliveryStatus(
       messageId,
@@ -209,11 +226,21 @@ class MessageRepository {
     );
   }
 
-  Future<List<Message>> getQueuedOutgoingMessages(String senderId) async {
+  /// Queued outgoing messages for [senderId].
+  ///
+  /// [excludeAttachments] lets the BLE drain skip media: attachment bytes
+  /// never travel over BLE or the multi-hop relay, so those messages wait for
+  /// the online transport instead of being sent as a bare text label.
+  Future<List<Message>> getQueuedOutgoingMessages(
+    String senderId, {
+    bool excludeAttachments = false,
+  }) async {
     final db = await _db;
     final maps = await db.query(
       'messages',
-      where: 'sender_id = ? AND status = ? AND receiver_id <> ?',
+      where:
+          'sender_id = ? AND status = ? AND receiver_id <> ?'
+          '${excludeAttachments ? ' AND attachment_json IS NULL' : ''}',
       whereArgs: [senderId, MessageStatus.queued.name, senderId],
       orderBy: 'timestamp ASC, message_id ASC',
     );

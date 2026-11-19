@@ -11,7 +11,7 @@ enum RelayQueueState { queued, sent, failed }
 
 /// One envelope parked in the `relay_queue` table.
 ///
-/// Mirrors the v5 schema 1:1: the opaque envelope bytes plus the routing
+/// Mirrors the v6 schema 1:1: the opaque envelope bytes plus the routing
 /// metadata a future relay needs, denormalized so queue scans never have to
 /// decode the blob. Timestamps persist in [TimestampUtils] canonical UTC
 /// ISO-8601 form, so expiry range scans are correct lexicographic comparisons.
@@ -24,6 +24,7 @@ class RelayQueueEntry {
     required this.expiresAt,
     required this.hopLimit,
     required this.hopCount,
+    this.incomingPeerDeviceId,
     this.attempts = 0,
     this.nextHopDeviceId,
     this.state = RelayQueueState.queued,
@@ -40,6 +41,11 @@ class RelayQueueEntry {
   final DateTime expiresAt;
   final int hopLimit;
   final int hopCount;
+
+  /// The authenticated peer this envelope arrived from, persisted so the
+  /// retry loop can still exclude it after a restart (v6). Null for rows
+  /// written before v6: those are never retried.
+  final String? incomingPeerDeviceId;
   final int attempts;
   final String? nextHopDeviceId;
   final RelayQueueState state;
@@ -55,6 +61,7 @@ class RelayQueueEntry {
       'expires_at': TimestampUtils.toUtcIso8601(expiresAt),
       'hop_limit': hopLimit,
       'hop_count': hopCount,
+      'incoming_peer_device_id': incomingPeerDeviceId,
       'attempts': attempts,
       'next_hop_device_id': nextHopDeviceId,
       'state': state.name,
@@ -72,6 +79,7 @@ class RelayQueueEntry {
       expiresAt: DateTime.parse(map['expires_at']! as String),
       hopLimit: map['hop_limit']! as int,
       hopCount: map['hop_count']! as int,
+      incomingPeerDeviceId: map['incoming_peer_device_id'] as String?,
       attempts: map['attempts']! as int,
       nextHopDeviceId: map['next_hop_device_id'] as String?,
       state: RelayQueueState.values.firstWhere(
@@ -96,6 +104,7 @@ class RelayQueueEntry {
       expiresAt: expiresAt,
       hopLimit: hopLimit,
       hopCount: hopCount,
+      incomingPeerDeviceId: incomingPeerDeviceId,
       attempts: attempts ?? this.attempts,
       nextHopDeviceId: nextHopDeviceId ?? this.nextHopDeviceId,
       state: state ?? this.state,

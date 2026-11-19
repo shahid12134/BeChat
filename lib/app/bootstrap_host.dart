@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:bechat/app/app.dart';
 import 'package:bechat/app/theme/app_theme.dart';
+import 'package:bechat/core/utils/error_formatter.dart';
 import 'package:bechat/providers/identity_initialization_providers.dart';
 
 class BootstrapHost extends ConsumerStatefulWidget {
@@ -127,7 +128,7 @@ class BootstrapErrorScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               Text(
-                '$error',
+                describeErrorForUser(error),
                 style: Theme.of(context).textTheme.bodySmall,
                 textAlign: TextAlign.center,
               ),

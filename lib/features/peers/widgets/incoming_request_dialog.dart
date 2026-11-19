@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:bechat/core/utils/error_formatter.dart';
 import 'package:bechat/providers/ble_providers.dart';
 import 'package:bechat/services/ble/incoming_connection_request.dart';
 
@@ -113,7 +114,9 @@ class _IncomingConnectionRequestDialogState
     try {
       await action();
     } catch (error) {
-      if (mounted) setState(() => _error = '$error');
+      if (mounted) {
+        setState(() => _error = describeErrorForUser(error));
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }

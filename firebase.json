@@ -1,0 +1,44 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "bechat-43a4f",
+          "appId": "1:965495189894:android:e98dc5436f8654994abc07",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "bechat-43a4f",
+          "configurations": {
+            "android": "1:965495189894:android:e98dc5436f8654994abc07",
+            "ios": "1:965495189894:ios:15a67e06d22b1e904abc07",
+            "windows": "1:965495189894:web:a1fad596b93c49b74abc07"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "storage": {
+      "port": 9199
+    },
+    "ui": {
+      "enabled": false
+    },
+    "singleProjectMode": true
+  }
+}
